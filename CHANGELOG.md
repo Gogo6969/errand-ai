@@ -30,6 +30,18 @@ All notable changes to this project are documented here. The format follows
 - **Live run journal** streaming to the SSE feed as the agent works, in its own plain language.
 - Per-run cost and token accounting, and a per-run stderr log, since the CLI reports only
   "exited with code 1" and the real cause is always on stderr.
+- `scripts/dev-install.sh`, which installs the runner from a stable signed copy rather than from
+  `target/debug`.
+
+### Fixed
+
+- **`errandd doctor` reported "No problems found" while displaying failures.** Four of its checks
+  printed a failure mark without counting it. A diagnostic that misreports its own result is worse
+  than no diagnostic.
+- **Never point the LaunchAgent at `target/debug`.** cargo rewrites that file on every build, and a
+  launchd-spawned process whose binary changed underneath it deadlocks in dyld while amfid
+  validates the signature: alive, never reaching main, nothing listening, no log. Development
+  installs now go through a stable signed copy, which is also the shape the shipping build uses.
 
 ## M1
 

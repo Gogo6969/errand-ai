@@ -307,9 +307,15 @@ async fn doctor() -> Result<()> {
 
     // API token
     let has_token = api::auth::read_primary_token().await.is_ok();
+    if !has_token {
+        problems += 1;
+    }
     println!("  {}  API token in keychain", tick(has_token));
     if !has_token {
-        println!("      Start the runner once and it will mint one.");
+        println!("      Either the runner has never started, or this build cannot read the");
+        println!("      stored item because its signature changed. The API still works either");
+        println!("      way, since the token's hash lives in the database. To fix the reading");
+        println!("      of it: delete the 'com.errandai.app.internal' keychain items and restart.");
     }
 
     // Claude CLI: the flagship executor
@@ -325,6 +331,7 @@ async fn doctor() -> Result<()> {
             println!("  {}  claude CLI: {} {}", tick(true), p.display(), version);
         }
         None => {
+            problems += 1;
             println!("  !  claude CLI: not found");
             println!("      The default executor needs it. Checked ~/.local/bin, /usr/local/bin,");
             println!("      /opt/homebrew/bin, and PATH.");

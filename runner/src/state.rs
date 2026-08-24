@@ -31,6 +31,12 @@ pub struct Inner {
     pub run_tokens: parking_lot::Mutex<std::collections::HashMap<String, String>>,
     /// Outcomes reported by agents through the finish and fail tools.
     pub outcomes: parking_lot::Mutex<std::collections::HashMap<String, crate::mcp::Outcome>>,
+    /// The browser each run is driving, if it has opened one.
+    pub browsers: tokio::sync::Mutex<
+        std::collections::HashMap<String, std::sync::Arc<crate::browser::Browser>>,
+    >,
+    /// One redactor per run, seeded with every secret that run resolves.
+    pub redactors: parking_lot::Mutex<std::collections::HashMap<String, crate::redact::Redactor>>,
 }
 
 impl AppState {
@@ -45,7 +51,35 @@ impl AppState {
             api_port: std::sync::atomic::AtomicU16::new(errand_core::DEFAULT_API_PORT),
             run_tokens: parking_lot::Mutex::new(std::collections::HashMap::new()),
             outcomes: parking_lot::Mutex::new(std::collections::HashMap::new()),
+            browsers: tokio::sync::Mutex::new(std::collections::HashMap::new()),
+            redactors: parking_lot::Mutex::new(std::collections::HashMap::new()),
         }))
+    }
+
+    /// The redactor for a run, created on first use. Every secret the run
+    /// touches is registered here, and everything leaving the run is scrubbed
+    /// through it.
+    pub fn redactor(&self, run_id: &str) -> crate::redact::Redactor {
+        let mut g = self.0.redactors.lock();
+        g.entry(run_id.to_string()).or_default().clone()
+    }
+
+    pub async fn browser(&self, run_id: &str) -> Option<std::sync::Arc<crate::browser::Browser>> {
+        self.0.browsers.lock().await.get(run_id).cloned()
+    }
+
+    pub async fn set_browser(&self, run_id: &str, b: std::sync::Arc<crate::browser::Browser>) {
+        self.0.browsers.lock().await.insert(run_id.to_string(), b);
+    }
+
+    /// Shut a run's browser down and release everything it held.
+    pub async fn close_browser(&self, run_id: &str) {
+        let b = self.0.browsers.lock().await.remove(run_id);
+        if let Some(b) = b {
+            b.close().await;
+        }
+        let _ = errand_core::db::release_browser_profiles(self.pool(), run_id).await;
+        self.0.redactors.lock().remove(run_id);
     }
 
     pub fn set_api_port(&self, p: u16) {

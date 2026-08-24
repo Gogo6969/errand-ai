@@ -14,9 +14,11 @@
 //!   errandd token            print the primary API token
 
 mod api;
+mod browser;
 mod executor;
 mod lock;
 mod mcp;
+mod redact;
 mod secrets;
 mod state;
 

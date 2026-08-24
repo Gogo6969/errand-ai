@@ -88,16 +88,107 @@ fn tool_definitions() -> Value {
                 "required": ["code", "attempting", "because", "next_steps"],
                 "additionalProperties": false
             }
+        }        ,
+        {
+            "name": "open_browser",
+            "description":
+                "Open the browser for this task. It uses a saved profile per site, so a site you \
+                 logged into on a previous run is usually still logged in. Call this before any \
+                 other browser tool.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        },
+        {
+            "name": "navigate",
+            "description":
+                "Go to a URL. Only sites on this task's allowed list will open; anything else is \
+                 refused, including a redirect. Returns what is on the page.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "url": { "type": "string" } },
+                "required": ["url"], "additionalProperties": false
+            }
+        },
+        {
+            "name": "snapshot",
+            "description":
+                "Read the current page: its address, title, and the things you can interact with, \
+                 each tagged with a ref like [ref=e7]. Take a fresh snapshot after anything that \
+                 changes the page, because refs do not survive a reload.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        },
+        {
+            "name": "act",
+            "description":
+                "Do one thing to the page: click a ref, type text into a ref, select a value, \
+                 tick a checkbox, press a key, or scroll. Never type a password with this; use \
+                 fill_credential, which is the only way a stored secret reaches a page.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "kind": { "type": "string", "enum": ["click","type","select","check","press","scroll"] },
+                    "ref": { "type": "string", "description": "A ref from the last snapshot, e.g. e7." },
+                    "text": { "type": "string" },
+                    "value": { "type": "string" },
+                    "key": { "type": "string" }
+                },
+                "required": ["kind"], "additionalProperties": false
+            }
+        },
+        {
+            "name": "fill_credential",
+            "description":
+                "Put a saved credential into a field. You name the credential and the field; you \
+                 never see the value, and it is only released to the exact site the credential is \
+                 registered against. Use list_credentials to see what this task has.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "credential_id": { "type": "string" },
+                    "ref": { "type": "string", "description": "The field to fill, from a snapshot." },
+                    "field": { "type": "string", "enum": ["username", "password"], "default": "password" }
+                },
+                "required": ["credential_id", "ref"], "additionalProperties": false
+            }
+        },
+        {
+            "name": "list_credentials",
+            "description":
+                "List the logins this task may use: their id, label, the site each is bound to, \
+                 and the username. Never the secret.",
+            "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
+        },
+        {
+            "name": "screenshot",
+            "description":
+                "Capture what the page looks like, for the person reading this run afterwards. \
+                 Password fields are masked before the image is taken.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "caption": { "type": "string" } },
+                "additionalProperties": false
+            }
         }
     ])
 }
 
 /// Names the agent is permitted to call, as the CLI sees them.
 pub fn qualified_tool_names() -> Vec<String> {
-    ["read_brief", "journal", "finish", "fail"]
-        .iter()
-        .map(|t| format!("mcp__errand__{t}"))
-        .collect()
+    [
+        "read_brief",
+        "journal",
+        "finish",
+        "fail",
+        "open_browser",
+        "navigate",
+        "snapshot",
+        "act",
+        "fill_credential",
+        "list_credentials",
+        "screenshot",
+    ]
+    .iter()
+    .map(|t| format!("mcp__errand__{t}"))
+    .collect()
 }
 
 /// How a run ended, as reported by the agent through the tool surface.
@@ -296,11 +387,131 @@ async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &Value) -> V
             text_result("run recorded as failed, with your explanation")
         }
 
+        "open_browser" => match open_browser(state, run_id).await {
+            Ok(msg) => text_result(msg),
+            Err(e) => text_error(format!("Could not open the browser: {e}")),
+        },
+
+        "navigate" => {
+            let Some(url) = args.get("url").and_then(|u| u.as_str()) else {
+                return text_error("navigate needs a 'url'.");
+            };
+            let Some(b) = state.browser(run_id).await else {
+                return text_error("No browser is open. Call open_browser first.");
+            };
+            match b.goto(url).await {
+                Ok(snap) => {
+                    let _ = journal(
+                        state,
+                        run_id,
+                        "navigate",
+                        &format!("Opened {}", snap.url),
+                        true,
+                    )
+                    .await;
+                    // Surface a human check immediately, so the agent fails
+                    // honestly rather than burning turns trying to solve
+                    // something it is forbidden to solve.
+                    if let Ok(Some(kind)) = b.detect_captcha().await {
+                        let _ = journal(
+                            state,
+                            run_id,
+                            "decide",
+                            &format!("Hit a human verification check ({kind})"),
+                            false,
+                        )
+                        .await;
+                        return text_error(format!(
+                            "This page is showing a human verification check ({kind}). You must \
+                             not attempt to solve or bypass it. Call fail with code \
+                             captcha_or_2fa_needed and explain that the person needs to complete \
+                             it themselves."
+                        ));
+                    }
+                    text_result(render_snapshot(&snap))
+                }
+                Err(e) => {
+                    // A refused navigation is a decision worth recording: it is
+                    // how a redirect to a lookalike site shows up afterwards.
+                    let _ = journal(
+                        state,
+                        run_id,
+                        "decide",
+                        &format!("Refused to open {url}"),
+                        false,
+                    )
+                    .await;
+                    text_error(e.to_string())
+                }
+            }
+        }
+
+        "snapshot" => {
+            let Some(b) = state.browser(run_id).await else {
+                return text_error("No browser is open. Call open_browser first.");
+            };
+            match b.snapshot().await {
+                Ok(s) => text_result(render_snapshot(&s)),
+                Err(e) => text_error(format!("Could not read the page: {e}")),
+            }
+        }
+
+        "act" => {
+            let Some(kind) = args.get("kind").and_then(|k| k.as_str()) else {
+                return text_error("act needs a 'kind'.");
+            };
+            let Some(b) = state.browser(run_id).await else {
+                return text_error("No browser is open. Call open_browser first.");
+            };
+            // Typing a secret through the ordinary path would put it in the
+            // journal and the prompt. The only way in is fill_credential.
+            if kind == "type" {
+                let text = args.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                if looks_like_a_secret(text) {
+                    return text_error(
+                        "That looks like a password. Use fill_credential instead, which keeps \
+                         the value out of this conversation entirely.",
+                    );
+                }
+            }
+            match b.act(kind, args.clone()).await {
+                Ok(_) => {
+                    let what = args.get("ref").and_then(|r| r.as_str()).unwrap_or("");
+                    let _ =
+                        journal(state, run_id, "act", format!("{kind} {what}").trim(), true).await;
+                    text_result("done")
+                }
+                Err(e) => text_error(e.to_string()),
+            }
+        }
+
+        "list_credentials" => match list_credentials(state, run_id).await {
+            Ok(v) => text_result(v),
+            Err(e) => text_error(format!("Could not list credentials: {e}")),
+        },
+
+        "fill_credential" => match fill_credential(state, run_id, args).await {
+            Ok(v) => text_result(v),
+            Err(e) => text_error(e.to_string()),
+        },
+
+        "screenshot" => {
+            let Some(b) = state.browser(run_id).await else {
+                return text_error("No browser is open. Call open_browser first.");
+            };
+            let caption = args
+                .get("caption")
+                .and_then(|c| c.as_str())
+                .unwrap_or("Screenshot");
+            match capture(state, run_id, &b, caption).await {
+                Ok(_) => text_result("captured"),
+                Err(e) => text_error(format!("Could not capture the page: {e}")),
+            }
+        }
+
         other => {
             let _ = INVALID_PARAMS;
-            text_error(format!(
-                "There is no tool called '{other}'. You have: read_brief, journal, finish, fail."
-            ))
+            text_error(format!("There is no tool called '{other}'."))
         }
     }
 }
@@ -317,6 +528,255 @@ async fn read_brief(state: &AppState, run_id: &str) -> anyhow::Result<String> {
         "Task: {}\n\nWhat the person asked for:\n{}\n\nThis run: {} (trigger: {})",
         task.name, task.description, run.mode, run.trigger
     ))
+}
+
+fn render_snapshot(s: &crate::browser::Snapshot) -> String {
+    format!(
+        "url: {}\ntitle: {}\n\n{}{}",
+        s.url,
+        s.title,
+        s.tree,
+        if s.truncated {
+            "\n\n(page truncated; scroll and snapshot again for more)"
+        } else {
+            ""
+        }
+    )
+}
+
+/// A crude shape check, used only to stop the model routing a secret through
+/// the wrong door. False positives cost one redirected tool call.
+fn looks_like_a_secret(text: &str) -> bool {
+    if text.len() < 8 {
+        return false;
+    }
+    let has_upper = text.chars().any(|c| c.is_ascii_uppercase());
+    let has_digit = text.chars().any(|c| c.is_ascii_digit());
+    let has_sym = text
+        .chars()
+        .any(|c| !c.is_alphanumeric() && !c.is_whitespace());
+    let no_spaces = !text.contains(' ');
+    no_spaces && has_digit && (has_upper || has_sym) && text.len() >= 10
+}
+
+fn apex_of(host: &str) -> String {
+    let parts: Vec<&str> = host.split('.').filter(|p| !p.is_empty()).collect();
+    if parts.len() <= 2 {
+        return host.to_string();
+    }
+    let two = parts[parts.len() - 2..].join(".");
+    const TWO_LEVEL: &[&str] = &["co.uk", "org.uk", "ac.uk", "com.au", "co.jp", "com.br"];
+    if TWO_LEVEL.contains(&two.as_str()) && parts.len() >= 3 {
+        parts[parts.len() - 3..].join(".")
+    } else {
+        two
+    }
+}
+
+async fn open_browser(state: &AppState, run_id: &str) -> anyhow::Result<String> {
+    if state.browser(run_id).await.is_some() {
+        return Ok("The browser is already open.".into());
+    }
+    let run = errand_core::db::get_run(state.pool(), run_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("run not found"))?;
+    let task = errand_core::db::get_task(state.pool(), &run.task_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+
+    let allowed: Vec<String> = task
+        .allowed_domains
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if allowed.is_empty() {
+        anyhow::bail!(
+            "This task has no approved sites yet, so the browser would not be able to open \
+             anything. Add the sites it needs to the task first."
+        );
+    }
+
+    let apex = apex_of(&allowed[0]);
+    let (_pid, dir_name) =
+        errand_core::db::claim_browser_profile(state.pool(), &apex, run_id).await?;
+    let profile_dir = errand_core::paths::data_root()?.join(dir_name);
+
+    let policy = crate::browser::DomainPolicy {
+        allowed: allowed.clone(),
+        strict_network: true,
+    };
+    let b =
+        crate::browser::Browser::launch(profile_dir, policy, state.redactor(run_id), true).await?;
+    state.set_browser(run_id, std::sync::Arc::new(b)).await;
+
+    let _ = errand_core::db::append_step(
+        state.pool(),
+        run_id,
+        "plan",
+        &format!("Opened the browser, limited to: {}", allowed.join(", ")),
+        true,
+        None,
+    )
+    .await;
+
+    Ok(format!(
+        "Browser open. You may visit: {}. Nothing else will load.",
+        allowed.join(", ")
+    ))
+}
+
+async fn list_credentials(state: &AppState, run_id: &str) -> anyhow::Result<String> {
+    let run = errand_core::db::get_run(state.pool(), run_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("run not found"))?;
+    let creds = errand_core::db::credentials_for_task(state.pool(), &run.task_id).await?;
+    if creds.is_empty() {
+        return Ok("This task has no saved logins.".into());
+    }
+    let mut out = String::from("Logins available to this task:\n");
+    for c in creds {
+        out.push_str(&format!(
+            "- id={} label={:?} site={} username={}\n",
+            c.id,
+            c.label,
+            c.domain,
+            c.username.unwrap_or_else(|| "(none)".into())
+        ));
+    }
+    out.push_str("\nUse fill_credential with the id. You will never see the secret itself.");
+    Ok(out)
+}
+
+async fn fill_credential(state: &AppState, run_id: &str, args: &Value) -> anyhow::Result<String> {
+    let cred_id = args
+        .get("credential_id")
+        .and_then(|c| c.as_str())
+        .ok_or_else(|| anyhow::anyhow!("fill_credential needs a 'credential_id'."))?;
+    let r#ref = args
+        .get("ref")
+        .and_then(|r| r.as_str())
+        .ok_or_else(|| anyhow::anyhow!("fill_credential needs a 'ref' naming the field."))?;
+    let field = args
+        .get("field")
+        .and_then(|f| f.as_str())
+        .unwrap_or("password");
+
+    let run = errand_core::db::get_run(state.pool(), run_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("run not found"))?;
+
+    // The credential must belong to this task. A run cannot reach another
+    // task's logins by guessing an id.
+    let allowed = errand_core::db::credentials_for_task(state.pool(), &run.task_id).await?;
+    let meta = allowed
+        .iter()
+        .find(|c| c.id == cred_id)
+        .ok_or_else(|| anyhow::anyhow!("This task has no credential with id {cred_id}."))?;
+
+    let Some(b) = state.browser(run_id).await else {
+        anyhow::bail!("No browser is open. Call open_browser first.");
+    };
+
+    // The binding check: the secret is released only to the site it belongs to.
+    // This is also what defeats a lookalike page, since a page that merely
+    // resembles the real one is on a different domain.
+    let snap = b.snapshot().await?;
+    let host = url::Url::parse(&snap.url)
+        .ok()
+        .and_then(|u| u.host_str().map(str::to_string))
+        .unwrap_or_default();
+    let bound = meta.domain.to_ascii_lowercase();
+    let host_l = host.to_ascii_lowercase();
+    if !(host_l == bound || host_l.ends_with(&format!(".{bound}"))) {
+        anyhow::bail!(
+            "Refusing to type the {:?} login into {host}. That credential is registered for \
+             {bound}, and this page is not it. Nothing was entered.",
+            meta.label
+        );
+    }
+
+    if field == "username" {
+        let user = meta
+            .username
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("That credential has no username saved."))?;
+        b.act("type", serde_json::json!({ "ref": r#ref, "text": user }))
+            .await?;
+    } else {
+        let (service, account, _) = errand_core::db::credential_keychain_ref(state.pool(), cred_id)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("credential metadata missing"))?;
+        let secret = crate::secrets::get(service, account).await?;
+        b.fill_secret(r#ref, secret.expose(), &meta.label).await?;
+    }
+
+    let _ = errand_core::db::mark_credential_used(state.pool(), cred_id).await;
+    let _ = errand_core::db::append_step(
+        state.pool(),
+        run_id,
+        "credential",
+        &format!("Filled the {} for {:?} into {}", field, meta.label, r#ref),
+        true,
+        None,
+    )
+    .await;
+
+    Ok(format!("Filled the {field} for {:?}.", meta.label))
+}
+
+async fn capture(
+    state: &AppState,
+    run_id: &str,
+    b: &crate::browser::Browser,
+    caption: &str,
+) -> anyhow::Result<()> {
+    let dir = errand_core::paths::run_dir(run_id)?.join("shots");
+    std::fs::create_dir_all(&dir)?;
+    let id = errand_core::new_id();
+    let path = dir.join(format!("{id}.png"));
+    b.screenshot_to(&path).await?;
+    let _ =
+        errand_core::db::append_step(state.pool(), run_id, "screenshot", caption, true, None).await;
+    Ok(())
+}
+
+/// Write a journal step, scrubbed, with a last-line assertion that no secret
+/// is getting through. The redactor should already have caught it; this is the
+/// check that turns a silent leak into a loud one.
+async fn journal(
+    state: &AppState,
+    run_id: &str,
+    kind: &str,
+    title: &str,
+    ok: bool,
+) -> anyhow::Result<i64> {
+    let red = state.redactor(run_id);
+    let clean = red.scrub(title);
+    debug_assert!(
+        red.is_clean(&clean),
+        "a secret survived redaction on its way into the journal"
+    );
+    if !red.is_clean(&clean) {
+        tracing::error!(
+            run_id,
+            "refusing to journal a line that still contains a secret"
+        );
+        return errand_core::db::append_step(
+            state.pool(),
+            run_id,
+            kind,
+            "[redacted: this step could not be recorded safely]",
+            ok,
+            None,
+        )
+        .await;
+    }
+    errand_core::db::append_step(state.pool(), run_id, kind, &clean, ok, None).await
 }
 
 #[cfg(test)]

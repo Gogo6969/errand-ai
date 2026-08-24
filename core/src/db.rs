@@ -595,6 +595,156 @@ pub async fn auto_pause_task(pool: &Pool, task_id: &str, reason: &str) -> Result
     Ok(())
 }
 
+// ---------------------------------------------------------------- browsers --
+
+/// Claim the browser profile for a site identity, creating it if needed.
+///
+/// One Chromium profile serves one process at a time, so the claim is a hard
+/// mutex. The lock is tied to the run rather than left dangling: crash recovery
+/// releases any lock whose run is no longer live, otherwise one crashed run
+/// locks a site out permanently and the only fix is editing the database.
+pub async fn claim_browser_profile(
+    pool: &Pool,
+    apex_domain: &str,
+    run_id: &str,
+) -> Result<(String, String)> {
+    let name = format!("{apex_domain} (default)");
+    let existing =
+        sqlx::query("SELECT id, dir_name, locked_by_run FROM browser_profiles WHERE name = ?")
+            .bind(&name)
+            .fetch_optional(pool)
+            .await?;
+
+    let (id, dir_name) = match existing {
+        Some(r) => {
+            let id: String = r.try_get("id")?;
+            let dir: String = r.try_get("dir_name")?;
+            let holder: Option<String> = r.try_get("locked_by_run")?;
+            if let Some(h) = holder {
+                if h != run_id && run_is_live(pool, &h).await? {
+                    anyhow::bail!(
+                        "The browser profile for {apex_domain} is in use by another run. \
+                         Only one run at a time can hold a site's logged-in session."
+                    );
+                }
+            }
+            (id, dir)
+        }
+        None => {
+            let id = crate::new_id();
+            let dir = format!("profiles/{id}");
+            sqlx::query(
+                "INSERT INTO browser_profiles (id, name, dir_name, default_domain, created_at)
+                 VALUES (?, ?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(&name)
+            .bind(&dir)
+            .bind(apex_domain)
+            .bind(crate::now_iso())
+            .execute(pool)
+            .await?;
+            (id, dir)
+        }
+    };
+
+    sqlx::query("UPDATE browser_profiles SET locked_by_run = ?, last_used_at = ? WHERE id = ?")
+        .bind(run_id)
+        .bind(crate::now_iso())
+        .bind(&id)
+        .execute(pool)
+        .await?;
+    Ok((id, dir_name))
+}
+
+/// Is this run still in a state where it could be holding resources?
+async fn run_is_live(pool: &Pool, run_id: &str) -> Result<bool> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS n FROM runs WHERE id = ? AND status IN
+         ('armed','queued','preflight','holding','running','healing','waiting_input','takeover')",
+    )
+    .bind(run_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get::<i64, _>("n")? > 0)
+}
+
+pub async fn release_browser_profiles(pool: &Pool, run_id: &str) -> Result<()> {
+    sqlx::query("UPDATE browser_profiles SET locked_by_run = NULL WHERE locked_by_run = ?")
+        .bind(run_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Credentials a task may use, with the domain each is bound to.
+pub async fn credentials_for_task(
+    pool: &Pool,
+    task_id: &str,
+) -> Result<Vec<crate::models::CredentialMeta>> {
+    let rows = sqlx::query(
+        "SELECT c.* FROM credentials c
+         JOIN task_credentials tc ON tc.credential_id = c.id
+         WHERE tc.task_id = ? ORDER BY c.label",
+    )
+    .bind(task_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| {
+            Ok(crate::models::CredentialMeta {
+                id: r.try_get("id")?,
+                label: r.try_get("label")?,
+                kind: r.try_get("kind")?,
+                domain: r.try_get("domain")?,
+                username: r.try_get("username")?,
+                require_biometric: r.try_get::<i64, _>("require_biometric")? != 0,
+                last_used_at: r.try_get("last_used_at")?,
+                use_count: r.try_get("use_count")?,
+                created_at: r.try_get("created_at")?,
+            })
+        })
+        .collect()
+}
+
+pub async fn link_task_credential(pool: &Pool, task_id: &str, credential_id: &str) -> Result<()> {
+    sqlx::query("INSERT OR IGNORE INTO task_credentials (task_id, credential_id) VALUES (?, ?)")
+        .bind(task_id)
+        .bind(credential_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn credential_keychain_ref(
+    pool: &Pool,
+    cred_id: &str,
+) -> Result<Option<(String, String, String)>> {
+    let row = sqlx::query(
+        "SELECT keychain_service, keychain_account, domain FROM credentials WHERE id = ?",
+    )
+    .bind(cred_id)
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some(r) => Ok(Some((
+            r.try_get("keychain_service")?,
+            r.try_get("keychain_account")?,
+            r.try_get("domain")?,
+        ))),
+        None => Ok(None),
+    }
+}
+
+pub async fn mark_credential_used(pool: &Pool, cred_id: &str) -> Result<()> {
+    sqlx::query("UPDATE credentials SET use_count = use_count + 1, last_used_at = ? WHERE id = ?")
+        .bind(crate::now_iso())
+        .bind(cred_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

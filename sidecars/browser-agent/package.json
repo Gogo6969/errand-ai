@@ -1,0 +1,12 @@
+{
+  "name": "errand-browser-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "The browser the Errand agent drives. Speaks NDJSON-RPC over stdio; never talks to the model directly.",
+  "main": "src/main.mjs",
+  "engines": { "node": ">=20" },
+  "dependencies": {
+    "playwright-core": "1.58.2"
+  }
+}

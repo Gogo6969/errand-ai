@@ -37,3 +37,7 @@ updater.key
 # Unattributed local build note, not authored by this session. Kept out of the
 # public repo pending review (it references private paths).
 SPEC-M1.md
+
+# Sidecar dependencies (installed with npm, not vendored)
+sidecars/browser-agent/node_modules/
+sidecars/browser-agent/package-lock.json

@@ -6,6 +6,44 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## M2b
+
+### Added
+
+- **Browser sidecar.** Playwright runs in a Node process the Rust core owns and supervises. The
+  model never speaks to it: it emits symbolic actions naming refs from a snapshot, and Rust checks
+  each one before it becomes a message on the pipe.
+- **Our own accessibility snapshot** rather than Playwright's, so ref stability is under our
+  control and secure fields are marked at the point of capture. A password box renders as
+  `textbox "Password" [ref=e2] [secure] value=[hidden]`, so its contents cannot reach the model
+  even by accident.
+- **The credential fill path.** The agent names a credential and a field; it never sees the value.
+  The secret is read from the keychain at the moment of use and released only to the exact domain
+  the credential is registered against, which is also what defeats a lookalike page.
+- **Domain allowlist**, enforced in three places: stated to the model so it plans within it,
+  checked authoritatively in Rust, and blocked again in the sidecar's request router. An empty
+  allowlist permits nothing rather than everything, because a task that has not said where it may
+  go has not been taught yet. A near-miss domain is reported as a probable lookalike rather than a
+  generic block.
+- **The redactor.** Every secret resolved during a run is registered along with its URL-encoded
+  and base64 forms, and everything headed for the journal, the logs, or the model is scrubbed
+  through it. Journal writes additionally assert the line is clean and refuse to record it if not.
+- **Captcha detection**, surfaced to the agent the moment it appears so it fails honestly instead
+  of burning turns on something it is forbidden to solve.
+- **Per-site browser profiles** with a lock tied to the run, so a logged-in session survives
+  between runs and a crashed run cannot lock a site out permanently. Stale Chromium singleton
+  locks are cleared before launch.
+- Masked screenshots: password fields are obscured before the pixels exist, not blurred after.
+
+### Verified against a real site
+
+A local site with a genuine login and booking flow was used end to end. The agent logged in with a
+stored credential and booked the right slot, reporting the confirmation number the server actually
+issued. The password appears nowhere afterwards: not in the database, the logs, the journal, or
+any artifact. Told to visit a site outside its allowlist, the agent was refused and failed with an
+explanation. Told to type a bank credential into a different site, the fill was refused and
+nothing was entered.
+
 ## M2a
 
 ### Added

@@ -517,6 +517,9 @@ pub async fn run_to_completion(state: AppState, run_id: String) {
             });
         }
     }
+    // A run must not leave a browser or a profile lock behind: the next run
+    // needing that site would queue forever behind a process nobody owns.
+    state.close_browser(&run_id).await;
     state.clear_run_token(&run_id);
 }
 

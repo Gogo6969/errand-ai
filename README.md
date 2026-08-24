@@ -16,10 +16,9 @@ sites, deciding as it goes, repairing itself when a page changes, and reporting 
 </div>
 
 > [!WARNING]
-> **Early development.** Milestone 2a of 10. The daemon, database, keychain, local API, and a
-> contained Claude agent that runs tasks and journals what it did all work today. There is no
-> browser automation, no scheduler, and no user interface yet, so it cannot yet run a real
-> errand against a website.
+> **Early development.** Milestone 2b of 10. A contained agent can now log into a website with a
+> stored credential and carry out a task there, journaling what it did. There is no scheduler and
+> no user interface yet, so runs are triggered by hand through the API.
 
 ---
 
@@ -78,8 +77,8 @@ prompt nobody is awake to answer.
 |---|---|---|
 | M1 | Workspace, schema, daemon under launchd, keychain, REST and SSE core | **done** |
 | M2a | Claude CLI executor with containment, tool server, live journal | **done** |
-| M2b | Browser sidecar, symbolic actions, credential fill, redaction | next |
-| M3 | Scheduler, run windows, catch-up, the side-effect fence | |
+| M2b | Browser sidecar, symbolic actions, credential fill, redaction | **done** |
+| M3 | Scheduler, run windows, catch-up, the side-effect fence | next |
 | M4 | Teach mode and playbooks | |
 | M5 | Self-heal and the failure surface | |
 | M6 | Telegram, WhatsApp, Apple Mail, Apple Messages | |
@@ -93,7 +92,7 @@ prompt nobody is awake to answer.
 Requires a stable Rust toolchain and macOS.
 
 ```bash
-cargo test --workspace       # 25 tests, including a real keychain round-trip
+cargo test --workspace       # 36 tests, including a real keychain round-trip
 cargo build
 ```
 

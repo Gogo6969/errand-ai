@@ -16,10 +16,10 @@ sites, deciding as it goes, repairing itself when a page changes, and reporting 
 </div>
 
 > [!WARNING]
-> **Early development.** Milestone 5 of 10. A contained agent learns a task from one supervised
+> **Early development.** Milestone 6 of 10. A contained agent learns a task from one supervised
 > run, repeats it on a schedule, logs in with a stored credential, adapts when the site changes,
-> and repairs itself within a budget. It cannot yet tell you the outcome anywhere except the API,
-> and there is no user interface.
+> and repairs itself within a budget, then tells you what happened over Telegram. There is no user
+> interface yet, so tasks are written through the API.
 
 ---
 
@@ -84,8 +84,8 @@ prompt nobody is awake to answer.
 | M3 | Scheduler, run windows, catch-up, the side-effect fence | **done** |
 | M4 | Teach mode and playbooks | **done** |
 | M5 | Self-heal and the failure surface | **done** |
-| M6 | Telegram, WhatsApp, Apple Mail, Apple Messages | next |
-| M7 | API hardening, scoped tokens, webhooks, TypeScript client | |
+| M6 | Telegram, WhatsApp, Apple Mail, Apple Messages | **done** |
+| M7 | API hardening, scoped tokens, webhooks, TypeScript client | next |
 | M8 | The interface, with every control explained | |
 | M9 | Open-source preparation and signing from CI | |
 | M10 | Public v0.1.0 | |
@@ -95,7 +95,7 @@ prompt nobody is awake to answer.
 Requires a stable Rust toolchain and macOS.
 
 ```bash
-cargo test --workspace       # 102 tests, including a real keychain round-trip
+cargo test --workspace       # 129 tests, including a real keychain round-trip
 cargo build
 ```
 

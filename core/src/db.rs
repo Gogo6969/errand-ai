@@ -1305,6 +1305,201 @@ pub async fn set_task_status(pool: &Pool, task_id: &str, status: &str) -> Result
     Ok(())
 }
 
+// ------------------------------------------------------------------ outbox --
+
+pub struct NewMessage {
+    pub run_id: Option<String>,
+    pub task_id: Option<String>,
+    pub class: String,
+    pub channel: String,
+    pub recipient: String,
+    pub recipient_label: Option<String>,
+    pub subject: Option<String>,
+    pub body: String,
+    pub is_failure: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct OutboxRow {
+    pub id: String,
+    pub channel: String,
+    pub class: String,
+    pub recipient: String,
+    pub subject: Option<String>,
+    pub body: String,
+    pub attempts: i64,
+    pub is_failure: bool,
+}
+
+fn body_hash(channel: &str, recipient: &str, body: &str) -> String {
+    let mut h: u64 = 1469598103934665603;
+    for b in format!("{channel}|{recipient}|{body}").bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(1099511628211);
+    }
+    format!("{h:016x}")
+}
+
+/// Queue a message. Identical messages to the same recipient within a few
+/// minutes are dropped, because the usual cause is a bug rather than an
+/// intention, and the person on the other end does not want it twice.
+pub async fn enqueue_message(pool: &Pool, m: NewMessage) -> Result<Option<String>> {
+    let hash = body_hash(&m.channel, &m.recipient, &m.body);
+    if m.class != "test" {
+        let dup = sqlx::query(
+            "SELECT COUNT(*) AS n FROM msg_outbox
+             WHERE body_hash = ? AND created_at > strftime('%Y-%m-%dT%H:%M:%SZ','now','-10 minutes')",
+        )
+        .bind(&hash)
+        .fetch_one(pool)
+        .await?
+        .try_get::<i64, _>("n")?;
+        if dup > 0 {
+            return Ok(None);
+        }
+    }
+
+    let id = crate::new_id();
+    sqlx::query(
+        "INSERT INTO msg_outbox (id, run_id, task_id, class, channel, recipient, recipient_label,
+                                 subject, body, body_hash, state, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+    )
+    .bind(&id)
+    .bind(&m.run_id)
+    .bind(&m.task_id)
+    .bind(&m.class)
+    .bind(&m.channel)
+    .bind(&m.recipient)
+    .bind(&m.recipient_label)
+    .bind(&m.subject)
+    .bind(&m.body)
+    .bind(&hash)
+    .bind(crate::now_iso())
+    .execute(pool)
+    .await?;
+    // Carried on the row so the outbox knows whether this is the news that
+    // breaks through quiet hours.
+    if m.is_failure {
+        sqlx::query("UPDATE msg_outbox SET last_error = 'failure-notice' WHERE id = ?")
+            .bind(&id)
+            .execute(pool)
+            .await?;
+    }
+    Ok(Some(id))
+}
+
+pub async fn due_outbox(pool: &Pool, limit: i64) -> Result<Vec<OutboxRow>> {
+    let rows = sqlx::query(
+        "SELECT id, channel, class, recipient, subject, body, attempts, last_error
+         FROM msg_outbox
+         WHERE state IN ('queued','retry_wait','deferred_quiet')
+           AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
+         ORDER BY created_at LIMIT ?",
+    )
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| {
+            let le: Option<String> = r.try_get("last_error")?;
+            Ok(OutboxRow {
+                id: r.try_get("id")?,
+                channel: r.try_get("channel")?,
+                class: r.try_get("class")?,
+                recipient: r.try_get("recipient")?,
+                subject: r.try_get("subject")?,
+                body: r.try_get("body")?,
+                attempts: r.try_get("attempts")?,
+                is_failure: le.as_deref() == Some("failure-notice"),
+            })
+        })
+        .collect()
+}
+
+pub async fn begin_send(pool: &Pool, id: &str) -> Result<()> {
+    sqlx::query("UPDATE msg_outbox SET state = 'sending', attempts = attempts + 1 WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn mark_sent(pool: &Pool, id: &str, receipt: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE msg_outbox SET state = 'sent', sent_at = ?, provider_receipt = ? WHERE id = ?",
+    )
+    .bind(crate::now_iso())
+    .bind(receipt)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn fail_outbox(
+    pool: &Pool,
+    id: &str,
+    state: &str,
+    error: &str,
+    next_attempt_at: Option<String>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE msg_outbox SET state = ?, last_error = ?, next_attempt_at = ? WHERE id = ?",
+    )
+    .bind(state)
+    .bind(error)
+    .bind(next_attempt_at)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn defer_outbox(pool: &Pool, id: &str, until: String) -> Result<()> {
+    sqlx::query("UPDATE msg_outbox SET state = 'deferred_quiet', next_attempt_at = ? WHERE id = ?")
+        .bind(until)
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// A send interrupted by a crash may or may not have arrived.
+///
+/// Retrying it blindly risks messaging someone twice; dropping it risks them
+/// never hearing. Neither is acceptable silently, so it is marked uncertain and
+/// shown as such.
+pub async fn mark_sending_uncertain(pool: &Pool) -> Result<u64> {
+    let res = sqlx::query(
+        "UPDATE msg_outbox SET state = 'uncertain',
+             last_error = 'Errand stopped while this was being sent, so it may or may not have arrived'
+         WHERE state = 'sending'",
+    )
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+pub async fn outbox_for_run(pool: &Pool, run_id: &str) -> Result<Vec<(String, String, String)>> {
+    let rows = sqlx::query(
+        "SELECT channel, state, COALESCE(last_error,'') AS err FROM msg_outbox WHERE run_id = ?",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| {
+            Ok((
+                r.try_get("channel")?,
+                r.try_get("state")?,
+                r.try_get("err")?,
+            ))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2013,5 +2208,143 @@ mod tests {
         }
         let notes = recent_notes(&pool, &t.id, 5).await.unwrap();
         assert_eq!(notes, vec!["older".to_string(), "newer".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn the_same_message_twice_in_a_minute_only_goes_once() {
+        let pool = open_memory().await.unwrap();
+        let m = || NewMessage {
+            run_id: None,
+            task_id: None,
+            class: "notify".into(),
+            channel: "telegram".into(),
+            recipient: "123".into(),
+            recipient_label: None,
+            subject: None,
+            body: "Court booked".into(),
+            is_failure: false,
+        };
+        assert!(enqueue_message(&pool, m()).await.unwrap().is_some());
+        assert!(
+            enqueue_message(&pool, m()).await.unwrap().is_none(),
+            "a duplicate is almost always a bug, and the person does not want it twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_test_message_is_never_deduplicated() {
+        let pool = open_memory().await.unwrap();
+        let m = || NewMessage {
+            run_id: None,
+            task_id: None,
+            class: "test".into(),
+            channel: "telegram".into(),
+            recipient: "123".into(),
+            recipient_label: None,
+            subject: None,
+            body: "test".into(),
+            is_failure: false,
+        };
+        assert!(enqueue_message(&pool, m()).await.unwrap().is_some());
+        assert!(
+            enqueue_message(&pool, m()).await.unwrap().is_some(),
+            "pressing Send test twice must actually send twice"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_queued_message_becomes_due_and_can_be_completed() {
+        let pool = open_memory().await.unwrap();
+        let id = enqueue_message(
+            &pool,
+            NewMessage {
+                run_id: None,
+                task_id: None,
+                class: "notify".into(),
+                channel: "telegram".into(),
+                recipient: "123".into(),
+                recipient_label: None,
+                subject: None,
+                body: "hello".into(),
+                is_failure: true,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        let due = due_outbox(&pool, 10).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert!(
+            due[0].is_failure,
+            "bad news must be recognisable as bad news"
+        );
+
+        begin_send(&pool, &id).await.unwrap();
+        mark_sent(&pool, &id, "42").await.unwrap();
+        assert!(due_outbox(&pool, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_message_interrupted_mid_send_is_marked_uncertain_rather_than_resent() {
+        let pool = open_memory().await.unwrap();
+        let id = enqueue_message(
+            &pool,
+            NewMessage {
+                run_id: None,
+                task_id: None,
+                class: "outreach".into(),
+                channel: "whatsapp".into(),
+                recipient: "15550100@c.us".into(),
+                recipient_label: Some("Alex".into()),
+                subject: None,
+                body: "Court booked".into(),
+                is_failure: false,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        begin_send(&pool, &id).await.unwrap();
+
+        assert_eq!(mark_sending_uncertain(&pool).await.unwrap(), 1);
+        // Not retried: messaging someone twice is worse than telling the truth
+        // that nobody knows whether it arrived.
+        assert!(due_outbox(&pool, 10).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn something_needing_a_person_is_parked_rather_than_retried() {
+        let pool = open_memory().await.unwrap();
+        let id = enqueue_message(
+            &pool,
+            NewMessage {
+                run_id: None,
+                task_id: None,
+                class: "notify".into(),
+                channel: "whatsapp".into(),
+                recipient: "x".into(),
+                recipient_label: None,
+                subject: None,
+                body: "hi".into(),
+                is_failure: false,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        fail_outbox(
+            &pool,
+            &id,
+            "needs_user",
+            "logged out; scan the QR code",
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            due_outbox(&pool, 10).await.unwrap().is_empty(),
+            "retrying achieves nothing until a person acts"
+        );
     }
 }

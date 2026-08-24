@@ -15,10 +15,12 @@
 
 mod api;
 mod browser;
+mod channels;
 mod executor;
 mod fixer;
 mod lock;
 mod mcp;
+mod outbox;
 mod redact;
 mod scheduler;
 mod secrets;
@@ -251,6 +253,8 @@ async fn serve(foreground: bool) -> Result<()> {
     // after the listener so a scheduling problem can never stop the API from
     // answering questions about why nothing is running.
     scheduler::spawn(state.clone());
+    outbox::spawn(state.clone());
+    channels::inbound::spawn(state.clone());
 
     // Only now touch the keychain.
     //

@@ -663,6 +663,13 @@ pub async fn run_to_completion(state: AppState, run_id: String) {
         }
     }
 
+    // Tell the person what happened. Queued rather than sent, because whether
+    // a message got through is a separate question from whether the work did,
+    // and a slow Telegram must never turn a successful booking into a failure.
+    if let Err(e) = crate::outbox::notify_run(&state, &run_id).await {
+        tracing::warn!(run_id, "could not queue the run notification: {e}");
+    }
+
     // A run must not leave a browser or a profile lock behind: the next run
     // needing that site would queue forever behind a process nobody owns.
     state.close_browser(&run_id).await;

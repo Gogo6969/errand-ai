@@ -49,6 +49,10 @@ pub fn router(state: AppState) -> Router {
             get(list_credentials).post(create_credential),
         )
         .route("/v1/credentials/{id}", delete(delete_credential))
+        .route("/v1/channels", get(list_channels))
+        .route("/v1/channels/{channel}/config", post(configure_channel))
+        .route("/v1/channels/{channel}/test", post(test_channel))
+        .route("/v1/channels/{channel}/enable", post(enable_channel))
         .route("/v1/admin/quiesce", post(quiesce))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -207,6 +211,165 @@ async fn activate_task(
             "This task has no schedule, so it will only run when you ask it to."
         }
     })))
+}
+
+#[derive(Deserialize)]
+struct ChannelConfig {
+    /// Write-only. Goes to the keychain and is never returned.
+    #[serde(default)]
+    secrets: std::collections::HashMap<String, String>,
+    /// Non-secret settings, such as where a gateway lives.
+    #[serde(default)]
+    settings: std::collections::HashMap<String, serde_json::Value>,
+}
+
+/// Set up a channel. Secrets go to the keychain; nothing sensitive is echoed.
+async fn configure_channel(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(channel): Path<String>,
+    Json(body): Json<ChannelConfig>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    if crate::channels::ChannelId::parse(&channel).is_none() {
+        return Err(ApiError::bad_request(format!(
+            "'{channel}' is not a channel."
+        )));
+    }
+
+    // Only the accounts a channel actually uses, so a typo cannot quietly
+    // write a secret nothing will ever read.
+    const ALLOWED: &[&str] = &[
+        "telegram.bot_token",
+        "telegram.chat_id",
+        "telegram.owner_user_id",
+        "whatsapp.api_key",
+    ];
+
+    let mut stored = vec![];
+    for (k, v) in body.secrets {
+        if !ALLOWED.contains(&k.as_str()) {
+            return Err(ApiError::bad_request(format!(
+                "'{k}' is not something Errand stores. Expected one of: {}",
+                ALLOWED.join(", ")
+            )));
+        }
+        crate::secrets::put_internal(&k, errand_core::keychain::Secret::new(v))
+            .await
+            .map_err(|e| {
+                ApiError::internal(format!("Could not save that to your keychain: {e}"))
+            })?;
+        stored.push(k);
+    }
+
+    for (k, v) in body.settings {
+        errand_core::db::set_setting(state.pool(), &k, &v)
+            .await
+            .map_err(ApiError::from)?;
+    }
+
+    let health = crate::channels::health_all(state.pool()).await;
+    Ok(Json(json!({
+        "stored": stored,
+        "health": health.iter().find(|h| h.channel == channel),
+        "note": "Secrets are in your macOS keychain. Errand can use them; it cannot show them \
+                 back to you."
+    })))
+}
+
+/// Every channel, and what it would take to make each one work.
+async fn list_channels(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Read)?;
+    let health = crate::channels::health_all(state.pool()).await;
+    Ok(Json(json!({
+        "channels": health,
+        "notes": {
+            "telegram": "Where run outcomes go. This is the one Errand relies on.",
+            "whatsapp": crate::channels::whatsapp::RISK_NOTICE,
+            "apple_mail": "Needs macOS Automation permission, which Errand asks for when you \
+                           press Enable, so the prompt appears while you are looking at it.",
+            "imessage": "Needs Messages to be signed in, and the same Automation permission."
+        }
+    })))
+}
+
+/// Send a real message through the whole pipeline, so a green light means it
+/// actually works rather than that the settings look plausible.
+async fn test_channel(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(channel): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    let Some(id) = crate::channels::ChannelId::parse(&channel) else {
+        return Err(ApiError::bad_request(format!(
+            "'{channel}' is not a channel."
+        )));
+    };
+
+    // Only ever to you. A test that could message someone else would be a
+    // convenient way to make Errand send anything to anyone.
+    let recipient = match id {
+        crate::channels::ChannelId::Telegram => {
+            crate::channels::telegram::configured_chat_id().await
+        }
+        _ => None,
+    };
+    let Some(recipient) = recipient else {
+        return Err(ApiError::conflict(
+            "no_self_recipient",
+            "A test only ever goes to you, and Errand does not know where that is for this \
+             channel yet. Set your own address for it first.",
+        ));
+    };
+
+    let queued = errand_core::db::enqueue_message(
+        state.pool(),
+        errand_core::db::NewMessage {
+            run_id: None,
+            task_id: None,
+            class: "test".into(),
+            channel: channel.clone(),
+            recipient,
+            recipient_label: Some("you".into()),
+            subject: Some("Errand test".into()),
+            body: format!(
+                "This is a test from Errand, sent at {}. If you are reading it, this channel works.",
+                errand_core::now_iso()
+            ),
+            is_failure: false,
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    Ok(Json(json!({
+        "queued": queued,
+        "note": "Queued. It goes out within a few seconds; check the channel list afterwards to \
+                 see whether it actually sent."
+    })))
+}
+
+/// Ask macOS for Automation permission now, while somebody is watching.
+async fn enable_channel(
+    State(_state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(channel): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    let Some(id) = crate::channels::ChannelId::parse(&channel) else {
+        return Err(ApiError::bad_request(format!(
+            "'{channel}' is not a channel."
+        )));
+    };
+    // The prompt has to come from the daemon, because macOS grants Automation
+    // to the process that sends the Apple Event. Asking from anywhere else
+    // grants it to the wrong thing and the 03:00 run still fails.
+    let health = crate::channels::apple::request_consent(id).await;
+    Ok(Json(serde_json::to_value(health).unwrap_or(json!({}))))
 }
 
 /// Start the supervised first run of a task.

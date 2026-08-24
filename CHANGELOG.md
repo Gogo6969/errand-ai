@@ -118,6 +118,40 @@ mattered most:
   It is now checked before every tool call, and the run winds down at seven. The tools that end a
   run stay open, so an over-budget agent can still report how far it got.
 
+## M6
+
+### Added
+
+- **Telegram, the channel Errand relies on.** A run finishing produces a card saying what
+  happened, how long it took and what it cost. WhatsApp rides an unofficial gateway that decays
+  and the Apple channels need consent that can be revoked, so run outcomes go here.
+- **A read-only bot.** You can ask it `/status`, `/tasks` and `/runs` from your phone. It cannot
+  start a run, approve anything, or change a task, because a chat message is not a good place to
+  authorise something that cannot be undone.
+- **Every inbound message is checked against one configured owner** and dropped otherwise. A bot
+  is addressable by anyone who discovers its username, and the token protects sending rather than
+  receiving. With no owner set, nobody is trusted rather than everybody.
+- **WhatsApp, honestly described.** There is no official API for personal accounts, so this drives
+  WhatsApp Web through a gateway. Sessions log out and need a QR rescan that cannot happen while
+  you are asleep, and automated sending can get a personal number banned. It is best effort, off
+  by default, and never the only way you find out what happened.
+- **Apple Mail and Apple Messages** through AppleScript, with the two error codes that actually
+  matter translated into something you can act on rather than passed through as numbers.
+- **Consent is requested from a button**, not from a run. macOS grants Automation to whichever
+  process sends the Apple Event, so the daemon asks while you are looking at the screen instead of
+  at 03:00 when there is nobody to click Allow. Every AppleScript call has a deadline, so a prompt
+  waiting where nobody can see it reports itself instead of hanging the daemon.
+- **The outbox.** Nothing sends inline. A run enqueues and moves on, so a slow channel can never
+  turn a completed booking into a failure. Retries back off and then stop; something that needs a
+  person is parked rather than retried, because retrying achieves nothing until they act; and a
+  send interrupted by a crash is marked uncertain rather than repeated, since messaging someone
+  twice is worse than admitting nobody knows whether it arrived.
+- **Quiet hours** for messages to people and for routine good news. A failure you asked to hear
+  about breaks through, because being told at 09:00 that the 08:00 booking failed is being told
+  too late to act.
+- Identical messages to the same recipient within ten minutes are dropped, since the usual cause
+  is a bug and the person on the other end does not want it twice.
+
 ## Unreleased, after M3
 
 ### Fixed

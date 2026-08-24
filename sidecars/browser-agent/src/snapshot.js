@@ -94,6 +94,13 @@ export const SNAPSHOT_FN = `(() => {
         } else if (el.value && el.type !== 'password') {
           parts.push('value=' + JSON.stringify(String(el.value).slice(0, 60)));
         }
+        // A control that submits a form is committing something. This is a far
+        // better signal than the words on it, because "Book a court" can be a
+        // navigation link and "Continue" can be a purchase.
+        const submits =
+          (tag === 'button' && (el.type === 'submit' || !el.type || el.type === '') && el.closest('form')) ||
+          (tag === 'input' && el.type === 'submit');
+        if (submits) parts.push('[submit]');
         if (el.disabled) parts.push('[disabled]');
         if (el.checked) parts.push('[checked]');
         if (tag === 'a' && el.href) parts.push('-> ' + el.getAttribute('href'));

@@ -16,9 +16,10 @@ sites, deciding as it goes, repairing itself when a page changes, and reporting 
 </div>
 
 > [!WARNING]
-> **Early development.** Milestone 3 of 10. A contained agent logs into a website with a stored
-> credential, carries out a task there, and now does it on a schedule without being asked. There
-> is no teach mode and no user interface yet, so tasks are written and triggered through the API.
+> **Early development.** Milestone 4 of 10. A contained agent learns a task from one supervised
+> run, writes down what worked for you to approve, and then repeats it on a schedule, logging into
+> the site with a stored credential. There is no user interface yet, so everything goes through
+> the API.
 
 ---
 
@@ -81,8 +82,8 @@ prompt nobody is awake to answer.
 | M2a | Claude CLI executor with containment, tool server, live journal | **done** |
 | M2b | Browser sidecar, symbolic actions, credential fill, redaction | **done** |
 | M3 | Scheduler, run windows, catch-up, the side-effect fence | **done** |
-| M4 | Teach mode and playbooks | next |
-| M5 | Self-heal and the failure surface | |
+| M4 | Teach mode and playbooks | **done** |
+| M5 | Self-heal and the failure surface | next |
 | M6 | Telegram, WhatsApp, Apple Mail, Apple Messages | |
 | M7 | API hardening, scoped tokens, webhooks, TypeScript client | |
 | M8 | The interface, with every control explained | |
@@ -94,7 +95,7 @@ prompt nobody is awake to answer.
 Requires a stable Rust toolchain and macOS.
 
 ```bash
-cargo test --workspace       # 72 tests, including a real keychain round-trip
+cargo test --workspace       # 89 tests, including a real keychain round-trip
 cargo build
 ```
 

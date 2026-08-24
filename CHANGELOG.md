@@ -52,6 +52,41 @@ mattered most:
 - **A window straddling local midnight was always missed**, abandoning every occurrence with an
   explanation that was untrue.
 
+## M4
+
+### Added
+
+- **Playbooks.** What the agent learned, written as markdown, versioned on disk and indexed in
+  SQLite. Plain markdown rather than a JSON blob in a column, because a structure nobody can read
+  is a structure nobody checks: you can open it, diff two versions, and see exactly what your
+  agent believes about a site.
+- **Intent and hint are separate.** A step records what it was trying to achieve and, separately,
+  how that happened to work last time. Intents survive a site redesign; hints do not, and the
+  agent is told to pursue the intent when a hint stops matching the page.
+- **Teach mode.** `POST /v1/tasks/{id}/teach` runs a task from its description alone, and the
+  agent calls `save_playbook` near the end with what actually worked.
+- **The approval gate.** A new playbook is stored unapproved and is followed by nothing. A task
+  with no approved playbook cannot be run normally and cannot be put on a schedule at all, because
+  scheduling one would send an unattended agent at a site with no agreed way of doing the job.
+  Approving needs the approve scope, not merely the one that starts runs.
+- **Only hints change themselves.** A playbook is distilled from pages written by strangers and
+  then fed back as trusted instruction, so the review gate is what stands between a hostile page
+  and a permanent foothold. Anything that changes the goal, a step's intent, a decision rule, or a
+  "Never do" line waits for a person.
+- **Notes between runs.** `leave_note` records something small a run learned, and the next run
+  reads the last few, oldest first.
+
+### Fixed
+
+- **The action classifier treated navigation as commitment.** Found by testing against a real
+  site: a homepage link reading "Book a court" was classified as a booking, which armed the fence
+  and then blocked the actual booking button on the next page, so the task could never book at
+  all. A link that merely navigates is no longer a commitment however it is worded, buttons that
+  submit a form are marked as such at the point of capture, and an unrecognised form submission
+  errs toward being treated as a commitment.
+- **Runs were ordered by a second-resolution timestamp alone**, so two runs in the same second
+  came back in an arbitrary order. The notes fed to an agent could be the wrong way round.
+
 ## Unreleased, after M3
 
 ### Fixed

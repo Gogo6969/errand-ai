@@ -200,8 +200,16 @@ fn system_prompt(has_playbook: bool) -> String {
     );
     if !has_playbook {
         p.push_str(
-            "\nThis task has no playbook yet, so work from the description alone and journal \
-             carefully. What you record is what the next run will learn from.\n",
+            "\nThis task has no playbook yet. Work from the description, and near the end call \
+             save_playbook with what actually worked, so the next run does not start from \
+             nothing. Write each step as an INTENT plus a separate HINT: intents survive a site \
+             redesign, hints do not.\n",
+        );
+    } else {
+        p.push_str(
+            "\nThis task has a playbook from a previous run. Follow its intents. If a hint no \
+             longer matches the page, pursue the intent another way and leave a note saying what \
+             changed, rather than giving up or guessing wildly.\n",
         );
     }
     p

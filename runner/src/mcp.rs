@@ -171,6 +171,56 @@ fn tool_definitions() -> Value {
                 "properties": { "caption": { "type": "string" } },
                 "additionalProperties": false
             }
+        }        ,
+        {
+            "name": "save_playbook",
+            "description":
+                "Write down how to do this task, so future runs do not have to work it out again. \
+                 Call this once, near the end of a supervised first run, after you know what \
+                 actually worked. Describe each step by its INTENT (what you were trying to \
+                 achieve, which survives a site redesign) and give the hint (the URL or the \
+                 button you used) separately, because hints go stale and intents do not. What \
+                 you write is shown to the person for approval before any future run follows it.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "goal": { "type": "string", "description": "One sentence: what this task achieves." },
+                    "steps": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "intent": { "type": "string", "description": "What this step achieves." },
+                                "hint": { "type": "string", "description": "How you did it this time. May go stale." },
+                                "decision": { "type": "string", "description": "What to do when the obvious path is not there." }
+                            },
+                            "required": ["intent"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "preconditions": { "type": "array", "items": { "type": "string" } },
+                    "success": { "type": "array", "items": { "type": "string" },
+                        "description": "How a future run knows it actually worked." },
+                    "known_failures": { "type": "array", "items": { "type": "string" } },
+                    "never": { "type": "array", "items": { "type": "string" },
+                        "description": "Things a future run must never do, such as booking twice." }
+                },
+                "required": ["goal", "steps"],
+                "additionalProperties": false
+            }
+        },
+        {
+            "name": "leave_note",
+            "description":
+                "Leave a short note for the next run of this task: something you learned that is \
+                 not worth changing the playbook over, such as a button that moved or a wait that \
+                 needed to be longer. Keep it to a sentence or two.",
+            "inputSchema": {
+                "type": "object",
+                "properties": { "note": { "type": "string" } },
+                "required": ["note"],
+                "additionalProperties": false
+            }
         }
     ])
 }
@@ -189,6 +239,8 @@ pub fn qualified_tool_names() -> Vec<String> {
         "fill_credential",
         "list_credentials",
         "screenshot",
+        "save_playbook",
+        "leave_note",
     ]
     .iter()
     .map(|t| format!("mcp__errand__{t}"))
@@ -484,9 +536,11 @@ async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &Value) -> V
             let the_ref = args.get("ref").and_then(|r| r.as_str()).unwrap_or("");
             let described = b.describe_ref(the_ref).await;
             let action_kind = if kind == "click" {
-                described
-                    .as_ref()
-                    .and_then(|(role, label)| crate::browser::looks_irreversible(role, label))
+                described.as_ref().and_then(|(role, label)| {
+                    let submits = role.ends_with("+submit");
+                    let base = role.trim_end_matches("+submit");
+                    crate::browser::classify(base, label, submits)
+                })
             } else {
                 None
             };
@@ -613,6 +667,22 @@ async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &Value) -> V
             }
         }
 
+        "save_playbook" => match save_playbook(state, run_id, args).await {
+            Ok(v) => text_result(v),
+            Err(e) => text_error(format!("Could not save the playbook: {e}")),
+        },
+
+        "leave_note" => {
+            let Some(note) = args.get("note").and_then(|n| n.as_str()) else {
+                return text_error("leave_note needs a 'note'.");
+            };
+            let clean = state.redactor(run_id).scrub(note);
+            match errand_core::db::set_run_notes(state.pool(), run_id, &clean).await {
+                Ok(_) => text_result("noted for the next run"),
+                Err(e) => text_error(format!("could not save that note: {e}")),
+            }
+        }
+
         other => {
             let _ = INVALID_PARAMS;
             text_error(format!("There is no tool called '{other}'."))
@@ -628,22 +698,62 @@ async fn read_brief(state: &AppState, run_id: &str) -> anyhow::Result<String> {
         .await?
         .ok_or_else(|| anyhow::anyhow!("task not found"))?;
 
+    let mut out = format!(
+        "Task: {}\n\nWhat the person asked for:\n{}\n",
+        task.name, task.description
+    );
+
+    // The description is the source of truth; the playbook is a shortcut the
+    // agent wrote for itself last time. Presented in that order, and labelled,
+    // so a stale hint never outranks what the person actually asked for.
+    match errand_core::db::active_playbook(state.pool(), &run.task_id).await {
+        Ok(Some(pb)) => {
+            out.push_str("\nHow this was done before (version ");
+            out.push_str(&pb.version.to_string());
+            out.push_str(
+                "). Treat each INTENT as what matters and each HINT as \
+                 how it happened to work last time: if a hint no longer fits the page, pursue the \
+                 intent another way and say so in a note.\n\n",
+            );
+            out.push_str(&pb.to_markdown());
+        }
+        Ok(None) => {
+            out.push_str(
+                "\nThere is no playbook for this task yet, so work it out from the description. \
+                 When you know what actually worked, call save_playbook so the next run does not \
+                 have to start from nothing.\n",
+            );
+        }
+        Err(e) => {
+            tracing::warn!(task = %run.task_id, "could not load the playbook: {e}");
+        }
+    }
+
+    if let Ok(notes) = errand_core::db::recent_notes(state.pool(), &run.task_id, 3).await {
+        if !notes.is_empty() {
+            out.push_str("\nNotes left by recent runs, oldest first:\n");
+            for n in notes {
+                out.push_str(&format!("- {n}\n"));
+            }
+        }
+    }
+
     let mode_note = match run.mode.as_str() {
         "dry_run" => {
-            "\n\nThis is a REHEARSAL. Anything that cannot be undone will be recorded \
-                      as what you would have done, and will not actually happen. Work through the \
-                      task normally and report what you would have done."
+            "\nThis is a REHEARSAL. Anything that cannot be undone will be recorded as \
+                      what you would have done, and will not actually happen. Work through the \
+                      task normally and report what you would have done.\n"
         }
         "teach" => {
-            "\n\nThis is a first, supervised run. Work carefully and journal your \
-                    reasoning, because what you record is what future runs will learn from."
+            "\nThis is the first, supervised run of this task. Nobody has approved a way \
+                    of doing it yet. Work carefully, journal your reasoning as you go, and near \
+                    the end call save_playbook with what actually worked.\n"
         }
         _ => "",
     };
-    Ok(format!(
-        "Task: {}\n\nWhat the person asked for:\n{}\n\nTriggered by: {}{}",
-        task.name, task.description, run.trigger, mode_note
-    ))
+    out.push_str(mode_note);
+    out.push_str(&format!("\nTriggered by: {}\n", run.trigger));
+    Ok(out)
 }
 
 fn render_snapshot(s: &crate::browser::Snapshot) -> String {
@@ -982,6 +1092,122 @@ async fn is_dry_run(state: &AppState, run_id: &str) -> bool {
         .flatten()
         .map(|r| r.mode == "dry_run")
         .unwrap_or(false)
+}
+
+/// Turn what the agent learned into a stored, unapproved playbook version.
+///
+/// Unapproved on purpose. A playbook is distilled from pages written by
+/// strangers and then fed back to the agent as trusted instruction, so a person
+/// reads it before any future run follows it.
+async fn save_playbook(state: &AppState, run_id: &str, args: &Value) -> anyhow::Result<String> {
+    use errand_core::playbook::{Playbook, Source, Step};
+
+    let run = errand_core::db::get_run(state.pool(), run_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("run not found"))?;
+    let task = errand_core::db::get_task(state.pool(), &run.task_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+
+    let strings = |k: &str| -> Vec<String> {
+        args.get(k)
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+
+    let steps: Vec<Step> = args
+        .get("steps")
+        .and_then(|v| v.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|s| {
+                    let intent = s.get("intent")?.as_str()?.to_string();
+                    Some(Step {
+                        intent,
+                        hint: s.get("hint").and_then(|h| h.as_str()).map(str::to_string),
+                        decision: s
+                            .get("decision")
+                            .and_then(|d| d.as_str())
+                            .map(str::to_string),
+                    })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
+    if steps.is_empty() {
+        anyhow::bail!("a playbook needs at least one step");
+    }
+
+    let sites: Vec<String> = task
+        .allowed_domains
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let version = errand_core::db::next_playbook_version(state.pool(), &run.task_id).await?;
+    let red = state.redactor(run_id);
+    let pb = Playbook {
+        version,
+        goal: red.scrub(args.get("goal").and_then(|g| g.as_str()).unwrap_or("")),
+        sites,
+        preconditions: strings("preconditions"),
+        steps: steps
+            .into_iter()
+            .map(|s| Step {
+                intent: red.scrub(&s.intent),
+                hint: s.hint.map(|h| red.scrub(&h)),
+                decision: s.decision.map(|d| red.scrub(&d)),
+            })
+            .collect(),
+        success: strings("success"),
+        known_failures: strings("known_failures"),
+        never: strings("never"),
+    };
+
+    if pb.goal.trim().is_empty() {
+        anyhow::bail!("a playbook needs a goal");
+    }
+
+    let source = if run.mode == "teach" {
+        Source::Teach
+    } else {
+        Source::Refine
+    };
+    errand_core::db::add_playbook_version(
+        state.pool(),
+        &run.task_id,
+        &pb,
+        source,
+        Some(run_id),
+        None,
+        false,
+    )
+    .await?;
+
+    let _ = journal(
+        state,
+        run_id,
+        "plan",
+        &format!("Wrote down how to do this, as version {version}"),
+        true,
+    )
+    .await;
+
+    Ok(format!(
+        "Saved as version {version}, with {} steps. It is waiting for the person to read and \
+         approve it; nothing will follow it until they do.",
+        pb.steps.len()
+    ))
 }
 
 #[cfg(test)]

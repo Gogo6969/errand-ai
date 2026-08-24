@@ -97,6 +97,13 @@ fn parse_refs(tree: &str) -> HashMap<String, (String, String)> {
             (Some(a), Some(b)) if b > a => body[a + 1..b].to_string(),
             _ => String::new(),
         };
+        // Carried through the role so the classifier can see it without
+        // widening the map's shape.
+        let role = if line.contains("[submit]") {
+            format!("{role}+submit")
+        } else {
+            role
+        };
         out.insert(r#ref, (role, label));
     }
     out
@@ -108,24 +115,60 @@ fn parse_refs(tree: &str) -> HashMap<String, (String, String)> {
 /// account of what it is doing. The two are combined by taking the stricter,
 /// because the expensive mistake here is one-directional: a needless
 /// confirmation costs a moment, an unguarded booking costs a court.
-pub fn looks_irreversible(role: &str, label: &str) -> Option<&'static str> {
+/// As above, but told whether the control submits a form.
+///
+/// A link that merely navigates is not a commitment, however it is worded. This
+/// distinction was learned from a real site: a homepage link reading "Book a
+/// court" was classified as a booking, which armed the fence and then blocked
+/// the actual booking button on the next page. Words alone are not enough.
+pub fn classify(role: &str, label: &str, submits: bool) -> Option<&'static str> {
     let l = label.to_ascii_lowercase();
-    let is_control = matches!(role, "button" | "link" | "menuitem") || role.is_empty();
-    if !is_control {
-        return None;
-    }
-    const PURCHASE: &[&str] = &["pay", "buy", "purchase", "checkout", "order", "subscribe"];
-    const BOOKING: &[&str] = &["book", "reserve", "confirm", "submit", "apply", "register"];
+
+    const PURCHASE: &[&str] = &[
+        "pay",
+        "buy",
+        "purchase",
+        "checkout",
+        "place order",
+        "subscribe",
+    ];
     const DELETION: &[&str] = &[
         "delete",
         "remove",
         "cancel booking",
+        "cancel reservation",
         "unsubscribe",
         "close account",
     ];
+    // These commit something only when the control actually does something,
+    // rather than taking you to the page where you might.
+    const BOOKING: &[&str] = &["book", "reserve", "confirm", "submit", "apply", "register"];
     const MESSAGE: &[&str] = &["send", "post", "publish", "reply"];
 
     let hit = |set: &[&str]| set.iter().any(|w| l.contains(w));
+
+    let acts = match role {
+        // A button, or something behaving as one, can commit.
+        "button" | "menuitem" | "" => true,
+        // A link navigates. Only the words that are never navigation count.
+        "link" => {
+            return if hit(PURCHASE) || hit(DELETION) {
+                Some(if hit(PURCHASE) {
+                    "purchase"
+                } else {
+                    "deletion"
+                })
+            } else {
+                None
+            }
+        }
+        // Text boxes, checkboxes and the rest commit nothing by being clicked.
+        _ => false,
+    };
+    if !acts && !submits {
+        return None;
+    }
+
     if hit(PURCHASE) {
         Some("purchase")
     } else if hit(DELETION) {
@@ -134,6 +177,11 @@ pub fn looks_irreversible(role: &str, label: &str) -> Option<&'static str> {
         Some("booking")
     } else if hit(MESSAGE) {
         Some("message")
+    } else if submits && l.len() < 40 {
+        // A form submission whose wording we do not recognise. Treated as a
+        // commitment, because the cost of a needless confirmation is a moment
+        // and the cost of the other mistake is a real booking.
+        Some("form_submit")
     } else {
         None
     }
@@ -450,6 +498,11 @@ fn sidecar_script() -> Result<PathBuf> {
 mod tests {
     use super::*;
 
+    /// A click on something that does not submit a form.
+    fn looks_irreversible(role: &str, label: &str) -> Option<&'static str> {
+        classify(role, label, false)
+    }
+
     fn policy(domains: &[&str]) -> DomainPolicy {
         DomainPolicy {
             allowed: domains.iter().map(|s| s.to_string()).collect(),
@@ -552,5 +605,48 @@ mod tests {
             looks_irreversible("button", "Confirm and pay"),
             Some("purchase")
         );
+    }
+
+    #[test]
+    fn a_navigation_link_is_not_a_commitment_however_it_is_worded() {
+        // Learned from a real site: a homepage link reading "Book a court"
+        // armed the fence and then blocked the actual booking button.
+        assert_eq!(looks_irreversible("link", "Book a court"), None);
+        assert_eq!(looks_irreversible("link", "Reserve a slot"), None);
+        assert_eq!(looks_irreversible("link", "Send us feedback"), None);
+        // But a link that plainly spends money or destroys something still counts.
+        assert_eq!(looks_irreversible("link", "Buy now"), Some("purchase"));
+        assert_eq!(
+            looks_irreversible("link", "Delete account"),
+            Some("deletion")
+        );
+    }
+
+    #[test]
+    fn a_button_that_books_is_still_a_commitment() {
+        assert_eq!(
+            looks_irreversible("button", "Book Wednesday 19:00 court 2"),
+            Some("booking")
+        );
+        assert_eq!(
+            looks_irreversible("button", "Confirm booking"),
+            Some("booking")
+        );
+    }
+
+    #[test]
+    fn an_unrecognised_form_submission_is_treated_as_a_commitment() {
+        // The wording is unfamiliar, but it submits a form, so it errs safe.
+        assert_eq!(classify("button", "Continue", true), Some("form_submit"));
+        // The same word on a plain link commits nothing.
+        assert_eq!(classify("link", "Continue", false), None);
+    }
+
+    #[test]
+    fn the_submit_marker_is_carried_through_from_the_snapshot() {
+        let tree = "- button \"Continue\" [ref=e4] [submit]\n- link \"Back\" [ref=e5]";
+        let m = parse_refs(tree);
+        assert_eq!(m.get("e4").unwrap().0, "button+submit");
+        assert_eq!(m.get("e5").unwrap().0, "link");
     }
 }

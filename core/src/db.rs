@@ -192,21 +192,22 @@ pub async fn list_runs(
     task_id: Option<&str>,
     limit: i64,
 ) -> Result<Vec<crate::models::Run>> {
-    let rows = match task_id {
-        Some(t) => {
-            sqlx::query("SELECT * FROM runs WHERE task_id = ? ORDER BY created_at DESC LIMIT ?")
-                .bind(t)
-                .bind(limit)
-                .fetch_all(pool)
-                .await?
-        }
-        None => {
-            sqlx::query("SELECT * FROM runs ORDER BY created_at DESC LIMIT ?")
-                .bind(limit)
-                .fetch_all(pool)
-                .await?
-        }
-    };
+    let rows =
+        match task_id {
+            Some(t) => sqlx::query(
+                "SELECT * FROM runs WHERE task_id = ? ORDER BY created_at DESC, id DESC LIMIT ?",
+            )
+            .bind(t)
+            .bind(limit)
+            .fetch_all(pool)
+            .await?,
+            None => {
+                sqlx::query("SELECT * FROM runs ORDER BY created_at DESC, id DESC LIMIT ?")
+                    .bind(limit)
+                    .fetch_all(pool)
+                    .await?
+            }
+        };
     rows.iter().map(run_from_row).collect()
 }
 
@@ -1149,6 +1150,161 @@ pub async fn confirm_holds(pool: &Pool, task_id: &str, note: &str) -> Result<u64
     Ok(res.rows_affected())
 }
 
+// --------------------------------------------------------------- playbooks --
+
+#[derive(Debug, Clone)]
+pub struct PlaybookVersion {
+    pub version: i64,
+    pub source: String,
+    pub approved: bool,
+    pub changelog: Option<String>,
+    pub created_by_run_id: Option<String>,
+    pub created_at: String,
+    pub sha256: String,
+}
+
+/// Store a new playbook version. Unapproved by default: nothing the agent
+/// wrote about a site takes effect until a person has read it.
+pub async fn add_playbook_version(
+    pool: &Pool,
+    task_id: &str,
+    pb: &crate::playbook::Playbook,
+    source: crate::playbook::Source,
+    created_by_run_id: Option<&str>,
+    changelog: Option<&str>,
+    approved: bool,
+) -> Result<i64> {
+    let (path, sha) = crate::playbook::write(task_id, pb)?;
+    let rel = path
+        .strip_prefix(crate::paths::data_root()?)
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_else(|_| path.to_string_lossy().to_string());
+
+    sqlx::query(
+        "INSERT INTO playbook_versions
+           (task_id, version, rel_path, sha256, source, created_by_run_id, approved,
+            changelog_md, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+    )
+    .bind(task_id)
+    .bind(pb.version)
+    .bind(&rel)
+    .bind(&sha)
+    .bind(source.as_str())
+    .bind(created_by_run_id)
+    .bind(i64::from(approved))
+    .bind(changelog)
+    .bind(crate::now_iso())
+    .execute(pool)
+    .await?;
+
+    if approved {
+        set_active_playbook(pool, task_id, pb.version).await?;
+    }
+    Ok(pb.version)
+}
+
+pub async fn next_playbook_version(pool: &Pool, task_id: &str) -> Result<i64> {
+    let row = sqlx::query(
+        "SELECT COALESCE(MAX(version), 0) + 1 AS next FROM playbook_versions WHERE task_id = ?",
+    )
+    .bind(task_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get("next")?)
+}
+
+pub async fn set_active_playbook(pool: &Pool, task_id: &str, version: i64) -> Result<()> {
+    sqlx::query("UPDATE playbook_versions SET approved = 1 WHERE task_id = ? AND version = ?")
+        .bind(task_id)
+        .bind(version)
+        .execute(pool)
+        .await?;
+    sqlx::query("UPDATE tasks SET active_playbook_version = ?, updated_at = ? WHERE id = ?")
+        .bind(version)
+        .bind(crate::now_iso())
+        .bind(task_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn list_playbook_versions(pool: &Pool, task_id: &str) -> Result<Vec<PlaybookVersion>> {
+    let rows = sqlx::query(
+        "SELECT version, source, approved, changelog_md, created_by_run_id, created_at, sha256
+         FROM playbook_versions WHERE task_id = ? ORDER BY version DESC",
+    )
+    .bind(task_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| {
+            Ok(PlaybookVersion {
+                version: r.try_get("version")?,
+                source: r.try_get("source")?,
+                approved: r.try_get::<i64, _>("approved")? != 0,
+                changelog: r.try_get("changelog_md")?,
+                created_by_run_id: r.try_get("created_by_run_id")?,
+                created_at: r.try_get("created_at")?,
+                sha256: r.try_get("sha256")?,
+            })
+        })
+        .collect()
+}
+
+/// The playbook a run should follow: the approved one, or nothing.
+pub async fn active_playbook(
+    pool: &Pool,
+    task_id: &str,
+) -> Result<Option<crate::playbook::Playbook>> {
+    let Some(task) = get_task(pool, task_id).await? else {
+        return Ok(None);
+    };
+    let Some(v) = task.playbook_version else {
+        return Ok(None);
+    };
+    Ok(crate::playbook::read(task_id, v).ok())
+}
+
+/// Notes left by recent runs, newest last, for the next run to read.
+pub async fn recent_notes(pool: &Pool, task_id: &str, limit: i64) -> Result<Vec<String>> {
+    let rows = sqlx::query(
+        "SELECT notes_md FROM runs
+         WHERE task_id = ? AND notes_md IS NOT NULL AND notes_md <> ''
+           AND status IN ('succeeded','failed')
+         ORDER BY created_at DESC, id DESC LIMIT ?",
+    )
+    .bind(task_id)
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    let mut notes: Vec<String> = rows
+        .into_iter()
+        .map(|r| r.try_get::<String, _>("notes_md"))
+        .collect::<std::result::Result<_, _>>()?;
+    notes.reverse();
+    Ok(notes)
+}
+
+pub async fn set_run_notes(pool: &Pool, run_id: &str, notes: &str) -> Result<()> {
+    sqlx::query("UPDATE runs SET notes_md = ? WHERE id = ?")
+        .bind(notes)
+        .bind(run_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn set_task_status(pool: &Pool, task_id: &str, status: &str) -> Result<()> {
+    sqlx::query("UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?")
+        .bind(status)
+        .bind(crate::now_iso())
+        .bind(task_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1768,5 +1924,94 @@ mod tests {
                 .unwrap(),
             FenceVerdict::AlreadyCommitted { .. }
         ));
+    }
+
+    fn a_playbook() -> crate::playbook::Playbook {
+        crate::playbook::Playbook {
+            version: 1,
+            goal: "Book a court.".into(),
+            sites: vec!["example.com".into()],
+            preconditions: vec![],
+            steps: vec![crate::playbook::Step {
+                intent: "Open the grid.".into(),
+                hint: Some("/courts".into()),
+                decision: None,
+            }],
+            success: vec![],
+            known_failures: vec![],
+            never: vec!["Never book two slots.".into()],
+        }
+    }
+
+    #[tokio::test]
+    async fn a_new_playbook_does_not_take_effect_until_it_is_approved() {
+        let dir = std::env::temp_dir().join(format!("errand-pb-{}", crate::new_id()));
+        std::env::set_var("ERRAND_DATA_DIR", &dir);
+        let pool = open_memory().await.unwrap();
+        let t = create_task(
+            &pool,
+            NewTask {
+                name: "T".into(),
+                description: "d".into(),
+                emoji: None,
+                schedule: serde_json::json!({"kind":"manual"}),
+            },
+        )
+        .await
+        .unwrap();
+
+        let v = next_playbook_version(&pool, &t.id).await.unwrap();
+        assert_eq!(v, 1);
+        let mut pb = a_playbook();
+        pb.version = v;
+        add_playbook_version(
+            &pool,
+            &t.id,
+            &pb,
+            crate::playbook::Source::Teach,
+            None,
+            Some("first"),
+            false,
+        )
+        .await
+        .unwrap();
+
+        // Written, listed, but not in force.
+        assert_eq!(list_playbook_versions(&pool, &t.id).await.unwrap().len(), 1);
+        assert!(
+            active_playbook(&pool, &t.id).await.unwrap().is_none(),
+            "an unapproved playbook must not be followed"
+        );
+
+        set_active_playbook(&pool, &t.id, v).await.unwrap();
+        let active = active_playbook(&pool, &t.id).await.unwrap().unwrap();
+        assert_eq!(active.goal, "Book a court.");
+        std::fs::remove_dir_all(&dir).ok();
+        std::env::remove_var("ERRAND_DATA_DIR");
+    }
+
+    #[tokio::test]
+    async fn notes_come_back_oldest_first_so_the_newest_reads_last() {
+        let pool = open_memory().await.unwrap();
+        let t = create_task(
+            &pool,
+            NewTask {
+                name: "T".into(),
+                description: "d".into(),
+                emoji: None,
+                schedule: serde_json::json!({"kind":"manual"}),
+            },
+        )
+        .await
+        .unwrap();
+        for (i, note) in ["older", "newer"].iter().enumerate() {
+            let r = create_run(&pool, &t.id, &format!("s{i}"), "manual", "normal", None)
+                .await
+                .unwrap();
+            finish_run_ok(&pool, &r.id, "ok").await.unwrap();
+            set_run_notes(&pool, &r.id, note).await.unwrap();
+        }
+        let notes = recent_notes(&pool, &t.id, 5).await.unwrap();
+        assert_eq!(notes, vec!["older".to_string(), "newer".to_string()]);
     }
 }

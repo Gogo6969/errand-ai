@@ -30,6 +30,12 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/tasks", get(list_tasks).post(create_task))
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/activate", post(activate_task))
+        .route("/v1/tasks/{id}/teach", post(teach_task))
+        .route("/v1/tasks/{id}/playbook", get(get_playbook))
+        .route(
+            "/v1/tasks/{id}/playbook/{version}/approve",
+            post(approve_playbook),
+        )
         .route("/v1/tasks/{id}/holds", post(resolve_holds))
         .route("/v1/tasks/{id}/pause", post(pause_task))
         .route("/v1/tasks/{id}/resume", post(resume_task))
@@ -164,6 +170,20 @@ async fn activate_task(
         .next_after(chrono::Utc::now())
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
+    if spec.is_scheduled()
+        && errand_core::db::active_playbook(state.pool(), &id)
+            .await
+            .map_err(ApiError::from)?
+            .is_none()
+    {
+        return Err(ApiError::conflict(
+            "task_not_taught",
+            "This task has no approved playbook, so putting it on a schedule would send an \
+             unattended agent at a site with no agreed way of doing the job. Teach it once and \
+             approve what it wrote first.",
+        ));
+    }
+
     if !errand_core::db::activate_task(state.pool(), &id)
         .await
         .map_err(ApiError::from)?
@@ -186,6 +206,147 @@ async fn activate_task(
         } else {
             "This task has no schedule, so it will only run when you ask it to."
         }
+    })))
+}
+
+/// Start the supervised first run of a task.
+///
+/// A teach run is how a task learns. It works from the description alone and
+/// writes down what actually worked, which a person then approves.
+async fn teach_task(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<errand_core::models::Run>> {
+    require(&caller, Scope::Run)?;
+    let task = errand_core::db::get_task(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found(format!("No task with id {id}.")))?;
+
+    if let Some(busy) = errand_core::db::busy_run_for_task(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+    {
+        return Err(ApiError::conflict(
+            "task_already_running",
+            format!("This task is already running (run {busy})."),
+        ));
+    }
+
+    let occurrence = format!("teach/{}", errand_core::new_id());
+    let run = errand_core::db::try_create_run(
+        state.pool(),
+        &id,
+        &occurrence,
+        "teach",
+        "teach",
+        Some(&caller.token_name),
+    )
+    .await
+    .map_err(|e| match e {
+        errand_core::db::CreateRunError::AlreadyExists => {
+            ApiError::conflict("occurrence_already_ran", "That teach run already exists.")
+        }
+        errand_core::db::CreateRunError::Other(e) => ApiError::from(e),
+    })?;
+
+    let _ = errand_core::db::set_task_status(state.pool(), &id, "teaching").await;
+    errand_core::db::append_step(
+        state.pool(),
+        &run.id,
+        "plan",
+        &format!(
+            "Teaching '{}': working it out from the description",
+            task.name
+        ),
+        true,
+        None,
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    state.emit(Event::RunStatus {
+        run_id: run.id.clone(),
+        task_id: id,
+        status: errand_core::models::RunStatus::Queued,
+    });
+    tokio::spawn(crate::executor::run_to_completion(
+        state.clone(),
+        run.id.clone(),
+    ));
+    Ok(Json(run))
+}
+
+/// The playbook in force, and every version, so a person can read what their
+/// agent believes about a site before trusting it.
+async fn get_playbook(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Read)?;
+    let versions = errand_core::db::list_playbook_versions(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?;
+    let active = errand_core::db::active_playbook(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(json!({
+        "active": active.as_ref().map(|p| json!({
+            "version": p.version,
+            "goal": p.goal,
+            "markdown": p.to_markdown(),
+        })),
+        "versions": versions.iter().map(|v| json!({
+            "version": v.version,
+            "source": v.source,
+            "approved": v.approved,
+            "changelog": v.changelog,
+            "created_by_run_id": v.created_by_run_id,
+            "created_at": v.created_at,
+            "sha256": v.sha256,
+        })).collect::<Vec<_>>(),
+        "note": if active.is_none() {
+            "Nothing is approved yet, so scheduled runs will not start. Teach the task once, \
+             read what it wrote, then approve it."
+        } else {
+            "Runs follow the approved version."
+        }
+    })))
+}
+
+/// Approve a version, which is the single gate between "the agent watched
+/// itself once" and "the agent does this alone at 08:00".
+async fn approve_playbook(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path((id, version)): Path<(String, i64)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Approving decides what an unattended agent will do on a real site, so it
+    // needs the same scope as answering an approval gate, not merely the one
+    // that starts runs.
+    require(&caller, Scope::Approve)?;
+
+    let pb = errand_core::playbook::read(&id, version)
+        .map_err(|e| ApiError::not_found(format!("Cannot read version {version}: {e}")))?;
+
+    errand_core::db::set_active_playbook(state.pool(), &id, version)
+        .await
+        .map_err(ApiError::from)?;
+    // A taught task becomes ready to be scheduled only once its playbook is
+    // approved.
+    let _ = errand_core::db::set_task_status(state.pool(), &id, "ready").await;
+
+    state.emit(Event::TaskUpdated {
+        task_id: id.clone(),
+    });
+    Ok(Json(json!({
+        "approved": version,
+        "steps": pb.steps.len(),
+        "note": "This task will now follow that playbook. Activate it if you want it to run on a \
+                 schedule."
     })))
 }
 
@@ -319,11 +480,18 @@ async fn run_task(
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found(format!("No task with id {id}.")))?;
 
-    if task.status == "draft" {
+    // The single gate between "the agent tried this once" and "the agent does
+    // this alone". A task with no approved playbook may only be taught.
+    if errand_core::db::active_playbook(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+        .is_none()
+    {
         return Err(ApiError::conflict(
             "task_not_taught",
-            "This task has never been taught, so there is nothing to replay yet. \
-             Run it once in teach mode first.",
+            "This task has no approved playbook, so there is nothing to follow yet. Teach it \
+             once with POST /v1/tasks/{id}/teach, read what it wrote down, and approve that \
+             before it runs on its own.",
         ));
     }
 

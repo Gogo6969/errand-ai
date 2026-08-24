@@ -34,9 +34,19 @@ echo "Scrub check over $(echo "$FILES" | wc -l | tr -d ' ') files"
 # --- 1. Private network addresses -------------------------------------------
 # Wolf's LAN model endpoints must never ship as defaults. They live in a
 # gitignored dev overlay and are found by auto-detection like anyone else's.
-if hits=$(echo "$FILES" | xargs grep -nE '\b(192\.168\.|10\.[0-9]+\.|172\.(1[6-9]|2[0-9]|3[01])\.)[0-9]' 2>/dev/null); then
-  problem "private LAN addresses found. Endpoints are discovered, never shipped as defaults:"
-  echo "$hits" | head -10 | sed 's/^/        /'
+# A line may opt out with `scrub:allow private-ip <reason>`. Every exemption is
+# printed, so they stay reviewable rather than accumulating unnoticed.
+if raw=$(echo "$FILES" | xargs grep -nE '\b(192\.168\.|10\.[0-9]+\.|172\.(1[6-9]|2[0-9]|3[01])\.)[0-9]' 2>/dev/null); then
+  exempt=$(echo "$raw" | grep 'scrub:allow private-ip' || true)
+  hits=$(echo "$raw" | grep -v 'scrub:allow private-ip' || true)
+  if [ -n "$exempt" ]; then
+    note "private-ip exemptions (review these):"
+    echo "$exempt" | sed 's/^/        /'
+  fi
+  if [ -n "$hits" ]; then
+    problem "private LAN addresses found. Endpoints are discovered, never shipped as defaults:"
+    echo "$hits" | head -10 | sed 's/^/        /'
+  fi
 fi
 
 # --- 2. Credential-shaped strings -------------------------------------------

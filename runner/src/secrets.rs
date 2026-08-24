@@ -77,6 +77,14 @@ pub async fn get_internal(account: &str) -> Result<Secret> {
     .await
 }
 
+pub async fn delete_internal(account: &str) -> Result<()> {
+    delete(
+        errand_core::keychain_service_internal(),
+        account.to_string(),
+    )
+    .await
+}
+
 /// Is the keychain answering at all? Used by health and by doctor. Never
 /// returns an error: the point is to report a state, not to fail.
 pub async fn probe() -> KeychainState {

@@ -63,13 +63,21 @@ pub async fn ensure_primary_token(pool: &Pool) -> Result<Option<String>> {
     }
     let token = generate_token()?;
     let hash = hash_token(&token);
-    errand_core::db::insert_token(pool, "primary", &hash, "admin").await?;
-    crate::secrets::put_internal(
+    let id = errand_core::db::insert_token(pool, "primary", &hash, "admin").await?;
+
+    if let Err(e) = crate::secrets::put_internal(
         errand_core::keychain::ACCOUNT_API_TOKEN,
         errand_core::keychain::Secret::new(token.clone()),
     )
     .await
-    .context("storing the API token in the keychain")?;
+    {
+        // Leaving the row behind would be worse than failing: the hash would
+        // authenticate a token nobody can read, and the next boot would see a
+        // token already exists and never mint a usable one. Roll it back so the
+        // next attempt starts clean.
+        let _ = errand_core::db::revoke_token(pool, &id).await;
+        return Err(e).context("storing the API token in the keychain");
+    }
     Ok(Some(token))
 }
 

@@ -39,8 +39,24 @@ rm -f "$DEST"
 cp "$SRC" "$DEST"
 chmod 755 "$DEST"
 
-echo "Signing $DEST"
-codesign --force --sign - "$DEST"
+# Sign with a stable identity when one exists.
+#
+# Ad-hoc signing (`--sign -`) produces a different code identity on every
+# build, so macOS treats each rebuild as a different program and the keychain
+# items created by the last one no longer match. That shows up as a permission
+# prompt nobody can see, and it wasted real time before this was understood.
+IDENTITY=$(security find-identity -v -p codesigning 2>/dev/null \
+  | grep -m1 -E "Apple Development|Developer ID Application" \
+  | sed -E 's/.*"(.*)"/\1/')
+if [ -n "$IDENTITY" ]; then
+  echo "Signing $DEST as: $IDENTITY"
+  codesign --force --sign "$IDENTITY" "$DEST"
+else
+  echo "Signing $DEST ad-hoc (no developer certificate found)"
+  echo "  Note: ad-hoc signatures change on every build, so you will be asked"
+  echo "  for keychain permission again after each rebuild."
+  codesign --force --sign - "$DEST"
+fi
 codesign --verify "$DEST" && echo "  signature ok"
 
 echo "Installing LaunchAgent"

@@ -127,6 +127,18 @@ impl AppState {
         self.0.outcomes.lock().remove(run_id)
     }
 
+    /// The signing secret for a webhook, from the keychain.
+    ///
+    /// In the keychain rather than the database for the same reason as every
+    /// other secret: the database is backed up, copied and read by tooling, and
+    /// this one lets a receiver believe a callback is genuine.
+    pub async fn webhook_secret(&self, webhook_id: &str) -> Option<String> {
+        crate::secrets::get_internal(&format!("webhook.{webhook_id}"))
+            .await
+            .ok()
+            .map(|s| s.expose().to_string())
+    }
+
     pub fn set_keychain(&self, s: crate::secrets::KeychainState) {
         let v = match s {
             crate::secrets::KeychainState::Ok => 1,

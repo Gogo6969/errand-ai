@@ -41,3 +41,8 @@ SPEC-M1.md
 # Sidecar dependencies (installed with npm, not vendored)
 sidecars/browser-agent/node_modules/
 sidecars/browser-agent/package-lock.json
+
+# TypeScript client build output
+packages/client/dist/
+packages/client/node_modules/
+packages/client/package-lock.json

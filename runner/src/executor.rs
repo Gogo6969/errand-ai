@@ -670,6 +670,18 @@ pub async fn run_to_completion(state: AppState, run_id: String) {
         tracing::warn!(run_id, "could not queue the run notification: {e}");
     }
 
+    // And tell any program that subscribed. A client that restarted mid-run
+    // hears the ending here rather than losing it.
+    if let Ok(Some(run)) = errand_core::db::get_run(state.pool(), &run_id).await {
+        let event = if run.status == "succeeded" {
+            "run.finished"
+        } else {
+            "run.failed"
+        };
+        let payload = serde_json::to_value(&run).unwrap_or(serde_json::Value::Null);
+        crate::webhooks::emit(&state, event, payload).await;
+    }
+
     // A run must not leave a browser or a profile lock behind: the next run
     // needing that site would queue forever behind a process nobody owns.
     state.close_browser(&run_id).await;

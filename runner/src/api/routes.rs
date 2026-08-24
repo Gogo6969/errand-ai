@@ -53,6 +53,10 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/channels/{channel}/config", post(configure_channel))
         .route("/v1/channels/{channel}/test", post(test_channel))
         .route("/v1/channels/{channel}/enable", post(enable_channel))
+        .route("/v1/tokens", get(list_tokens).post(mint_token))
+        .route("/v1/tokens/{id}", delete(revoke_token))
+        .route("/v1/webhooks", get(list_webhooks).post(create_webhook))
+        .route("/v1/webhooks/{id}", delete(delete_webhook))
         .route("/v1/admin/quiesce", post(quiesce))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -275,6 +279,210 @@ async fn configure_channel(
         "note": "Secrets are in your macOS keychain. Errand can use them; it cannot show them \
                  back to you."
     })))
+}
+
+// ------------------------------------------------------------------ tokens --
+
+async fn list_tokens(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Admin)?;
+    let rows = errand_core::db::list_tokens(state.pool())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "tokens": rows.iter().map(|(id, name, scopes, last)| json!({
+            "id": id, "name": name, "scopes": scopes, "last_used_at": last
+        })).collect::<Vec<_>>()
+    })))
+}
+
+#[derive(Deserialize)]
+struct MintToken {
+    name: String,
+    /// Comma separated, from: read, run, webhook, approve, manage, admin.
+    scopes: String,
+}
+
+/// Mint a token for one client, with only the scopes it needs.
+async fn mint_token(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Json(body): Json<MintToken>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Admin)?;
+    if body.name.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "Give the token a name, so you can tell later which program is using it.",
+        ));
+    }
+
+    let mut scopes = vec![];
+    for raw in body.scopes.split(',') {
+        let t = raw.trim();
+        if t.is_empty() {
+            continue;
+        }
+        match Scope::parse(t) {
+            Some(s) => scopes.push(s),
+            None => {
+                return Err(ApiError::bad_request(format!(
+                    "'{t}' is not a permission. Choose from: read, run, webhook, approve, \
+                     manage, admin."
+                )))
+            }
+        }
+    }
+    if scopes.is_empty() {
+        return Err(ApiError::bad_request(
+            "A token with no permissions can do nothing. Say what this client needs.",
+        ));
+    }
+
+    let token = super::auth::generate_token().map_err(ApiError::from)?;
+    let hash = super::auth::hash_token(&token);
+    let csv = scopes
+        .iter()
+        .map(|s| s.as_str())
+        .collect::<Vec<_>>()
+        .join(",");
+    errand_core::db::insert_token(state.pool(), &body.name, &hash, &csv)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(json!({
+        "name": body.name,
+        "scopes": csv,
+        "token": token,
+        "note": "This is the only time you will see it. Errand stores only a hash, so it cannot \
+                 show it to you again. If you lose it, mint another and revoke this one."
+    })))
+}
+
+async fn revoke_token(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Admin)?;
+    let gone = errand_core::db::revoke_token(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?;
+    if !gone {
+        return Err(ApiError::not_found("No live token with that id."));
+    }
+    Ok(Json(
+        json!({ "revoked": id, "note": "It stops working immediately." }),
+    ))
+}
+
+// ---------------------------------------------------------------- webhooks --
+
+async fn list_webhooks(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Read)?;
+    let hooks = errand_core::db::list_webhooks(state.pool())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "webhooks": hooks.iter().map(|h| json!({
+            "id": h.id, "url": h.url, "events": h.events, "active": h.active,
+            "failure_count": h.failure_count, "last_error": h.last_error,
+            "created_at": h.created_at
+        })).collect::<Vec<_>>()
+    })))
+}
+
+#[derive(Deserialize)]
+struct NewWebhook {
+    url: String,
+    events: Vec<String>,
+}
+
+async fn create_webhook(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Json(body): Json<NewWebhook>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Its own scope rather than manage, so a client can subscribe to its own
+    // outcomes without also being able to rewrite playbooks.
+    require(&caller, Scope::Webhook)?;
+
+    if !errand_core::db::webhook_target_allowed(&body.url) {
+        return Err(ApiError::bad_request(
+            "A webhook may only point at your own machine or your own network. Errand calls these \
+             addresses on a schedule, so allowing a public one would turn it into a way of making \
+             your computer fetch whatever somebody chose.",
+        ));
+    }
+
+    const KNOWN: &[&str] = &[
+        "run.finished",
+        "run.failed",
+        "run.needs_attention",
+        "task.updated",
+    ];
+    for e in &body.events {
+        if !KNOWN.contains(&e.as_str()) {
+            return Err(ApiError::bad_request(format!(
+                "'{e}' is not an event Errand sends. Choose from: {}",
+                KNOWN.join(", ")
+            )));
+        }
+    }
+    if body.events.is_empty() {
+        return Err(ApiError::bad_request(
+            "Say which events you want, or nothing will ever be delivered.",
+        ));
+    }
+
+    let secret = super::auth::generate_token().map_err(ApiError::from)?;
+    let id = errand_core::db::create_webhook(
+        state.pool(),
+        &caller.token_id,
+        &body.url,
+        &body.events,
+        "keychain",
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    // The signing secret lives in the keychain, like every other secret.
+    crate::secrets::put_internal(
+        &format!("webhook.{id}"),
+        errand_core::keychain::Secret::new(secret.clone()),
+    )
+    .await
+    .map_err(|e| ApiError::internal(format!("Could not save the signing secret: {e}")))?;
+
+    Ok(Json(json!({
+        "id": id,
+        "url": body.url,
+        "events": body.events,
+        "secret": secret,
+        "note": "Keep the secret. Every delivery carries X-Errand-Signature, which is \
+                 sha256=HMAC(secret, timestamp + '.' + body). Check it, and reject anything with a \
+                 timestamp more than a few minutes old, so nobody can replay a delivery at you."
+    })))
+}
+
+async fn delete_webhook(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Webhook)?;
+    let gone = errand_core::db::delete_webhook(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?;
+    if !gone {
+        return Err(ApiError::not_found("No webhook with that id."));
+    }
+    let _ = crate::secrets::delete_internal(&format!("webhook.{id}")).await;
+    Ok(Json(json!({ "deleted": id })))
 }
 
 /// Every channel, and what it would take to make each one work.
@@ -629,9 +837,41 @@ async fn run_task(
     State(state): State<AppState>,
     Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
     body: Option<Json<RunBody>>,
-) -> ApiResult<Json<errand_core::models::Run>> {
+) -> ApiResult<Json<serde_json::Value>> {
     require(&caller, Scope::Run)?;
+
+    // A client that retries after a dropped connection must get the same run
+    // back rather than a second booking. This is the difference between a
+    // network blip and a duplicate court.
+    let idem = headers
+        .get("Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.len() <= 128);
+
+    let request_hash = super::auth::hash_token(&format!(
+        "{id}:{}",
+        body.as_ref().map(|b| b.0.dry_run).unwrap_or(false)
+    ));
+
+    if let Some(key) = &idem {
+        match errand_core::db::idempotent_replay(state.pool(), key, "run", &request_hash)
+            .await
+            .map_err(ApiError::from)?
+        {
+            Some(Ok(stored)) => {
+                let v: serde_json::Value =
+                    serde_json::from_str(&stored).unwrap_or(serde_json::Value::Null);
+                return Ok(Json(v));
+            }
+            Some(Err(why)) => {
+                return Err(ApiError::conflict("idempotency_key_reuse", why));
+            }
+            None => {}
+        }
+    }
     if state.is_quiescing() {
         return Err(ApiError::conflict(
             "quiescing",
@@ -752,7 +992,19 @@ async fn run_task(
         run.id.clone(),
     ));
 
-    Ok(Json(run))
+    let body = serde_json::to_value(&run).unwrap_or(json!({}));
+    if let Some(key) = idem {
+        let _ = errand_core::db::remember_idempotent(
+            state.pool(),
+            &key,
+            "run",
+            &request_hash,
+            202,
+            &body.to_string(),
+        )
+        .await;
+    }
+    Ok(Json(body))
 }
 
 // -------------------------------------------------------------------- runs --

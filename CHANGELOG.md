@@ -152,6 +152,43 @@ mattered most:
 - Identical messages to the same recipient within ten minutes are dropped, since the usual cause
   is a bug and the person on the other end does not want it twice.
 
+## M7
+
+### Added
+
+- **Scoped tokens per client.** Each program gets its own named token with only what it needs.
+  KinAI gets `read,run,webhook`: enough to list tasks, start them, and subscribe to its own
+  outcomes, and deliberately not enough to rewrite a playbook, read a credential, or answer an
+  approval gate. A compromised client cannot approve the booking it started.
+- **Idempotency on run triggers.** Pass `Idempotency-Key` and a retry after a dropped connection
+  returns the same run instead of booking twice. The same key with different content is refused
+  rather than replayed, because replaying the old answer would hide the client's bug.
+- **Webhooks**, for clients that restart rather than holding a stream open. Every delivery is
+  signed with HMAC-SHA256 over the timestamp and body, so a receiver can tell a genuine callback
+  from anything else that finds the port and can reject a replayed one.
+- **Webhook targets are restricted to your own machine or network.** A callback address a client
+  supplies and Errand then fetches on a schedule is the shape of a request-forgery hole, so a
+  public URL is refused, and the check runs again at delivery time rather than only at subscribe
+  time.
+- **A hook that stops answering is switched off** after repeated failures, and you are told, since
+  the symptom otherwise is another program silently never hearing about anything.
+- **`@errand-ai/client`**, a TypeScript client with no runtime dependencies: find tasks, start
+  them idempotently, follow a run as an async iterator, and verify a delivery signature.
+
+### Fixed
+
+- **A failed keychain write left a token nobody could use.** The hash went into the database
+  first so the API works even if the keychain stalls, but when the write then failed the row
+  stayed behind: it authenticated a token nobody could read, and the next boot saw a token already
+  existed and never minted a usable one. The row is now rolled back.
+- **Development builds churned their own code identity.** Ad-hoc signing produces a different
+  identity on every build, so macOS treated each rebuild as a different program and the keychain
+  items from the last one no longer matched, which surfaced as a permission prompt nobody could
+  see. Development installs now sign with a stable certificate when one exists.
+- **The scrub check had no way to permit a deliberate exception**, so a test asserting that
+  private addresses are allowed would have failed the push. Exemptions are now explicit and every
+  one is printed, rather than the rule being weakened.
+
 ## Unreleased, after M3
 
 ### Fixed

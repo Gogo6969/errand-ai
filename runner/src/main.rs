@@ -25,6 +25,7 @@ mod redact;
 mod scheduler;
 mod secrets;
 mod state;
+mod webhooks;
 
 use anyhow::{Context, Result};
 use errand_core::launchd::ServiceManager;
@@ -255,6 +256,7 @@ async fn serve(foreground: bool) -> Result<()> {
     scheduler::spawn(state.clone());
     outbox::spawn(state.clone());
     channels::inbound::spawn(state.clone());
+    webhooks::spawn(state.clone());
 
     // Only now touch the keychain.
     //

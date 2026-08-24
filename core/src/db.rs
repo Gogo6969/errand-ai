@@ -1500,6 +1500,293 @@ pub async fn outbox_for_run(pool: &Pool, run_id: &str) -> Result<Vec<(String, St
         .collect()
 }
 
+// ---------------------------------------------------------------- webhooks --
+
+#[derive(Debug, Clone)]
+pub struct Webhook {
+    pub id: String,
+    pub url: String,
+    pub events: Vec<String>,
+    pub active: bool,
+    pub failure_count: i64,
+    pub last_error: Option<String>,
+    pub created_at: String,
+}
+
+/// Only loopback and private addresses.
+///
+/// A webhook is a URL an outside client hands us and we then fetch on a
+/// schedule, which is the shape of a request-forgery hole. Errand calls things
+/// on your own machine or your own network, never the public internet.
+pub fn webhook_target_allowed(url: &str) -> bool {
+    let Ok(u) = url::Url::parse(url) else {
+        return false;
+    };
+    if !matches!(u.scheme(), "http" | "https") {
+        return false;
+    }
+    let Some(host) = u.host_str() else {
+        return false;
+    };
+    if host == "localhost" || host.ends_with(".local") {
+        return true;
+    }
+    match host.parse::<std::net::IpAddr>() {
+        Ok(std::net::IpAddr::V4(ip)) => ip.is_loopback() || ip.is_private(),
+        Ok(std::net::IpAddr::V6(ip)) => ip.is_loopback(),
+        Err(_) => false,
+    }
+}
+
+pub async fn create_webhook(
+    pool: &Pool,
+    token_id: &str,
+    url: &str,
+    events: &[String],
+    secret_hash: &str,
+) -> Result<String> {
+    let id = crate::new_id();
+    sqlx::query(
+        "INSERT INTO webhooks (id, token_id, url, events, secret_hash, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(token_id)
+    .bind(url)
+    .bind(events.join(","))
+    .bind(secret_hash)
+    .bind(crate::now_iso())
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+pub async fn list_webhooks(pool: &Pool) -> Result<Vec<Webhook>> {
+    let rows = sqlx::query("SELECT * FROM webhooks ORDER BY created_at DESC")
+        .fetch_all(pool)
+        .await?;
+    rows.into_iter()
+        .map(|r| {
+            let ev: String = r.try_get("events")?;
+            Ok(Webhook {
+                id: r.try_get("id")?,
+                url: r.try_get("url")?,
+                events: ev.split(',').map(str::to_string).collect(),
+                active: r.try_get::<i64, _>("active")? != 0,
+                failure_count: r.try_get("failure_count")?,
+                last_error: r.try_get("last_error")?,
+                created_at: r.try_get("created_at")?,
+            })
+        })
+        .collect()
+}
+
+pub async fn delete_webhook(pool: &Pool, id: &str) -> Result<bool> {
+    let res = sqlx::query("DELETE FROM webhooks WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Queue one delivery per subscriber interested in this event.
+pub async fn fan_out_event(pool: &Pool, event: &str, payload: &serde_json::Value) -> Result<usize> {
+    let hooks = list_webhooks(pool).await?;
+    let mut n = 0;
+    for h in hooks.into_iter().filter(|h| h.active) {
+        if !h.events.iter().any(|e| e == event) {
+            continue;
+        }
+        sqlx::query(
+            "INSERT INTO webhook_deliveries (id, webhook_id, event, payload, created_at)
+             VALUES (?, ?, ?, ?, ?)",
+        )
+        .bind(crate::new_id())
+        .bind(&h.id)
+        .bind(event)
+        .bind(payload.to_string())
+        .bind(crate::now_iso())
+        .execute(pool)
+        .await?;
+        n += 1;
+    }
+    Ok(n)
+}
+
+#[derive(Debug, Clone)]
+pub struct Delivery {
+    pub id: String,
+    pub webhook_id: String,
+    pub url: String,
+    pub event: String,
+    pub payload: String,
+    pub attempts: i64,
+}
+
+pub async fn due_deliveries(pool: &Pool, limit: i64) -> Result<Vec<Delivery>> {
+    let rows = sqlx::query(
+        "SELECT d.id, d.webhook_id, d.event, d.payload, d.attempts, w.url
+         FROM webhook_deliveries d JOIN webhooks w ON w.id = d.webhook_id
+         WHERE d.delivered_at IS NULL AND w.active = 1
+           AND (d.next_retry_at IS NULL OR d.next_retry_at <= ?)
+         ORDER BY d.created_at LIMIT ?",
+    )
+    .bind(chrono::Utc::now().to_rfc3339())
+    .bind(limit)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| {
+            Ok(Delivery {
+                id: r.try_get("id")?,
+                webhook_id: r.try_get("webhook_id")?,
+                url: r.try_get("url")?,
+                event: r.try_get("event")?,
+                payload: r.try_get("payload")?,
+                attempts: r.try_get("attempts")?,
+            })
+        })
+        .collect()
+}
+
+pub async fn mark_delivered(pool: &Pool, id: &str, status: u16) -> Result<()> {
+    sqlx::query(
+        "UPDATE webhook_deliveries SET delivered_at = ?, status_code = ?, attempts = attempts + 1
+         WHERE id = ?",
+    )
+    .bind(crate::now_iso())
+    .bind(status as i64)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Record a failed delivery, and disable a hook that has clearly gone away.
+///
+/// Retrying a dead endpoint forever is how a background worker quietly becomes
+/// a load generator against somebody's machine.
+pub async fn fail_delivery(
+    pool: &Pool,
+    id: &str,
+    webhook_id: &str,
+    error: &str,
+    next_retry_at: Option<String>,
+) -> Result<bool> {
+    sqlx::query(
+        "UPDATE webhook_deliveries SET attempts = attempts + 1, last_error = ?, next_retry_at = ?
+         WHERE id = ?",
+    )
+    .bind(error)
+    .bind(&next_retry_at)
+    .bind(id)
+    .execute(pool)
+    .await?;
+
+    if next_retry_at.is_none() {
+        let n: i64 = sqlx::query(
+            "UPDATE webhooks SET failure_count = failure_count + 1, last_error = ?
+             WHERE id = ? RETURNING failure_count",
+        )
+        .bind(error)
+        .bind(webhook_id)
+        .fetch_one(pool)
+        .await?
+        .try_get("failure_count")?;
+
+        if n >= 20 {
+            sqlx::query("UPDATE webhooks SET active = 0 WHERE id = ?")
+                .bind(webhook_id)
+                .execute(pool)
+                .await?;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+// ------------------------------------------------------------ idempotency --
+
+/// A stored response for a repeated request.
+pub async fn idempotent_replay(
+    pool: &Pool,
+    key: &str,
+    endpoint: &str,
+    request_hash: &str,
+) -> Result<Option<std::result::Result<String, String>>> {
+    let row = sqlx::query(
+        "SELECT request_sha256, response_body FROM idempotency_keys
+         WHERE key = ? AND endpoint = ?",
+    )
+    .bind(key)
+    .bind(endpoint)
+    .fetch_optional(pool)
+    .await?;
+    let Some(r) = row else { return Ok(None) };
+    let stored: String = r.try_get("request_sha256")?;
+    if stored != request_hash {
+        // The same key with different content is a client bug, and replaying
+        // the old answer would hide it.
+        return Ok(Some(Err(
+            "that idempotency key was already used for a different request".into(),
+        )));
+    }
+    Ok(Some(Ok(r.try_get("response_body")?)))
+}
+
+pub async fn remember_idempotent(
+    pool: &Pool,
+    key: &str,
+    endpoint: &str,
+    request_hash: &str,
+    status: u16,
+    body: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT OR REPLACE INTO idempotency_keys
+           (key, endpoint, request_sha256, response_status, response_body, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(key)
+    .bind(endpoint)
+    .bind(request_hash)
+    .bind(status as i64)
+    .bind(body)
+    .bind(crate::now_iso())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_tokens(pool: &Pool) -> Result<Vec<(String, String, String, Option<String>)>> {
+    let rows = sqlx::query(
+        "SELECT id, name, scopes, last_used_at FROM api_tokens
+         WHERE revoked_at IS NULL ORDER BY created_at",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| {
+            Ok((
+                r.try_get("id")?,
+                r.try_get("name")?,
+                r.try_get("scopes")?,
+                r.try_get("last_used_at")?,
+            ))
+        })
+        .collect()
+}
+
+pub async fn revoke_token(pool: &Pool, id: &str) -> Result<bool> {
+    let res =
+        sqlx::query("UPDATE api_tokens SET revoked_at = ? WHERE id = ? AND revoked_at IS NULL")
+            .bind(crate::now_iso())
+            .bind(id)
+            .execute(pool)
+            .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2345,6 +2632,126 @@ mod tests {
         assert!(
             due_outbox(&pool, 10).await.unwrap().is_empty(),
             "retrying achieves nothing until a person acts"
+        );
+    }
+
+    #[test]
+    fn a_webhook_may_only_point_at_your_own_machine_or_network() {
+        // Errand fetches these on a schedule, so a public URL would make it a
+        // request-forgery tool aimed wherever a client chose.
+        assert!(webhook_target_allowed("http://127.0.0.1:3000/hook"));
+        assert!(webhook_target_allowed("http://localhost:3000/hook"));
+        assert!(webhook_target_allowed("http://192.168.1.50:8080/hook")); // scrub:allow private-ip testing that a LAN address is permitted
+        assert!(webhook_target_allowed("http://kin.local/hook"));
+
+        assert!(!webhook_target_allowed("https://example.com/hook"));
+        assert!(!webhook_target_allowed(
+            "http://169.254.169.254/latest/meta-data"
+        ));
+        assert!(!webhook_target_allowed("file:///etc/passwd"));
+        assert!(!webhook_target_allowed("not a url"));
+    }
+
+    #[tokio::test]
+    async fn a_retried_request_gets_the_same_answer_rather_than_a_second_booking() {
+        let pool = open_memory().await.unwrap();
+        let key = "kinai-msg-1";
+        assert!(idempotent_replay(&pool, key, "/run", "hash-a")
+            .await
+            .unwrap()
+            .is_none());
+
+        remember_idempotent(&pool, key, "/run", "hash-a", 202, r#"{"id":"run-1"}"#)
+            .await
+            .unwrap();
+        let replay = idempotent_replay(&pool, key, "/run", "hash-a")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(replay.unwrap(), r#"{"id":"run-1"}"#);
+    }
+
+    #[tokio::test]
+    async fn the_same_key_with_different_content_is_refused_rather_than_replayed() {
+        let pool = open_memory().await.unwrap();
+        remember_idempotent(&pool, "k", "/run", "hash-a", 202, "{}")
+            .await
+            .unwrap();
+        let r = idempotent_replay(&pool, "k", "/run", "hash-DIFFERENT")
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            r.is_err(),
+            "replaying the old answer would hide a client bug"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hook_that_keeps_failing_is_eventually_switched_off() {
+        let pool = open_memory().await.unwrap();
+        let tid = insert_token(&pool, "kinai", "h", "read,run,webhook")
+            .await
+            .unwrap();
+        let wid = create_webhook(
+            &pool,
+            &tid,
+            "http://127.0.0.1:9/x",
+            &["run.finished".to_string()],
+            "s",
+        )
+        .await
+        .unwrap();
+
+        let mut disabled = false;
+        for _ in 0..20 {
+            disabled = fail_delivery(&pool, "d", &wid, "refused", None)
+                .await
+                .unwrap();
+        }
+        assert!(
+            disabled,
+            "retrying a dead endpoint forever is a load generator"
+        );
+        assert!(!list_webhooks(&pool).await.unwrap()[0].active);
+    }
+
+    #[tokio::test]
+    async fn events_only_reach_the_hooks_that_asked_for_them() {
+        let pool = open_memory().await.unwrap();
+        let tid = insert_token(&pool, "kinai", "h", "read,run,webhook")
+            .await
+            .unwrap();
+        create_webhook(
+            &pool,
+            &tid,
+            "http://127.0.0.1:3000/a",
+            &["run.finished".to_string()],
+            "s",
+        )
+        .await
+        .unwrap();
+        create_webhook(
+            &pool,
+            &tid,
+            "http://127.0.0.1:3000/b",
+            &["run.failed".to_string()],
+            "s",
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            fan_out_event(&pool, "run.finished", &serde_json::json!({}))
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            fan_out_event(&pool, "task.updated", &serde_json::json!({}))
+                .await
+                .unwrap(),
+            0
         );
     }
 }

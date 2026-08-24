@@ -189,6 +189,32 @@ mattered most:
   private addresses are allowed would have failed the push. Exemptions are now explicit and every
   one is printed, rather than the rule being weakened.
 
+## M8
+
+### Added
+
+- **A window.** Errand-AI is now an app you can open: tasks, history, settings, and a run timeline
+  showing everything the agent did in its own words.
+- **The shell does almost nothing on purpose.** It never executes a task, opens the database, or
+  touches a website. It asks the daemon, which is what lets you quit the window without stopping
+  anything that was running.
+- **The API token never enters the webview.** Every call is proxied through Rust. A token in
+  JavaScript is a token in the page, readable by anything that ends up running there, and this one
+  can start runs and read your whole history.
+- **Every control is explained**, and a machine checks it. The audit fails the build on a control
+  without an explanation, on an explanation nobody shows, and on an unknown id. Exemptions are
+  explicit, carry a stated reason, and are printed on every run so they stay reviewable. A
+  labelled form field counts as explained by its label, because a tooltip repeating the label is
+  noise rather than help.
+- **Explanations written for someone slightly worried** about what this is going to do to their
+  accounts. Where it matters they say what will not happen: pausing deletes nothing, running now
+  will not book twice, a rehearsal books nothing at all, and a saved login can never be typed into
+  any site but its own.
+- **The failure card** answers the same three questions everywhere: what it was doing, why it
+  stopped, and what you can do, with technical detail behind a disclosure for when you want it.
+- **A task that needs you says so**, and offers the two answers that unblock it after a run died
+  part way through something irreversible.
+
 ## Unreleased, after M3
 
 ### Fixed

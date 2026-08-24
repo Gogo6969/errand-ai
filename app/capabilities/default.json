@@ -1,0 +1,7 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "The window talks to the daemon through Rust commands, never directly, so the API token never enters the webview.",
+  "windows": ["main"],
+  "permissions": ["core:default", "shell:allow-open"]
+}

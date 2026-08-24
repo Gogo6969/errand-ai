@@ -37,6 +37,34 @@ jobs:
           cargo test --workspace
           echo "tests exit=$?"
 
+  frontend:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+
+      - name: Install
+        run: npm --prefix frontend install
+
+      # The rule is that nothing in the interface goes unexplained. This is what
+      # makes that true rather than aspirational.
+      - name: Hint coverage
+        run: |
+          cd frontend && node scripts/audit-hints.mjs
+          echo "hints exit=$?"
+
+      - name: Build
+        run: |
+          npm --prefix frontend run build
+          echo "frontend build exit=$?"
+
+      - name: Client package
+        run: |
+          npm --prefix packages/client install
+          npx --prefix packages/client tsc -p packages/client/tsconfig.json
+          echo "client exit=$?"
+
   scrub:
     runs-on: ubuntu-latest
     steps:

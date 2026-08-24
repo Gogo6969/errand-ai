@@ -16,10 +16,10 @@ sites, deciding as it goes, repairing itself when a page changes, and reporting 
 </div>
 
 > [!WARNING]
-> **Early development.** Milestone 7 of 10. A contained agent learns a task from one supervised
+> **Early development.** Milestone 8 of 10. A contained agent learns a task from one supervised
 > run, repeats it on a schedule, logs in with a stored credential, adapts when the site changes,
-> and repairs itself within a budget, then tells you what happened over Telegram. There is no user
-> interface yet, so tasks are written through the API.
+> and repairs itself within a budget, then tells you what happened over Telegram. There is now a
+> window as well. What is left is open-source preparation and a signed, notarised release.
 
 ---
 
@@ -86,8 +86,8 @@ prompt nobody is awake to answer.
 | M5 | Self-heal and the failure surface | **done** |
 | M6 | Telegram, WhatsApp, Apple Mail, Apple Messages | **done** |
 | M7 | API hardening, scoped tokens, webhooks, TypeScript client | **done** |
-| M8 | The interface, with every control explained | next |
-| M9 | Open-source preparation and signing from CI | |
+| M8 | The interface, with every control explained | **done** |
+| M9 | Open-source preparation and signing from CI | next |
 | M10 | Public v0.1.0 | |
 
 ## Building
@@ -96,7 +96,7 @@ Requires a stable Rust toolchain and macOS.
 
 ```bash
 cargo test --workspace       # 138 tests, including a real keychain round-trip
-cargo build
+cargo tauri build            # produces Errand-AI.app and a DMG
 ```
 
 Run the daemon in your terminal:

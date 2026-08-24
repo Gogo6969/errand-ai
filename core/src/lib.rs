@@ -9,6 +9,7 @@ pub mod keychain;
 pub mod launchd;
 pub mod models;
 pub mod paths;
+pub mod schedule;
 
 /// Bundle identifier of the app. Data directory derives from this.
 pub const APP_ID: &str = "com.errandai.app";

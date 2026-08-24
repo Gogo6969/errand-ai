@@ -79,6 +79,66 @@ impl DomainPolicy {
     }
 }
 
+/// Pull `role "label" [ref=eN]` out of a snapshot line.
+fn parse_refs(tree: &str) -> HashMap<String, (String, String)> {
+    let mut out = HashMap::new();
+    for line in tree.lines() {
+        let Some(rs) = line.find("[ref=") else {
+            continue;
+        };
+        let Some(re) = line[rs..].find(']') else {
+            continue;
+        };
+        let r#ref = line[rs + 5..rs + re].to_string();
+
+        let body = line.trim_start().trim_start_matches("- ");
+        let role = body.split_whitespace().next().unwrap_or("").to_string();
+        let label = match (body.find('"'), body.rfind('"')) {
+            (Some(a), Some(b)) if b > a => body[a + 1..b].to_string(),
+            _ => String::new(),
+        };
+        out.insert(r#ref, (role, label));
+    }
+    out
+}
+
+/// Does this control look like it does something that cannot be undone?
+///
+/// Judged from what the control actually says, independently of the model's own
+/// account of what it is doing. The two are combined by taking the stricter,
+/// because the expensive mistake here is one-directional: a needless
+/// confirmation costs a moment, an unguarded booking costs a court.
+pub fn looks_irreversible(role: &str, label: &str) -> Option<&'static str> {
+    let l = label.to_ascii_lowercase();
+    let is_control = matches!(role, "button" | "link" | "menuitem") || role.is_empty();
+    if !is_control {
+        return None;
+    }
+    const PURCHASE: &[&str] = &["pay", "buy", "purchase", "checkout", "order", "subscribe"];
+    const BOOKING: &[&str] = &["book", "reserve", "confirm", "submit", "apply", "register"];
+    const DELETION: &[&str] = &[
+        "delete",
+        "remove",
+        "cancel booking",
+        "unsubscribe",
+        "close account",
+    ];
+    const MESSAGE: &[&str] = &["send", "post", "publish", "reply"];
+
+    let hit = |set: &[&str]| set.iter().any(|w| l.contains(w));
+    if hit(PURCHASE) {
+        Some("purchase")
+    } else if hit(DELETION) {
+        Some("deletion")
+    } else if hit(BOOKING) {
+        Some("booking")
+    } else if hit(MESSAGE) {
+        Some("message")
+    } else {
+        None
+    }
+}
+
 fn levenshtein(a: &str, b: &str) -> usize {
     let (a, b): (Vec<char>, Vec<char>) = (a.chars().collect(), b.chars().collect());
     let mut prev: Vec<usize> = (0..=b.len()).collect();
@@ -101,6 +161,10 @@ struct Pending {
 
 /// A live browser, owned by one run.
 pub struct Browser {
+    /// Label and role of every ref in the most recent snapshot, so an action
+    /// can be classified by what it actually says before it is performed.
+    /// The model's own account of what it is clicking is not trusted alone.
+    last_refs: Mutex<HashMap<String, (String, String)>>,
     stdin: Mutex<ChildStdin>,
     pending: Arc<Mutex<Pending>>,
     child: Mutex<Child>,
@@ -186,6 +250,7 @@ impl Browser {
         });
 
         let b = Self {
+            last_refs: Mutex::new(HashMap::new()),
             stdin: Mutex::new(stdin),
             pending,
             child: Mutex::new(child),
@@ -259,9 +324,15 @@ impl Browser {
         self.snapshot().await
     }
 
+    /// What a ref says, from the last snapshot: (role, label).
+    pub async fn describe_ref(&self, r#ref: &str) -> Option<(String, String)> {
+        self.last_refs.lock().await.get(r#ref).cloned()
+    }
+
     pub async fn snapshot(&self) -> Result<Snapshot> {
         let v = self.call("page.snapshot", json!({})).await?;
         let mut s: Snapshot = serde_json::from_value(v).context("reading the page snapshot")?;
+        *self.last_refs.lock().await = parse_refs(&s.tree);
         // A page can contain a secret we already know, echoed into a field or a
         // confirmation line. Scrub before the model ever sees it.
         s.tree = self.redactor.scrub(&s.tree);
@@ -429,5 +500,57 @@ mod tests {
         assert!(!p.permits("not a url"));
         assert!(!p.permits("javascript:alert(1)"));
         assert!(!p.permits("file:///etc/passwd"));
+    }
+
+    #[test]
+    fn refs_are_parsed_out_of_a_snapshot() {
+        let tree = "- heading \"Courts\"\n  - button \"Book Wednesday 19:00\" [ref=e3]\n  - textbox \"Email\" [ref=e1]";
+        let m = parse_refs(tree);
+        assert_eq!(
+            m.get("e3"),
+            Some(&("button".to_string(), "Book Wednesday 19:00".to_string()))
+        );
+        assert_eq!(m.get("e1").unwrap().0, "textbox");
+    }
+
+    #[test]
+    fn buttons_that_commit_something_are_recognised() {
+        assert_eq!(
+            looks_irreversible("button", "Book this court"),
+            Some("booking")
+        );
+        assert_eq!(looks_irreversible("button", "Pay now"), Some("purchase"));
+        assert_eq!(
+            looks_irreversible("button", "Confirm booking"),
+            Some("booking")
+        );
+        assert_eq!(
+            looks_irreversible("button", "Delete my account"),
+            Some("deletion")
+        );
+        assert_eq!(
+            looks_irreversible("button", "Send message"),
+            Some("message")
+        );
+    }
+
+    #[test]
+    fn ordinary_navigation_is_not_treated_as_irreversible() {
+        assert_eq!(looks_irreversible("link", "Back to courts"), None);
+        assert_eq!(looks_irreversible("button", "Next page"), None);
+        assert_eq!(
+            looks_irreversible("textbox", "Book"),
+            None,
+            "typing is not committing"
+        );
+    }
+
+    #[test]
+    fn purchase_outranks_booking_when_a_label_suggests_both() {
+        // "Confirm and pay" must be classified by the more serious of the two.
+        assert_eq!(
+            looks_irreversible("button", "Confirm and pay"),
+            Some("purchase")
+        );
     }
 }

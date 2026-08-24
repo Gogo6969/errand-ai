@@ -6,6 +6,52 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## M3
+
+### Added
+
+- **The scheduler.** Tasks now fire on their own. Occurrences are computed in the task's IANA
+  timezone with instants stored in UTC, so the same wall-clock time is a different moment either
+  side of a daylight-saving change rather than drifting by an hour twice a year. A local time that
+  never existed runs just after the gap; an ambiguous one takes the first occurrence.
+- **Run windows.** A task can start early enough to be logged in and waiting before the moment it
+  cares about, and abandons an occurrence whose window has closed rather than doing it late.
+- **Catch-up.** Occurrences missed while the machine slept or the daemon was down follow the task's
+  policy: skip, run once if still inside the grace window, or replay all. The scheduler's position
+  is persisted, so a gap caused by a restart is seen on the next boot rather than being invisible.
+- **The side-effect fence, wired to the agent.** Any click on a control that books, pays, sends or
+  deletes is classified in Rust from what the control actually says, consulted against the fence,
+  and committed with evidence only after it succeeds. One occurrence admits one such action.
+- **Crash recovery.** Runs left mid-flight by a killed daemon are closed at boot with an
+  explanation, and a run interrupted while holding an unresolved irreversible action pauses its
+  task rather than letting it quietly repeat.
+- **Task activation.** `POST /v1/tasks/{id}/activate` moves a task from draft to ready.
+
+### Fixed
+
+Found by an adversarial review of this milestone, which returned thirteen blockers. The ones that
+mattered most:
+
+- **The fence was decorative.** `arm_side_effect` had tests and no callers. Nothing consulted it
+  before an irreversible action, so the central safety claim was enforced by nothing.
+- **A manual run minted a fresh occurrence every time**, so it could never see the fence belonging
+  to the scheduled run it was repeating. The ordinary sequence of a run dying mid-booking and the
+  user pressing Run now would have booked a second court.
+- **No task could ever reach `ready` through any product path.** Only raw SQL could activate one,
+  which is how it went unnoticed: the scheduler was being tested through a back door.
+- **The fence was a check-then-write with no transaction**, so two callers could both claim an
+  aborted slot and both receive a go-ahead. It is now a single statement.
+- **`commit_side_effect` returned success when it wrote nothing**, losing the evidence at the exact
+  moment it mattered.
+- **Every error from run creation was read as "already ran"**, so a busy or failing database would
+  drop an occurrence with no run, no failure and no record.
+- **Occurrence truncation kept the oldest**, discarding exactly the recent occurrences catch-up
+  needs and leaving a task silently not running late when its policy said it should.
+- **`start_at` and jitter were display-only.** The interface showed a start time the run provably
+  would not use, and a window's early start never happened.
+- **A window straddling local midnight was always missed**, abandoning every occurrence with an
+  explanation that was untrue.
+
 ## M2b
 
 ### Added

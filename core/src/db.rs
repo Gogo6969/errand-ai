@@ -249,6 +249,73 @@ fn run_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<crate::models::Run> {
     })
 }
 
+/// Why creating a run did not happen.
+#[derive(Debug)]
+pub enum CreateRunError {
+    /// This occurrence already produced a run. Expected, and not a problem.
+    AlreadyExists,
+    /// Anything else. Must never be mistaken for the above: treating a disk
+    /// error or a busy database as "already ran" silently loses the occurrence
+    /// forever, with no run, no failure and no explanation.
+    Other(anyhow::Error),
+}
+
+impl std::fmt::Display for CreateRunError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::AlreadyExists => write!(f, "this occurrence already has a run"),
+            Self::Other(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+/// Create a run for one occurrence, distinguishing a duplicate from a fault.
+pub async fn try_create_run(
+    pool: &Pool,
+    task_id: &str,
+    occurrence_id: &str,
+    trigger: &str,
+    mode: &str,
+    triggered_by: Option<&str>,
+) -> std::result::Result<crate::models::Run, CreateRunError> {
+    let id = crate::new_id();
+    let res = sqlx::query(
+        "INSERT INTO runs (id, task_id, occurrence_id, mode, trigger, triggered_by, status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
+    )
+    .bind(&id)
+    .bind(task_id)
+    .bind(occurrence_id)
+    .bind(mode)
+    .bind(trigger)
+    .bind(triggered_by)
+    .bind(crate::now_iso())
+    .execute(pool)
+    .await;
+
+    if let Err(e) = res {
+        // Only a unique-index violation means "already ran".
+        let is_dup = match &e {
+            sqlx::Error::Database(db) => {
+                db.code().as_deref() == Some("2067")
+                    || db.message().contains("runs.task_id, runs.occurrence_id")
+                    || db.message().contains("idx_runs_occurrence")
+            }
+            _ => false,
+        };
+        return Err(if is_dup {
+            CreateRunError::AlreadyExists
+        } else {
+            CreateRunError::Other(e.into())
+        });
+    }
+
+    get_run(pool, &id)
+        .await
+        .map_err(CreateRunError::Other)?
+        .ok_or_else(|| CreateRunError::Other(anyhow::anyhow!("run vanished after insert")))
+}
+
 /// Create a run for one occurrence. The unique index on
 /// `(task_id, occurrence_id)` makes a duplicate insert fail rather than
 /// producing a second run for the same scheduled slot.
@@ -757,6 +824,299 @@ pub async fn revoke_tokens_named(pool: &Pool, name_prefix: &str) -> Result<u64> 
     Ok(res.rows_affected())
 }
 
+// ------------------------------------------------------------ side effects --
+
+/// What the fence says about an irreversible action.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FenceVerdict {
+    /// Go ahead. Call `commit_side_effect` with evidence once it is done.
+    Armed(String),
+    /// This occurrence already did this. Do not do it again.
+    AlreadyCommitted { evidence: Option<String> },
+    /// A previous attempt armed this and never reported back, so nobody knows
+    /// whether it actually happened. Verify on the site before arming again.
+    NeedsVerification { armed_at: String },
+}
+
+/// Ask the fence for permission to do something irreversible.
+///
+/// The key is scoped to the occurrence, never to what the agent chose to do. A
+/// key like `book:court2:19:00` would let a retry that picks court 4 straight
+/// past the guard and double-book, which is the exact failure the fence exists
+/// to prevent. One scheduled slot admits one irreversible action, whatever the
+/// agent decides that action should be.
+pub async fn arm_side_effect(
+    pool: &Pool,
+    run_id: &str,
+    task_id: &str,
+    occurrence_id: &str,
+    action_kind: &str,
+) -> Result<FenceVerdict> {
+    let key = format!("{task_id}:{occurrence_id}:{action_kind}");
+    let id = crate::new_id();
+    let now = crate::now_iso();
+
+    // One statement, so two callers cannot both read "aborted" and both take
+    // the slot. A check followed by a separate write would hand two agents a
+    // valid go-ahead for the same booking, which is the failure this whole
+    // mechanism exists to prevent.
+    //
+    // The conflict clause claims the row only when it is currently aborted; a
+    // committed or already-armed row is left untouched and reported back as it
+    // stands.
+    let row = sqlx::query(
+        "INSERT INTO side_effects (id, run_id, task_id, occurrence_id, action_kind,
+                                   idempotency_key, state, armed_at)
+         VALUES (?, ?, ?, ?, ?, ?, 'armed', ?)
+         ON CONFLICT(idempotency_key) DO UPDATE
+           SET state = 'armed', run_id = excluded.run_id, armed_at = excluded.armed_at
+           WHERE side_effects.state = 'aborted'
+         RETURNING id, state, evidence_json, armed_at",
+    )
+    .bind(&id)
+    .bind(run_id)
+    .bind(task_id)
+    .bind(occurrence_id)
+    .bind(action_kind)
+    .bind(&key)
+    .bind(&now)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(r) = row {
+        // We either inserted or claimed an aborted row; either way it is ours.
+        return Ok(FenceVerdict::Armed(r.try_get("id")?));
+    }
+
+    // The conflict clause declined to update, so an existing row is committed
+    // or already armed. Read it to say which.
+    let r = sqlx::query(
+        "SELECT id, state, evidence_json, armed_at FROM side_effects WHERE idempotency_key = ?",
+    )
+    .bind(&key)
+    .fetch_one(pool)
+    .await?;
+    let state: String = r.try_get("state")?;
+    Ok(match state.as_str() {
+        "committed" => FenceVerdict::AlreadyCommitted {
+            evidence: r.try_get("evidence_json")?,
+        },
+        _ => FenceVerdict::NeedsVerification {
+            armed_at: r.try_get("armed_at")?,
+        },
+    })
+}
+
+/// Record that the irreversible thing actually happened, with proof.
+pub async fn commit_side_effect(pool: &Pool, id: &str, evidence: &str) -> Result<()> {
+    let res = sqlx::query(
+        "UPDATE side_effects SET state = 'committed', committed_at = ?, evidence_json = ?
+         WHERE id = ? AND state = 'armed'",
+    )
+    .bind(crate::now_iso())
+    .bind(evidence)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    // A silent no-op here is the worst possible outcome: the caller believes
+    // the irreversible action was recorded, the evidence is lost, and the next
+    // attempt sees a slot that looks free.
+    if res.rows_affected() != 1 {
+        let state: Option<String> = sqlx::query("SELECT state FROM side_effects WHERE id = ?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?
+            .map(|r| r.try_get("state"))
+            .transpose()?;
+        anyhow::bail!(
+            "could not record that the action completed: fence {id} is {}, not armed",
+            state.unwrap_or_else(|| "missing".into())
+        );
+    }
+    Ok(())
+}
+
+/// Record that it was decided against, freeing the slot for a later attempt.
+pub async fn abort_side_effect(pool: &Pool, id: &str, why: &str) -> Result<()> {
+    let res = sqlx::query(
+        "UPDATE side_effects SET state = 'aborted', evidence_json = ? WHERE id = ? AND state = 'armed'",
+    )
+    .bind(why)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    if res.rows_affected() != 1 {
+        anyhow::bail!("fence {id} was not armed, so it could not be released");
+    }
+    Ok(())
+}
+
+/// Any fence left armed by a run that is no longer live.
+///
+/// A crash between arming and committing means nobody knows whether the action
+/// happened. Such a run is never retried automatically, and a manual retry
+/// enters verify-first mode.
+pub async fn dangling_fences(pool: &Pool, task_id: &str, occurrence_id: &str) -> Result<bool> {
+    let row = sqlx::query(
+        "SELECT COUNT(*) AS n FROM side_effects
+         WHERE task_id = ? AND occurrence_id = ? AND state = 'armed'",
+    )
+    .bind(task_id)
+    .bind(occurrence_id)
+    .fetch_one(pool)
+    .await?;
+    Ok(row.try_get::<i64, _>("n")? > 0)
+}
+
+pub async fn set_next_run_at(pool: &Pool, task_id: &str, iso: &str) -> Result<()> {
+    sqlx::query("UPDATE tasks SET next_run_at = ? WHERE id = ?")
+        .bind(iso)
+        .bind(task_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Close a run that deliberately did not happen. Skipped is not a failure, so
+/// it carries an explanation but no failure code the retry ladder would act on.
+pub async fn finish_run_skipped(pool: &Pool, run_id: &str, code: &str, human: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE runs SET status = 'skipped', finished_at = ?, summary_md = ?, notes_md = ?
+         WHERE id = ?",
+    )
+    .bind(crate::now_iso())
+    .bind(human)
+    .bind(code)
+    .bind(run_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// The most recent committed action of this kind for this task, if it happened
+/// within the given window.
+///
+/// The per-occurrence fence protects a scheduled slot, but a manual "Run now"
+/// mints a fresh slot every time, so nothing stops someone triggering a booking
+/// task twice in a minute and booking twice. This is what makes that visible.
+pub async fn recent_commit(
+    pool: &Pool,
+    task_id: &str,
+    action_kind: &str,
+    within_minutes: i64,
+) -> Result<Option<(String, String, Option<String>)>> {
+    let row = sqlx::query(
+        "SELECT occurrence_id, committed_at, evidence_json FROM side_effects
+         WHERE task_id = ? AND action_kind = ? AND state = 'committed'
+           AND committed_at IS NOT NULL
+           AND committed_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)
+         ORDER BY committed_at DESC LIMIT 1",
+    )
+    .bind(task_id)
+    .bind(action_kind)
+    .bind(format!("-{within_minutes} minutes"))
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some(r) => Ok(Some((
+            r.try_get("occurrence_id")?,
+            r.try_get("committed_at")?,
+            r.try_get("evidence_json")?,
+        ))),
+        None => Ok(None),
+    }
+}
+
+/// Move a task from draft to ready so the scheduler will consider it.
+///
+/// Without this there is no path at all from creating a task to it ever
+/// running, which is exactly the sort of gap that hides when tests reach into
+/// the database directly instead of going through the product.
+pub async fn activate_task(pool: &Pool, task_id: &str) -> Result<bool> {
+    let res = sqlx::query(
+        "UPDATE tasks SET status = 'ready', auto_paused = 0, paused_reason = NULL, updated_at = ?
+         WHERE id = ? AND status IN ('draft', 'teaching', 'ready')",
+    )
+    .bind(crate::now_iso())
+    .bind(task_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Is this task already running something?
+pub async fn busy_run_for_task(pool: &Pool, task_id: &str) -> Result<Option<String>> {
+    let row = sqlx::query(
+        "SELECT id FROM runs WHERE task_id = ? AND status IN
+         ('armed','queued','preflight','holding','running','healing','waiting_input','takeover')
+         LIMIT 1",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some(r) => Ok(Some(r.try_get("id")?)),
+        None => Ok(None),
+    }
+}
+
+/// Close out runs left mid-flight by a daemon that died.
+///
+/// Without this a killed run stays "running" forever: it never ends, never
+/// explains itself, and permanently inflates the busy count. Returns the runs
+/// it closed, with a flag for those that were holding an unresolved
+/// irreversible action, because those tasks must not simply carry on.
+pub async fn recover_interrupted_runs(pool: &Pool) -> Result<Vec<(String, String, bool)>> {
+    let rows = sqlx::query(
+        "SELECT id, task_id FROM runs WHERE status IN
+         ('armed','queued','preflight','holding','running','healing','waiting_input','takeover')",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = vec![];
+    for r in rows {
+        let run_id: String = r.try_get("id")?;
+        let task_id: String = r.try_get("task_id")?;
+
+        let armed = sqlx::query(
+            "SELECT COUNT(*) AS n FROM side_effects WHERE run_id = ? AND state = 'armed'",
+        )
+        .bind(&run_id)
+        .fetch_one(pool)
+        .await?
+        .try_get::<i64, _>("n")?
+            > 0;
+
+        let human = if armed {
+            concat!(
+                "**What I was doing:** Something that cannot be undone, such as booking or ",
+                "sending.\n",
+                "**Why I could not finish:** Errand stopped while that was in progress, so ",
+                "nobody knows whether it went through.\n",
+                "**What you can do:** Check the site before running this again. This task has ",
+                "been paused so it cannot repeat the action by accident."
+            )
+            .to_string()
+        } else {
+            concat!(
+                "**What I was doing:** Working on this task.\n",
+                "**Why I could not finish:** Errand stopped while the run was in progress, so ",
+                "it never got to report what it had done.\n",
+                "**What you can do:** Check whether anything was completed, then press Run now."
+            )
+            .to_string()
+        };
+
+        finish_run_failed(pool, &run_id, "interrupted", &human, None).await?;
+        if armed {
+            auto_pause_task(pool, &task_id, "interrupted_mid_action").await?;
+        }
+        out.push((run_id, task_id, armed));
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -885,5 +1245,422 @@ mod tests {
         // The wire type has no field capable of carrying a secret.
         let json = serde_json::to_string(&all[0]).unwrap();
         assert!(!json.contains("password_value"));
+    }
+
+    #[tokio::test]
+    async fn the_fence_lets_one_action_through_per_occurrence() {
+        let pool = open_memory().await.unwrap();
+        let t = create_task(
+            &pool,
+            NewTask {
+                name: "T".into(),
+                description: "d".into(),
+                emoji: None,
+                schedule: serde_json::json!({"kind":"manual"}),
+            },
+        )
+        .await
+        .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "2026-08-26T08:00Z",
+            "schedule",
+            "normal",
+            None,
+        )
+        .await
+        .unwrap();
+
+        let v = arm_side_effect(&pool, &r.id, &t.id, "2026-08-26T08:00Z", "booking")
+            .await
+            .unwrap();
+        let FenceVerdict::Armed(id) = v else {
+            panic!("first arm should be allowed: {v:?}")
+        };
+        commit_side_effect(&pool, &id, r#"{"confirmation":"44821"}"#)
+            .await
+            .unwrap();
+
+        // The same occurrence asking again gets told it is already done.
+        let again = arm_side_effect(&pool, &r.id, &t.id, "2026-08-26T08:00Z", "booking")
+            .await
+            .unwrap();
+        match again {
+            FenceVerdict::AlreadyCommitted { evidence } => {
+                assert!(evidence.unwrap().contains("44821"));
+            }
+            other => panic!("expected AlreadyCommitted, got {other:?}"),
+        }
+    }
+
+    /// The failure the fence exists to prevent: a retry that picks a different
+    /// resource must not slip past a guard keyed on the first choice.
+    #[tokio::test]
+    async fn a_retry_choosing_differently_cannot_double_book() {
+        let pool = open_memory().await.unwrap();
+        let t = create_task(
+            &pool,
+            NewTask {
+                name: "Court".into(),
+                description: "d".into(),
+                emoji: None,
+                schedule: serde_json::json!({"kind":"manual"}),
+            },
+        )
+        .await
+        .unwrap();
+        let r1 = create_run(&pool, &t.id, "slot-A", "schedule", "normal", None)
+            .await
+            .unwrap();
+
+        // First attempt books court 2.
+        let FenceVerdict::Armed(id) = arm_side_effect(&pool, &r1.id, &t.id, "slot-A", "booking")
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        commit_side_effect(&pool, &id, r#"{"court":"2"}"#)
+            .await
+            .unwrap();
+
+        // A retry of the same occurrence decides court 4 instead. Because the
+        // key is the occurrence and not the court, it is still refused.
+        let retry = arm_side_effect(&pool, &r1.id, &t.id, "slot-A", "booking")
+            .await
+            .unwrap();
+        assert!(
+            matches!(retry, FenceVerdict::AlreadyCommitted { .. }),
+            "a different choice must not open a second booking: {retry:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_crash_between_arming_and_committing_demands_verification() {
+        let pool = open_memory().await.unwrap();
+        let t = create_task(
+            &pool,
+            NewTask {
+                name: "T".into(),
+                description: "d".into(),
+                emoji: None,
+                schedule: serde_json::json!({"kind":"manual"}),
+            },
+        )
+        .await
+        .unwrap();
+        let r = create_run(&pool, &t.id, "slot-B", "schedule", "normal", None)
+            .await
+            .unwrap();
+
+        // Armed, then the process died. Nobody knows if it went through.
+        arm_side_effect(&pool, &r.id, &t.id, "slot-B", "booking")
+            .await
+            .unwrap();
+        assert!(dangling_fences(&pool, &t.id, "slot-B").await.unwrap());
+
+        let after = arm_side_effect(&pool, &r.id, &t.id, "slot-B", "booking")
+            .await
+            .unwrap();
+        assert!(
+            matches!(after, FenceVerdict::NeedsVerification { .. }),
+            "an uncommitted fence must force a check before acting again: {after:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn aborting_frees_the_slot_for_a_later_attempt() {
+        let pool = open_memory().await.unwrap();
+        let t = create_task(
+            &pool,
+            NewTask {
+                name: "T".into(),
+                description: "d".into(),
+                emoji: None,
+                schedule: serde_json::json!({"kind":"manual"}),
+            },
+        )
+        .await
+        .unwrap();
+        let r = create_run(&pool, &t.id, "slot-C", "schedule", "normal", None)
+            .await
+            .unwrap();
+
+        let FenceVerdict::Armed(id) = arm_side_effect(&pool, &r.id, &t.id, "slot-C", "booking")
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        abort_side_effect(&pool, &id, "no free courts")
+            .await
+            .unwrap();
+        assert!(!dangling_fences(&pool, &t.id, "slot-C").await.unwrap());
+
+        let again = arm_side_effect(&pool, &r.id, &t.id, "slot-C", "booking")
+            .await
+            .unwrap();
+        assert!(
+            matches!(again, FenceVerdict::Armed(_)),
+            "an aborted attempt should not block a real one: {again:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn different_occurrences_and_action_kinds_are_independent() {
+        let pool = open_memory().await.unwrap();
+        let t = create_task(
+            &pool,
+            NewTask {
+                name: "T".into(),
+                description: "d".into(),
+                emoji: None,
+                schedule: serde_json::json!({"kind":"manual"}),
+            },
+        )
+        .await
+        .unwrap();
+        let r = create_run(&pool, &t.id, "w1", "schedule", "normal", None)
+            .await
+            .unwrap();
+
+        let FenceVerdict::Armed(a) = arm_side_effect(&pool, &r.id, &t.id, "w1", "booking")
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        commit_side_effect(&pool, &a, "{}").await.unwrap();
+
+        // Next week's slot is a different occurrence.
+        assert!(matches!(
+            arm_side_effect(&pool, &r.id, &t.id, "w2", "booking")
+                .await
+                .unwrap(),
+            FenceVerdict::Armed(_)
+        ));
+        // Sending a message is a different kind of action.
+        assert!(matches!(
+            arm_side_effect(&pool, &r.id, &t.id, "w1", "message")
+                .await
+                .unwrap(),
+            FenceVerdict::Armed(_)
+        ));
+    }
+
+    /// The per-occurrence fence cannot see a manual re-trigger, because each
+    /// manual run is its own slot. This is what notices it anyway.
+    #[tokio::test]
+    async fn a_repeat_of_the_same_action_within_minutes_is_visible() {
+        let pool = open_memory().await.unwrap();
+        let t = create_task(
+            &pool,
+            NewTask {
+                name: "Book".into(),
+                description: "d".into(),
+                emoji: None,
+                schedule: serde_json::json!({"kind":"manual"}),
+            },
+        )
+        .await
+        .unwrap();
+        let r = create_run(&pool, &t.id, "manual/one", "manual", "normal", None)
+            .await
+            .unwrap();
+
+        assert!(recent_commit(&pool, &t.id, "booking", 10)
+            .await
+            .unwrap()
+            .is_none());
+
+        let FenceVerdict::Armed(id) = arm_side_effect(&pool, &r.id, &t.id, "manual/one", "booking")
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        commit_side_effect(&pool, &id, r#"{"court":"2"}"#)
+            .await
+            .unwrap();
+
+        // A second manual run is a different occurrence, so the fence allows it.
+        let r2 = create_run(&pool, &t.id, "manual/two", "manual", "normal", None)
+            .await
+            .unwrap();
+        assert!(matches!(
+            arm_side_effect(&pool, &r2.id, &t.id, "manual/two", "booking")
+                .await
+                .unwrap(),
+            FenceVerdict::Armed(_)
+        ));
+        // But the repeat is visible, which is what stops it happening silently.
+        let recent = recent_commit(&pool, &t.id, "booking", 10).await.unwrap();
+        assert!(
+            recent.is_some(),
+            "a booking a moment ago must be visible to the next attempt"
+        );
+        assert_eq!(recent.unwrap().0, "manual/one");
+    }
+
+    #[tokio::test]
+    async fn an_old_action_does_not_block_a_legitimate_new_one() {
+        let pool = open_memory().await.unwrap();
+        let t = create_task(
+            &pool,
+            NewTask {
+                name: "Book".into(),
+                description: "d".into(),
+                emoji: None,
+                schedule: serde_json::json!({"kind":"manual"}),
+            },
+        )
+        .await
+        .unwrap();
+        let r = create_run(&pool, &t.id, "old", "manual", "normal", None)
+            .await
+            .unwrap();
+        let FenceVerdict::Armed(id) = arm_side_effect(&pool, &r.id, &t.id, "old", "booking")
+            .await
+            .unwrap()
+        else {
+            panic!()
+        };
+        commit_side_effect(&pool, &id, "{}").await.unwrap();
+        sqlx::query("UPDATE side_effects SET committed_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Booking again next week is normal and must not be obstructed.
+        assert!(recent_commit(&pool, &t.id, "booking", 10)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn a_duplicate_occurrence_is_distinguished_from_a_real_fault() {
+        let pool = open_memory().await.unwrap();
+        let t = create_task(
+            &pool,
+            NewTask {
+                name: "T".into(),
+                description: "d".into(),
+                emoji: None,
+                schedule: serde_json::json!({"kind":"manual"}),
+            },
+        )
+        .await
+        .unwrap();
+        try_create_run(&pool, &t.id, "slot", "schedule", "normal", None)
+            .await
+            .unwrap();
+        let again = try_create_run(&pool, &t.id, "slot", "schedule", "normal", None).await;
+        assert!(
+            matches!(again, Err(CreateRunError::AlreadyExists)),
+            "a second run for one slot must be reported as a duplicate, not a fault"
+        );
+
+        // A genuine fault must NOT masquerade as a duplicate, or the occurrence
+        // is lost silently.
+        let bad = try_create_run(&pool, "no-such-task", "slot2", "schedule", "normal", None).await;
+        assert!(
+            matches!(bad, Err(CreateRunError::Other(_))),
+            "a foreign key failure must not be read as 'already ran'"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_can_be_activated_from_draft() {
+        let pool = open_memory().await.unwrap();
+        let t = create_task(
+            &pool,
+            NewTask {
+                name: "T".into(),
+                description: "d".into(),
+                emoji: None,
+                schedule: serde_json::json!({"kind":"manual"}),
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(t.status, "draft");
+        assert!(activate_task(&pool, &t.id).await.unwrap());
+        assert_eq!(
+            get_task(&pool, &t.id).await.unwrap().unwrap().status,
+            "ready"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_interrupted_run_is_closed_with_an_explanation_and_pauses_if_it_was_mid_action() {
+        let pool = open_memory().await.unwrap();
+        let t = create_task(
+            &pool,
+            NewTask {
+                name: "T".into(),
+                description: "d".into(),
+                emoji: None,
+                schedule: serde_json::json!({"kind":"manual"}),
+            },
+        )
+        .await
+        .unwrap();
+        activate_task(&pool, &t.id).await.unwrap();
+        let r = create_run(&pool, &t.id, "slot", "schedule", "normal", None)
+            .await
+            .unwrap();
+        set_run_status(&pool, &r.id, "running").await.unwrap();
+        arm_side_effect(&pool, &r.id, &t.id, "slot", "booking")
+            .await
+            .unwrap();
+
+        let recovered = recover_interrupted_runs(&pool).await.unwrap();
+        assert_eq!(recovered.len(), 1);
+        assert!(
+            recovered[0].2,
+            "should be flagged as interrupted mid-action"
+        );
+
+        let run = get_run(&pool, &r.id).await.unwrap().unwrap();
+        assert_eq!(run.status, "failed");
+        let f = run.failure.unwrap();
+        assert_eq!(f.code, "interrupted");
+        assert!(f
+            .plain_reason
+            .contains("nobody knows whether it went through"));
+
+        // The task is paused so it cannot quietly repeat the action.
+        let task = get_task(&pool, &t.id).await.unwrap().unwrap();
+        assert_eq!(task.status, "paused");
+        assert!(task.auto_paused);
+    }
+
+    #[tokio::test]
+    async fn a_busy_task_is_visible_so_a_second_run_can_be_refused() {
+        let pool = open_memory().await.unwrap();
+        let t = create_task(
+            &pool,
+            NewTask {
+                name: "T".into(),
+                description: "d".into(),
+                emoji: None,
+                schedule: serde_json::json!({"kind":"manual"}),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(busy_run_for_task(&pool, &t.id).await.unwrap().is_none());
+        let r = create_run(&pool, &t.id, "s", "manual", "normal", None)
+            .await
+            .unwrap();
+        assert_eq!(
+            busy_run_for_task(&pool, &t.id).await.unwrap(),
+            Some(r.id.clone())
+        );
+        finish_run_ok(&pool, &r.id, "done").await.unwrap();
+        assert!(busy_run_for_task(&pool, &t.id).await.unwrap().is_none());
     }
 }

@@ -121,7 +121,11 @@ fn tool_definitions() -> Value {
             "description":
                 "Do one thing to the page: click a ref, type text into a ref, select a value, \
                  tick a checkbox, press a key, or scroll. Never type a password with this; use \
-                 fill_credential, which is the only way a stored secret reaches a page.",
+                 fill_credential, which is the only way a stored secret reaches a page. \
+                 Anything that cannot be undone, such as booking, paying, sending or deleting, \
+                 is checked against a safety record first: this run's slot may commit each such \
+                 action only once ever, so if you are told it is already done, do not try again \
+                 and do not look for another way round it.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -474,14 +478,88 @@ async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &Value) -> V
                     );
                 }
             }
+            // Anything that cannot be undone goes through the fence first, so
+            // one scheduled occurrence can commit at most one such action, even
+            // across crashes, retries, and a differently chosen outcome.
+            let the_ref = args.get("ref").and_then(|r| r.as_str()).unwrap_or("");
+            let described = b.describe_ref(the_ref).await;
+            let action_kind = if kind == "click" {
+                described
+                    .as_ref()
+                    .and_then(|(role, label)| crate::browser::looks_irreversible(role, label))
+            } else {
+                None
+            };
+
+            let mut fence_id: Option<String> = None;
+            if let Some(action_kind) = action_kind {
+                match guard_irreversible(state, run_id, action_kind).await {
+                    Ok(Guard::Proceed(id)) => fence_id = Some(id),
+                    Ok(Guard::Refuse(msg)) => {
+                        let _ = journal(state, run_id, "decide", &msg, false).await;
+                        return text_error(msg);
+                    }
+                    Err(e) => return text_error(format!("Could not check the safety record: {e}")),
+                }
+            }
+
             match b.act(kind, args.clone()).await {
                 Ok(_) => {
-                    let what = args.get("ref").and_then(|r| r.as_str()).unwrap_or("");
-                    let _ =
-                        journal(state, run_id, "act", format!("{kind} {what}").trim(), true).await;
+                    let label = described
+                        .as_ref()
+                        .map(|(_, l)| l.clone())
+                        .unwrap_or_default();
+                    let title = if label.is_empty() {
+                        format!("{kind} {the_ref}")
+                    } else {
+                        format!("{kind} {label:?}")
+                    };
+                    let _ = journal(state, run_id, "act", title.trim(), true).await;
+
+                    if let Some(id) = fence_id {
+                        // Commit with evidence, so a later attempt is told what
+                        // already happened rather than merely being refused.
+                        let url = b.snapshot().await.map(|s| s.url).unwrap_or_default();
+                        let evidence = json!({
+                            "action": action_kind,
+                            "label": label,
+                            "url": url,
+                            "at": errand_core::now_iso(),
+                        });
+                        let _ = errand_core::db::commit_side_effect(
+                            state.pool(),
+                            &id,
+                            &evidence.to_string(),
+                        )
+                        .await;
+                        let _ = journal(
+                            state,
+                            run_id,
+                            "decide",
+                            &format!(
+                                "Recorded that this slot has now had its {} done",
+                                action_kind.unwrap_or("action")
+                            ),
+                            true,
+                        )
+                        .await;
+                    }
                     text_result("done")
                 }
-                Err(e) => text_error(e.to_string()),
+                Err(e) => {
+                    if let Some(id) = fence_id {
+                        // Nothing took effect, so release the slot rather than
+                        // leaving it dangling and blocking the task until a
+                        // human clears it by hand.
+                        let _ = errand_core::db::abort_side_effect(
+                            state.pool(),
+                            &id,
+                            "the action failed before it took effect",
+                        )
+                        .await;
+                    }
+                    text_error(e.to_string())
+                }
             }
         }
 
@@ -777,6 +855,85 @@ async fn journal(
         .await;
     }
     errand_core::db::append_step(state.pool(), run_id, kind, &clean, ok, None).await
+}
+
+/// How recently a matching irreversible action counts as a probable repeat.
+/// Long enough to catch a double trigger, short enough that booking again next
+/// week is never obstructed.
+const REPEAT_WINDOW_MIN: i64 = 10;
+
+enum Guard {
+    Proceed(String),
+    Refuse(String),
+}
+
+/// Ask the fence whether this run may do something irreversible.
+async fn guard_irreversible(
+    state: &AppState,
+    run_id: &str,
+    action_kind: &str,
+) -> anyhow::Result<Guard> {
+    use errand_core::db::FenceVerdict;
+    let run = errand_core::db::get_run(state.pool(), run_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("run not found"))?;
+
+    let verdict = errand_core::db::arm_side_effect(
+        state.pool(),
+        run_id,
+        &run.task_id,
+        &run.occurrence_id,
+        action_kind,
+    )
+    .await?;
+
+    Ok(match verdict {
+        FenceVerdict::Armed(id) => {
+            // The fence protects a scheduled slot, but a manual run is its own
+            // slot, so pressing Run now twice would otherwise book twice with
+            // nothing to stop it. A repeat of the same irreversible action
+            // minutes after the last one is almost always an accident, so it
+            // stops and asks rather than quietly doing it again.
+            if let Some((prev_occ, at, evidence)) = errand_core::db::recent_commit(
+                state.pool(),
+                &run.task_id,
+                action_kind,
+                REPEAT_WINDOW_MIN,
+            )
+            .await?
+            {
+                if prev_occ != run.occurrence_id {
+                    let _ = errand_core::db::abort_side_effect(
+                        state.pool(),
+                        &id,
+                        "a matching action had just been done",
+                    )
+                    .await;
+                    return Ok(Guard::Refuse(format!(
+                        "This task already did a {action_kind} at {at}, only minutes ago: {}. \
+                         Doing it again now would almost certainly duplicate it, so it has been \
+                         stopped. Do not look for another way round this. Report that it appears \
+                         to have been done already and finish, so a person can decide whether a \
+                         second one was really wanted.",
+                        evidence.unwrap_or_else(|| "no details recorded".into())
+                    )));
+                }
+            }
+            Guard::Proceed(id)
+        }
+        FenceVerdict::AlreadyCommitted { evidence } => Guard::Refuse(format!(
+            "This run's slot has already had its {action_kind} done: {}. Doing it again would \
+             duplicate it. Do not retry. Report what already happened and finish.",
+            evidence.unwrap_or_else(|| "no details recorded".into())
+        )),
+        FenceVerdict::NeedsVerification { armed_at } => Guard::Refuse(format!(
+            "An earlier attempt at this slot started a {action_kind} at {armed_at} and never \
+             confirmed whether it completed, so it may or may not have gone through. Do not \
+             repeat it blindly. Check the site for evidence of whether it already happened, and \
+             report what you find. If it plainly did not happen, say so and stop; a human will \
+             clear this."
+        )),
+    })
 }
 
 #[cfg(test)]

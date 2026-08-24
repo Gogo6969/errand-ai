@@ -29,6 +29,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/health/detail", get(health_detail))
         .route("/v1/tasks", get(list_tasks).post(create_task))
         .route("/v1/tasks/{id}", get(get_task))
+        .route("/v1/tasks/{id}/activate", post(activate_task))
         .route("/v1/tasks/{id}/pause", post(pause_task))
         .route("/v1/tasks/{id}/resume", post(resume_task))
         .route("/v1/tasks/{id}/run", post(run_task))
@@ -136,6 +137,51 @@ async fn create_task(
     Ok(Json(task))
 }
 
+/// Move a task from draft to ready so the scheduler will consider it.
+async fn activate_task(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    let task = errand_core::db::get_task(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found(format!("No task with id {id}.")))?;
+
+    // A schedule that cannot be read would leave the task armed but unable to
+    // compute when it runs, which is worse than refusing here.
+    let spec = errand_core::schedule::ScheduleSpec::from_json(&task.schedule)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let next = spec
+        .next_after(chrono::Utc::now())
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
+    if !errand_core::db::activate_task(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+    {
+        return Err(ApiError::conflict(
+            "task_not_activatable",
+            "Only a draft, teaching or ready task can be activated. An archived task cannot.",
+        ));
+    }
+
+    if let Some(n) = next {
+        let _ = errand_core::db::set_next_run_at(state.pool(), &id, &n.to_rfc3339()).await;
+    }
+    state.emit(Event::TaskUpdated { task_id: id });
+    Ok(Json(json!({
+        "status": "ready",
+        "next_run_at": next.map(|n| n.to_rfc3339()),
+        "note": if next.is_some() {
+            "This task will now run on its own schedule."
+        } else {
+            "This task has no schedule, so it will only run when you ask it to."
+        }
+    })))
+}
+
 #[derive(Deserialize, Default)]
 struct PauseBody {
     #[serde(default)]
@@ -218,11 +264,55 @@ async fn run_task(
         ));
     }
 
+    // Refuse to start a second agent on a task that is already running one.
+    // Two agents on the same task can each book the same slot, and the unique
+    // index does not catch it because their occurrence ids differ.
+    if let Some(busy) = errand_core::db::busy_run_for_task(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+    {
+        return Err(ApiError::conflict(
+            "task_already_running",
+            format!(
+                "This task is already running (run {busy}). Wait for it to finish, or cancel it, \
+                 rather than starting a second one alongside it."
+            ),
+        ));
+    }
+
     let dry = body.map(|b| b.0.dry_run).unwrap_or(false);
-    // A manual run gets a fresh occurrence id. Retries of a crashed run inherit
-    // the original one instead, so the side-effect fence still covers them.
-    let occurrence = format!("manual/{}", errand_core::new_id());
-    let run = errand_core::db::create_run(
+
+    // Give a manual run the identity of the slot it stands in for.
+    //
+    // A fresh id per press would mean the fence never recognises the work the
+    // scheduled run already did, so the ordinary sequence of a run dying
+    // mid-booking and the user pressing Run now would book a second court with
+    // nothing to stop it.
+    let spec = errand_core::schedule::ScheduleSpec::from_json(&task.schedule)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    let occurrence = match spec
+        .last_occurrence_at_or_before(chrono::Utc::now())
+        .map_err(|e| ApiError::bad_request(e.to_string()))?
+    {
+        Some(occ) => spec.occurrence_id(occ),
+        None => format!("manual/{}", errand_core::new_id()),
+    };
+
+    // An unresolved irreversible action means nobody knows what already
+    // happened. Starting another run could repeat it.
+    if errand_core::db::dangling_fences(state.pool(), &id, &occurrence)
+        .await
+        .map_err(ApiError::from)?
+    {
+        return Err(ApiError::conflict(
+            "needs_verification",
+            "An earlier attempt at this slot began something that cannot be undone and never \
+             confirmed whether it finished. Running again could do it twice. Check the site \
+             first, then clear this from the task before running it again.",
+        ));
+    }
+
+    let run = match errand_core::db::try_create_run(
         state.pool(),
         &id,
         &occurrence,
@@ -231,7 +321,18 @@ async fn run_task(
         Some(&caller.token_name),
     )
     .await
-    .map_err(ApiError::from)?;
+    {
+        Ok(r) => r,
+        Err(errand_core::db::CreateRunError::AlreadyExists) => {
+            return Err(ApiError::conflict(
+                "occurrence_already_ran",
+                "This task has already run for the current scheduled slot. Running again now \
+                 would repeat work that was already done. Wait for the next slot, or look at \
+                 what the last run did.",
+            ))
+        }
+        Err(errand_core::db::CreateRunError::Other(e)) => return Err(ApiError::from(e)),
+    };
 
     errand_core::db::append_step(
         state.pool(),

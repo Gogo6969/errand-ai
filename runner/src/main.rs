@@ -19,6 +19,7 @@ mod executor;
 mod lock;
 mod mcp;
 mod redact;
+mod scheduler;
 mod secrets;
 mod state;
 
@@ -244,6 +245,11 @@ async fn serve(foreground: bool) -> Result<()> {
             errand_core::VERSION
         );
     }
+
+    // The scheduler is what makes a task fire without anyone asking. It starts
+    // after the listener so a scheduling problem can never stop the API from
+    // answering questions about why nothing is running.
+    scheduler::spawn(state.clone());
 
     // Only now touch the keychain.
     //

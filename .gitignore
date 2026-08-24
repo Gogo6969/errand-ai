@@ -1,0 +1,39 @@
+# Build output
+/target/
+**/target/
+node_modules/
+frontend/.svelte-kit/
+frontend/build/
+dist/
+
+# The dev overlay. Local model endpoints, test tokens, machine-specific paths.
+# This is the file that keeps private LAN addresses out of the public repo, so
+# it is ignored before it exists rather than after.
+config.dev.json
+config.local.json
+.env
+.env.*
+!.env.example
+
+# Signing material, never in a repo
+*.p12
+*.mobileprovision
+AuthKey_*.p8
+updater.key
+*.pem
+
+# Runtime data (the real thing lives in Application Support)
+*.db
+*.db-wal
+*.db-shm
+/runs/
+/playbooks/
+/profiles/
+/logs/
+
+# macOS
+.DS_Store
+
+# Unattributed local build note, not authored by this session. Kept out of the
+# public repo pending review (it references private paths).
+SPEC-M1.md

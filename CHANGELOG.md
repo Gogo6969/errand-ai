@@ -44,6 +44,17 @@ any artifact. Told to visit a site outside its allowlist, the agent was refused 
 explanation. Told to type a bank credential into a different site, the fill was refused and
 nothing was entered.
 
+### Fixed
+
+- **The CLI could hang forever after it had already answered.** A keychain call that stalls behind
+  a macOS authorization prompt runs on a blocking thread, and a timeout only abandons the future:
+  tokio cannot cancel the thread, so the runtime waited on it indefinitely. `doctor` printed its
+  full report and then never returned. It now exits explicitly, which is the right end of a
+  diagnostic anyway. Verified: returns in under a second where it previously never returned.
+- **Added `errandd token --new`.** If the keychain copy of the API token becomes unreadable, the
+  hash in the database still authenticates requests but nobody can read the value, and the only
+  way out was editing the database by hand. This mints a replacement and revokes the old one.
+
 ## M2a
 
 ### Added

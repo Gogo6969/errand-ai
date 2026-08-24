@@ -73,6 +73,28 @@ pub async fn ensure_primary_token(pool: &Pool) -> Result<Option<String>> {
     Ok(Some(token))
 }
 
+/// Mint a replacement primary token, revoking the old one.
+///
+/// The recovery path for the case where the keychain copy has become
+/// unreadable: a rebuilt binary, a restored machine, a cleared keychain. The
+/// hash in the database still authenticates requests, but nobody can read the
+/// value any more, and without this the only way out is editing the database
+/// by hand.
+pub async fn regenerate_primary_token(pool: &Pool) -> Result<String> {
+    let token = generate_token()?;
+    let hash = hash_token(&token);
+    errand_core::db::revoke_tokens_named(pool, "primary").await?;
+    let name = format!("primary-{}", &errand_core::new_id()[..8]);
+    errand_core::db::insert_token(pool, &name, &hash, "admin").await?;
+    crate::secrets::put_internal(
+        errand_core::keychain::ACCOUNT_API_TOKEN,
+        errand_core::keychain::Secret::new(token.clone()),
+    )
+    .await
+    .context("storing the new API token in the keychain")?;
+    Ok(token)
+}
+
 /// Read the primary token back out of the keychain, for the CLI and for the UI
 /// to display on request.
 pub async fn read_primary_token() -> Result<String> {

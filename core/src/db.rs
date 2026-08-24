@@ -745,6 +745,18 @@ pub async fn mark_credential_used(pool: &Pool, cred_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Revoke every live token with this name. Used by the token recovery path.
+pub async fn revoke_tokens_named(pool: &Pool, name_prefix: &str) -> Result<u64> {
+    let res = sqlx::query(
+        "UPDATE api_tokens SET revoked_at = ? WHERE name LIKE ? AND revoked_at IS NULL",
+    )
+    .bind(crate::now_iso())
+    .bind(format!("{name_prefix}%"))
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -48,15 +48,44 @@ async fn main() -> Result<()> {
             println!("LaunchAgent removed. Scheduled tasks will no longer run.");
             Ok(())
         }
-        "doctor" => doctor().await,
+        "doctor" => {
+            let problems = doctor().await?;
+            // Exit explicitly rather than returning.
+            //
+            // A keychain call that stalls behind an authorization prompt is
+            // running on a blocking thread, and a timeout only abandons the
+            // future: tokio cannot cancel the thread, so the runtime would wait
+            // for it forever and the command would hang after having already
+            // printed its answer. Leaving is the correct end of a diagnostic.
+            std::process::exit(i32::from(problems > 0));
+        }
+        "token" if args.get(1).map(String::as_str) == Some("--new") => {
+            let pool = errand_core::db::open().await?;
+            match api::auth::regenerate_primary_token(&pool).await {
+                Ok(t) => {
+                    println!("{t}");
+                    eprintln!(
+                        "\nThe previous token has been revoked. Update anything that used it."
+                    );
+                    std::process::exit(0);
+                }
+                Err(e) => {
+                    eprintln!("Could not mint a replacement token: {e}");
+                    std::process::exit(1);
+                }
+            }
+        }
         "token" => match api::auth::read_primary_token().await {
             Ok(t) => {
                 println!("{t}");
-                Ok(())
+                // Same reason as doctor: a wedged keychain thread must not keep
+                // the process alive after the answer has been given.
+                std::process::exit(0);
             }
             Err(e) => {
-                eprintln!("No API token in the keychain yet: {e}");
-                eprintln!("Start the runner once and it will mint one.");
+                eprintln!("Cannot read the API token: {e}");
+                eprintln!("If the runner has never started, start it and it will mint one.");
+                eprintln!("Otherwise mint a replacement with: errandd token --new");
                 std::process::exit(1);
             }
         },
@@ -106,6 +135,8 @@ WHEN SOMETHING IS WRONG
   doctor             Check everything that has to be true for a task to run, and
                      say what to do about anything that is not.
   token              Print the API token, for talking to the local API.
+  token --new        Mint a replacement and revoke the old one. Use this when
+                     the stored token can no longer be read.
   --version          Print the version.
 
 THE LOCAL API
@@ -265,7 +296,7 @@ async fn serve(foreground: bool) -> Result<()> {
 
 /// One command that answers "why is my agent not working". Every check prints
 /// what it found and what to do about it, never just a status.
-async fn doctor() -> Result<()> {
+async fn doctor() -> Result<u32> {
     println!(
         "Errand-AI doctor ({} / schema {})\n",
         errand_core::VERSION,
@@ -414,7 +445,7 @@ async fn doctor() -> Result<()> {
     } else {
         println!("{problems} problem(s) above need attention.");
     }
-    Ok(())
+    Ok(problems)
 }
 
 fn tick(ok: bool) -> &'static str {

@@ -56,4 +56,4 @@ jobs:
         run: ./scripts/scrub-check.sh
 
       - name: Gitleaks over full history
-        run: gitleaks detect --redact --exit-code 1
+        run: gitleaks detect --redact --no-banner --exit-code 2

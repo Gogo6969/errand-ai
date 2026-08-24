@@ -78,12 +78,19 @@ if hits=$(echo "$FILES" | grep -vE '\.(md|lock)$' | xargs grep -nE '/Users/[a-z0
 fi
 
 # --- 6. gitleaks, when available --------------------------------------------
+# Leaks are reported as exit 2 so they are distinguishable from a tool error.
+# Collapsing the two is how a bad flag once got reported as "findings", which is
+# the same failure as reporting a broken check as a passing one.
 if command -v gitleaks >/dev/null 2>&1; then
-  if gitleaks detect --no-git --redact --exit-code 1 -q 2>/dev/null; then
-    note "gitleaks: clean"
-  else
-    problem "gitleaks reported findings (run: gitleaks detect --no-git --redact)"
-  fi
+  gl_out=$(gitleaks detect --no-git --redact --no-banner --exit-code 2 2>&1)
+  gl_rc=$?
+  case "$gl_rc" in
+    0) note "gitleaks: clean" ;;
+    2) problem "gitleaks found secrets:"
+       echo "$gl_out" | grep -iE 'finding|file|line|rule' | head -20 | sed 's/^/        /' ;;
+    *) problem "gitleaks failed to run (exit $gl_rc). A check that cannot run is not a check that passed:"
+       echo "$gl_out" | tail -5 | sed 's/^/        /' ;;
+  esac
 else
   note "gitleaks not installed locally; CI runs it on every push"
 fi

@@ -63,12 +63,61 @@ async fn main() -> Result<()> {
             println!("errandd {}", errand_core::VERSION);
             Ok(())
         }
+        "--help" | "-h" | "help" => {
+            print_help();
+            Ok(())
+        }
         other => {
-            eprintln!("Unknown argument '{other}'.");
-            eprintln!("Try: --foreground, --launchd, install, uninstall, doctor, token");
+            eprintln!("Unknown argument '{other}'.\n");
+            print_help();
             std::process::exit(2);
         }
     }
+}
+
+/// Every command, and what it is actually for. The product's rule is that
+/// nothing goes unexplained, and that starts at the command line.
+fn print_help() {
+    println!(
+        r#"errandd {version} - the Errand-AI background runner.
+
+This is the process that does the work. It schedules tasks, runs them with a
+contained AI agent, records what happened, holds your credentials, and serves
+the local API. It keeps running whether or not any window is open.
+
+USAGE
+  errandd <command>
+
+RUNNING
+  --launchd          Run as the background agent. This is how launchd starts it;
+                     you would not normally type it yourself.
+  --foreground       Run here in this terminal, logging to the screen. Use this
+                     when you want to watch what it is doing.
+
+SETUP
+  install [path]     Install it as a background agent that starts at login.
+                     Point this at a stable copy of the binary, never at a build
+                     directory: rebuilding a running binary deadlocks it on macOS.
+  uninstall          Remove the background agent. Scheduled tasks stop running.
+
+WHEN SOMETHING IS WRONG
+  doctor             Check everything that has to be true for a task to run, and
+                     say what to do about anything that is not.
+  token              Print the API token, for talking to the local API.
+  --version          Print the version.
+
+THE LOCAL API
+  http://127.0.0.1:4477 - loopback only. Use 127.0.0.1 rather than localhost,
+  because the listener is IPv4 and localhost can resolve to IPv6 first.
+
+    curl -H "Authorization: Bearer $(errandd token)" \
+         http://127.0.0.1:4477/v1/tasks
+
+DATA
+  Everything lives in ~/Library/Application Support/com.errandai.app/
+  Secrets live in your macOS keychain and nowhere else."#,
+        version = errand_core::VERSION
+    );
 }
 
 fn init_logging(foreground: bool) -> Option<tracing_appender::non_blocking::WorkerGuard> {
@@ -312,10 +361,19 @@ async fn doctor() -> Result<()> {
     }
     println!("  {}  API token in keychain", tick(has_token));
     if !has_token {
-        println!("      Either the runner has never started, or this build cannot read the");
-        println!("      stored item because its signature changed. The API still works either");
-        println!("      way, since the token's hash lives in the database. To fix the reading");
-        println!("      of it: delete the 'com.errandai.app.internal' keychain items and restart.");
+        println!("      The API itself still works: what authenticates a request is the hash");
+        println!("      in the database, and the keychain only holds a readable copy. Usual");
+        println!("      causes, in order of likelihood:");
+        println!("        - The runner has never started. Start it and it mints one.");
+        println!("        - You switched between a debug and a release build. They deliberately");
+        println!("          use separate keychain services, so each needs its own token.");
+        println!("        - The binary was rebuilt and re-signed, so the stored item's access");
+        println!("          list no longer matches it.");
+        println!(
+            "      For the last two: delete the '{}' items in",
+            errand_core::keychain_service_internal()
+        );
+        println!("      Keychain Access, then restart the runner.");
     }
 
     // Claude CLI: the flagship executor

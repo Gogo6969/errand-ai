@@ -6,6 +6,33 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+## M2a
+
+### Added
+
+- **Contained Claude executor.** Runs are carried out by the Claude CLI spawned headless, with
+  its capabilities established by testing rather than assumption. Four facts drove the design:
+  `--allowedTools` only auto-approves and removes nothing; `--disallowedTools "*"` empties the
+  list but takes the MCP tools with it; `Glob` and `Grep` cannot be removed at all; and the tool
+  list is not stable between invocations. So the boundary is the **working directory**, since the
+  un-removable tools are filesystem readers that refuse to leave cwd without a permission headless
+  mode denies, and every run gets an empty scratch directory of its own.
+- **Fail-closed containment assertion.** The tool list reported at session start is checked before
+  the model can act. Anything beyond our own MCP tools kills the process and fails the run. This
+  was verified by removing the deny list and watching it catch all 30 tools, including `Bash`,
+  `WebFetch`, `Skill`, `Workflow` and `CronCreate`. A breach is its own terminal failure code and
+  auto-pauses the task, because retrying an unsafe spawn is worse than not running.
+- **MCP tool server** at `/mcp/runs/{run_id}`, the agent's only reach into the world, with a bearer
+  minted per run so a tool call cannot touch another run's data. Four tools for this milestone:
+  `read_brief`, `journal`, `finish`, `fail`.
+- **The three-question failure contract, enforced end to end.** `fail` refuses an explanation that
+  does not say what was attempted, why it could not finish, and what the person can do next.
+- **Live run journal** streaming to the SSE feed as the agent works, in its own plain language.
+- Per-run cost and token accounting, and a per-run stderr log, since the CLI reports only
+  "exited with code 1" and the real cause is always on stderr.
+
+## M1
+
 ### Added
 
 - **Cargo workspace** with `errand-core` (shared library) and `errand-runner` (the `errandd`

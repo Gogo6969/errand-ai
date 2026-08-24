@@ -345,6 +345,79 @@ pub async fn append_step(
     Ok(seq)
 }
 
+pub async fn set_run_status(pool: &Pool, run_id: &str, status: &str) -> Result<()> {
+    let started = if status == "running" {
+        Some(crate::now_iso())
+    } else {
+        None
+    };
+    sqlx::query("UPDATE runs SET status = ?, started_at = COALESCE(started_at, ?) WHERE id = ?")
+        .bind(status)
+        .bind(started)
+        .bind(run_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+pub async fn finish_run_ok(pool: &Pool, run_id: &str, summary: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE runs SET status = 'succeeded', finished_at = ?, summary_md = ? WHERE id = ?",
+    )
+    .bind(crate::now_iso())
+    .bind(summary)
+    .bind(run_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Close a run as failed. The schema rejects this without both a code and a
+/// plain-language explanation, which is the invariant that keeps a failure from
+/// ever reaching the user as a bare error string.
+pub async fn finish_run_failed(
+    pool: &Pool,
+    run_id: &str,
+    code: &str,
+    human: &str,
+    technical: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE runs SET status = 'failed', finished_at = ?, failure_code = ?,
+                         failure_human = ?, failure_technical = ?
+         WHERE id = ?",
+    )
+    .bind(crate::now_iso())
+    .bind(code)
+    .bind(human)
+    .bind(technical)
+    .bind(run_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn record_usage(
+    pool: &Pool,
+    run_id: &str,
+    tokens_in: i64,
+    tokens_out: i64,
+    cost_usd: f64,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE runs SET tokens_in = tokens_in + ?, tokens_out = tokens_out + ?,
+                         cost_usd = cost_usd + ?
+         WHERE id = ?",
+    )
+    .bind(tokens_in)
+    .bind(tokens_out)
+    .bind(cost_usd)
+    .bind(run_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
 // ------------------------------------------------------------- credentials --
 
 pub async fn list_credentials(pool: &Pool) -> Result<Vec<crate::models::CredentialMeta>> {
@@ -502,6 +575,21 @@ pub async fn record_audit(pool: &Pool, e: AuditEntry<'_>) -> Result<()> {
     .bind(e.status as i64)
     .bind(e.latency_ms)
     .bind(e.request_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Pause a task because the system decided to, not because the user did.
+/// Distinguished from a user pause in the UI so the reason is visible.
+pub async fn auto_pause_task(pool: &Pool, task_id: &str, reason: &str) -> Result<()> {
+    sqlx::query(
+        "UPDATE tasks SET status = 'paused', auto_paused = 1, paused_reason = ?, updated_at = ?
+         WHERE id = ? AND status IN ('ready','paused')",
+    )
+    .bind(reason)
+    .bind(crate::now_iso())
+    .bind(task_id)
     .execute(pool)
     .await?;
     Ok(())

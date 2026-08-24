@@ -17,7 +17,13 @@ use crate::state::AppState;
 
 pub fn router(state: AppState) -> Router {
     // Unauthenticated: liveness only, and it reveals nothing beyond "alive".
-    let public = Router::new().route("/v1/health", get(health_public));
+    //
+    // The MCP endpoint sits here rather than behind the API-token middleware
+    // because it carries its own per-run bearer, checked inside the handler.
+    // A run's token grants access to that run alone, and to nothing else.
+    let public = Router::new()
+        .route("/v1/health", get(health_public))
+        .route("/mcp/runs/{run_id}", post(crate::mcp::handle));
 
     let private = Router::new()
         .route("/v1/health/detail", get(health_detail))
@@ -243,6 +249,14 @@ async fn run_task(
         task_id: id,
         status: errand_core::models::RunStatus::Queued,
     });
+
+    // Hand the run to the contained executor and return immediately. Callers
+    // follow progress on the SSE stream rather than holding a request open.
+    tokio::spawn(crate::executor::run_to_completion(
+        state.clone(),
+        run.id.clone(),
+    ));
+
     Ok(Json(run))
 }
 

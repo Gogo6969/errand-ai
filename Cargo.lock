@@ -432,6 +432,7 @@ dependencies = [
  "futures",
  "getrandom 0.4.3",
  "hex",
+ "parking_lot",
  "serde",
  "serde_json",
  "sha2 0.11.0",

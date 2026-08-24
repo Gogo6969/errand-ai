@@ -14,7 +14,9 @@
 //!   errandd token            print the primary API token
 
 mod api;
+mod executor;
 mod lock;
+mod mcp;
 mod secrets;
 mod state;
 
@@ -124,14 +126,15 @@ async fn serve(foreground: bool) -> Result<()> {
         anyhow::bail!("database integrity check failed: {check}");
     }
 
-    let state = AppState::new(pool.clone());
-    let app =
-        api::routes::router(state.clone()).layer(tower_http::trace::TraceLayer::new_for_http());
-
     let port = std::env::var("ERRAND_API_PORT")
         .ok()
         .and_then(|p| p.parse().ok())
         .unwrap_or(errand_core::DEFAULT_API_PORT);
+
+    let state = AppState::new(pool.clone());
+    state.set_api_port(port);
+    let app =
+        api::routes::router(state.clone()).layer(tower_http::trace::TraceLayer::new_for_http());
 
     // Loopback only. LAN mode is an explicit opt-in that also makes TLS
     // mandatory, and it does not exist yet.

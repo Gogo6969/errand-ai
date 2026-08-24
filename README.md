@@ -16,9 +16,10 @@ sites, deciding as it goes, repairing itself when a page changes, and reporting 
 </div>
 
 > [!WARNING]
-> **Early development.** Milestone 1 of 10. The daemon, database, keychain integration, and
-> local API work today. There is no agent, no browser automation, no scheduler, and no user
-> interface yet. Nothing here is ready to run a real errand.
+> **Early development.** Milestone 2a of 10. The daemon, database, keychain, local API, and a
+> contained Claude agent that runs tasks and journals what it did all work today. There is no
+> browser automation, no scheduler, and no user interface yet, so it cannot yet run a real
+> errand against a website.
 
 ---
 
@@ -51,8 +52,10 @@ These are properties the code is built to hold, not aspirations:
   constraint, not a convention.
 - **A scheduled occurrence runs exactly once.** Enforced by a unique index, so a crash and
   restart cannot double-book anything.
-- **The agent is contained.** It reads hostile web pages unattended, so it gets exactly one tool
-  surface and no shell, filesystem, or arbitrary network access.
+- **The agent is contained, and it is checked rather than trusted.** It reads hostile web pages
+  unattended, so it gets one tool surface and an empty working directory. The tool list is
+  inspected before the model can act, and anything unexpected kills the run rather than
+  proceeding. Verified by deliberately removing the restrictions and watching it refuse.
 - **The API is the app's own transport.** The interface is a client of the same API a third party
   would use, which is the only reliable way to keep an integration API honest.
 
@@ -74,8 +77,8 @@ prompt nobody is awake to answer.
 | Milestone | Delivers | State |
 |---|---|---|
 | M1 | Workspace, schema, daemon under launchd, keychain, REST and SSE core | **done** |
-| M2a | Claude CLI executor with containment, tool server, live journal | next |
-| M2b | Browser sidecar, symbolic actions, credential fill, redaction | |
+| M2a | Claude CLI executor with containment, tool server, live journal | **done** |
+| M2b | Browser sidecar, symbolic actions, credential fill, redaction | next |
 | M3 | Scheduler, run windows, catch-up, the side-effect fence | |
 | M4 | Teach mode and playbooks | |
 | M5 | Self-heal and the failure surface | |
@@ -90,7 +93,7 @@ prompt nobody is awake to answer.
 Requires a stable Rust toolchain and macOS.
 
 ```bash
-cargo test --workspace       # 16 tests, including a real keychain round-trip
+cargo test --workspace       # 25 tests, including a real keychain round-trip
 cargo build
 ```
 

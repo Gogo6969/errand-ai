@@ -126,6 +126,9 @@ pub enum FailureCode {
     BudgetExceeded,
     NeedsHumanDecision,
     ProviderError,
+    /// The agent was offered tools it must not have. Terminal and auto-pausing:
+    /// retrying an unsafe spawn is worse than not running at all.
+    ContainmentBreach,
     CrashDuringSideEffect,
     MissedWindow,
     MissedWhileAsleep,
@@ -152,6 +155,7 @@ impl FailureCode {
             | Self::CaptchaOr2faNeeded
             | Self::BudgetExceeded
             | Self::NeedsHumanDecision
+            | Self::ContainmentBreach
             | Self::CrashDuringSideEffect => RetryClass::Terminal,
             Self::MissedWindow
             | Self::MissedWhileAsleep
@@ -163,7 +167,7 @@ impl FailureCode {
     /// Auth failures pause the task so it does not fail the same way every day
     /// until someone notices.
     pub fn should_auto_pause(&self) -> bool {
-        matches!(self, Self::AuthExpired)
+        matches!(self, Self::AuthExpired | Self::ContainmentBreach)
     }
 }
 

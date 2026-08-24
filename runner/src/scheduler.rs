@@ -203,8 +203,13 @@ async fn consider(
                 .unwrap_or_default(),
             _ => spec.catch_up_plan(&ready, now),
         };
-        if plan.is_empty() {
-            for missed in &ready {
+        // Record every occurrence the plan did not take, not only the case
+        // where it took nothing. Under the default policy a five-occurrence
+        // outage yields one run, and the other four would otherwise vanish
+        // without a trace, which is exactly the silent gap this is meant to
+        // prevent.
+        for missed in &ready {
+            if !plan.contains(missed) {
                 record_skip(state, task, spec, *missed, "missed_while_asleep").await?;
             }
         }
@@ -216,6 +221,14 @@ async fn consider(
     for occurrence in to_run {
         if spec.window_missed(occurrence, now)? {
             record_skip(state, task, spec, occurrence, "missed_window").await?;
+            continue;
+        }
+        // One run per task at a time. A task whose runs take longer than its
+        // interval would otherwise pile up agents on the same site, each with
+        // its own browser and its own idea of what has been done.
+        if let Some(busy) = errand_core::db::busy_run_for_task(state.pool(), &task.id).await? {
+            tracing::info!(task = %task.id, %busy, "still running; skipping this occurrence");
+            record_skip(state, task, spec, occurrence, "still_running").await?;
             continue;
         }
         fire(state, task, spec, occurrence).await?;
@@ -342,6 +355,13 @@ async fn record_skip(
             "confirmed whether it finished, so nobody knows if it went through. Rather than ",
             "risk doing it twice, this run was not started and the task has been paused. ",
             "Check the site, then resume the task."
+        )
+        .to_string(),
+        "still_running" => concat!(
+            "This run came due while the previous one was still going. Two runs of the same task ",
+            "at once would each act without knowing what the other had done, so this one was not ",
+            "started. If this keeps happening, the task is taking longer than the gap between its ",
+            "runs."
         )
         .to_string(),
         "missed_window" => format!(

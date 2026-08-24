@@ -1117,6 +1117,38 @@ pub async fn recover_interrupted_runs(pool: &Pool) -> Result<Vec<(String, String
     Ok(out)
 }
 
+/// Release every unresolved irreversible action on a task.
+///
+/// A run that armed a fence and died leaves the task blocked: the scheduler
+/// will not fire it and Run now refuses, which is correct, but without this
+/// there is no way out except editing the database. The user checks the site,
+/// then tells Errand what they found.
+pub async fn clear_holds(pool: &Pool, task_id: &str, note: &str) -> Result<u64> {
+    let res = sqlx::query(
+        "UPDATE side_effects SET state = 'aborted', evidence_json = ?
+         WHERE task_id = ? AND state = 'armed'",
+    )
+    .bind(note)
+    .bind(task_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
+/// Mark an unresolved action as having actually happened, on the user's word.
+pub async fn confirm_holds(pool: &Pool, task_id: &str, note: &str) -> Result<u64> {
+    let res = sqlx::query(
+        "UPDATE side_effects SET state = 'committed', committed_at = ?, evidence_json = ?
+         WHERE task_id = ? AND state = 'armed'",
+    )
+    .bind(crate::now_iso())
+    .bind(note)
+    .bind(task_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1662,5 +1694,79 @@ mod tests {
         );
         finish_run_ok(&pool, &r.id, "done").await.unwrap();
         assert!(busy_run_for_task(&pool, &t.id).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn a_stuck_task_can_be_released_by_the_user() {
+        let pool = open_memory().await.unwrap();
+        let t = create_task(
+            &pool,
+            NewTask {
+                name: "T".into(),
+                description: "d".into(),
+                emoji: None,
+                schedule: serde_json::json!({"kind":"manual"}),
+            },
+        )
+        .await
+        .unwrap();
+        let r = create_run(&pool, &t.id, "slot", "schedule", "normal", None)
+            .await
+            .unwrap();
+        arm_side_effect(&pool, &r.id, &t.id, "slot", "booking")
+            .await
+            .unwrap();
+        assert!(dangling_fences(&pool, &t.id, "slot").await.unwrap());
+
+        // "I checked, it did not happen."
+        assert_eq!(
+            clear_holds(&pool, &t.id, "user checked: not booked")
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(!dangling_fences(&pool, &t.id, "slot").await.unwrap());
+        assert!(matches!(
+            arm_side_effect(&pool, &r.id, &t.id, "slot", "booking")
+                .await
+                .unwrap(),
+            FenceVerdict::Armed(_)
+        ));
+    }
+
+    #[tokio::test]
+    async fn confirming_a_hold_stops_the_slot_being_used_again() {
+        let pool = open_memory().await.unwrap();
+        let t = create_task(
+            &pool,
+            NewTask {
+                name: "T".into(),
+                description: "d".into(),
+                emoji: None,
+                schedule: serde_json::json!({"kind":"manual"}),
+            },
+        )
+        .await
+        .unwrap();
+        let r = create_run(&pool, &t.id, "slot", "schedule", "normal", None)
+            .await
+            .unwrap();
+        arm_side_effect(&pool, &r.id, &t.id, "slot", "booking")
+            .await
+            .unwrap();
+
+        // "I checked, it did go through."
+        assert_eq!(
+            confirm_holds(&pool, &t.id, "user checked: booked")
+                .await
+                .unwrap(),
+            1
+        );
+        assert!(matches!(
+            arm_side_effect(&pool, &r.id, &t.id, "slot", "booking")
+                .await
+                .unwrap(),
+            FenceVerdict::AlreadyCommitted { .. }
+        ));
     }
 }

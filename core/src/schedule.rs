@@ -6,7 +6,7 @@
 //! daylight-saving change, and a scheduler that stores local times drifts by an
 //! hour twice a year without anyone noticing until they lose a booking.
 
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use chrono::{DateTime, Duration, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
 use serde::{Deserialize, Serialize};
@@ -144,10 +144,72 @@ impl ScheduleSpec {
     ///
     /// This is what the unique index on runs and the side-effect fence key on,
     /// so it must be derived from the scheduled moment rather than from
-    /// anything the agent decides later. Minute resolution: two runs of the
-    /// same task in the same minute are the same occurrence.
+    /// anything the agent decides later.
+    ///
+    /// Seconds resolution: a minute-resolution id would collapse every
+    /// occurrence of a schedule that fires more than once a minute into one,
+    /// so all but the first would be silently discarded as duplicates.
     pub fn occurrence_id(&self, instant: DateTime<Utc>) -> String {
-        instant.format("%Y-%m-%dT%H:%MZ").to_string()
+        instant.format("%Y-%m-%dT%H:%M:%SZ").to_string()
+    }
+
+    /// The instant this occurrence's real work may begin.
+    ///
+    /// `None` when the task has no window, meaning the work may begin as soon
+    /// as the run starts.
+    pub fn not_before_instant(&self, occurrence: DateTime<Utc>) -> Result<Option<DateTime<Utc>>> {
+        let Some(w) = &self.window else {
+            return Ok(None);
+        };
+        let tz = self.timezone()?;
+        let not_before = NaiveTime::parse_from_str(&w.not_before, "%H:%M:%S")
+            .or_else(|_| NaiveTime::parse_from_str(&w.not_before, "%H:%M"))
+            .with_context(|| format!("'{}' is not a time of day", w.not_before))?;
+        let day = occurrence.with_timezone(&tz).date_naive();
+        Ok(tz
+            .from_local_datetime(&day.and_time(not_before))
+            .earliest()
+            .map(|d| d.with_timezone(&Utc)))
+    }
+
+    /// Reject a schedule that cannot work, at the moment it is saved.
+    ///
+    /// Without this, "quarter past banana" round-trips happily through the API
+    /// and only surfaces at 08:00 on the day it was supposed to matter.
+    pub fn validate(&self) -> Result<()> {
+        self.timezone()?;
+        match &self.kind {
+            Kind::Manual => {}
+            Kind::Once { at } => {
+                parse_local(at, self.timezone()?)?;
+            }
+            Kind::Cron { expr } => {
+                <croner::Cron as std::str::FromStr>::from_str(expr)
+                    .map_err(|e| anyhow!("'{expr}' is not a valid schedule: {e}"))?;
+            }
+        }
+        if self.jitter_s < 0 {
+            bail!("jitter cannot be negative");
+        }
+        if self.catch_up_grace_min < 0 {
+            bail!("the catch-up grace period cannot be negative");
+        }
+        if let Some(w) = &self.window {
+            for (field, value) in [("not_before", &w.not_before), ("not_after", &w.not_after)] {
+                NaiveTime::parse_from_str(value, "%H:%M:%S")
+                    .or_else(|_| NaiveTime::parse_from_str(value, "%H:%M"))
+                    .map_err(|_| {
+                        anyhow!("the window's {field} is '{value}', which is not a time of day. Use something like 08:00:00.")
+                    })?;
+            }
+            if w.arm_early_s < 0 {
+                bail!("a window cannot start a negative amount of time early");
+            }
+            if w.arm_early_s > 3600 {
+                bail!("starting more than an hour early is almost certainly a mistake");
+            }
+        }
+        Ok(())
     }
 
     /// When the runner should actually start, given a window that wants the
@@ -436,11 +498,13 @@ mod tests {
     }
 
     #[test]
-    fn occurrence_ids_are_stable_and_minute_resolution() {
+    fn occurrence_ids_identify_the_exact_scheduled_instant() {
         let s = cron("0 0 8 * * *", "UTC");
         let a = s.occurrence_id(utc("2026-08-26T08:00:00Z"));
-        let b = s.occurrence_id(utc("2026-08-26T08:00:59Z"));
-        assert_eq!(a, b, "the same minute is the same occurrence");
+        assert_eq!(a, "2026-08-26T08:00:00Z");
+        // Stable for the same instant, distinct for any other.
+        assert_eq!(a, s.occurrence_id(utc("2026-08-26T08:00:00Z")));
+        assert_ne!(a, s.occurrence_id(utc("2026-08-26T08:00:59Z")));
         assert_ne!(a, s.occurrence_id(utc("2026-08-26T08:01:00Z")));
     }
 
@@ -657,6 +721,73 @@ mod tests {
             ScheduleSpec::default()
                 .last_occurrence_at_or_before(Utc::now())
                 .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_sub_minute_schedule_does_not_collapse_into_one_occurrence() {
+        // A minute-resolution id would make all six of these the same slot, and
+        // five of the six would vanish as duplicates.
+        let s = cron("*/10 * * * * *", "UTC");
+        let a = s.occurrence_id(utc("2026-08-26T08:00:00Z"));
+        let b = s.occurrence_id(utc("2026-08-26T08:00:10Z"));
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn a_nonsense_schedule_is_refused_when_it_is_saved() {
+        let bad = ScheduleSpec {
+            kind: Kind::Cron {
+                expr: "quarter past banana".into(),
+            },
+            ..Default::default()
+        };
+        assert!(bad.validate().is_err());
+
+        let bad_tz = ScheduleSpec {
+            tz: "Mars/Olympus".into(),
+            ..cron("0 0 8 * * *", "UTC")
+        };
+        assert!(bad_tz.validate().is_err());
+
+        let bad_window = ScheduleSpec {
+            window: Some(Window {
+                not_before: "banana".into(),
+                not_after: "08:10".into(),
+                arm_early_s: 60,
+            }),
+            ..cron("0 0 8 * * *", "UTC")
+        };
+        let e = bad_window.validate().unwrap_err().to_string();
+        assert!(e.contains("not a time of day"), "unhelpful: {e}");
+
+        assert!(cron("0 0 8 * * *", "UTC").validate().is_ok());
+    }
+
+    #[test]
+    fn the_barrier_instant_is_the_window_opening() {
+        let s = ScheduleSpec {
+            kind: Kind::Cron {
+                expr: "0 0 8 * * WED".into(),
+            },
+            tz: "UTC".into(),
+            window: Some(Window {
+                not_before: "08:00:00".into(),
+                not_after: "08:10:00".into(),
+                arm_early_s: 90,
+            }),
+            ..Default::default()
+        };
+        let occ = utc("2026-08-26T08:00:00Z");
+        assert_eq!(
+            s.not_before_instant(occ).unwrap(),
+            Some(utc("2026-08-26T08:00:00Z"))
+        );
+        // The run starts before the barrier, which is the whole point.
+        assert!(s.start_at(occ) < s.not_before_instant(occ).unwrap().unwrap());
+        assert_eq!(
+            ScheduleSpec::default().not_before_instant(occ).unwrap(),
             None
         );
     }

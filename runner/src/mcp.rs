@@ -491,6 +491,32 @@ async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &Value) -> V
                 None
             };
 
+            // A dry run must actually be dry. Enforced here at the tool layer
+            // rather than by asking the model nicely, because "I told it not
+            // to" is not a guarantee, and a user who trusts a dry run and gets
+            // a real booking has been actively misled.
+            if let Some(action_kind) = action_kind {
+                if is_dry_run(state, run_id).await {
+                    let label = described
+                        .as_ref()
+                        .map(|(_, l)| l.clone())
+                        .unwrap_or_default();
+                    let _ = journal(
+                        state,
+                        run_id,
+                        "decide",
+                        &format!("WOULD HAVE done the {action_kind}: {label:?}"),
+                        true,
+                    )
+                    .await;
+                    return text_result(format!(
+                        "This is a dry run, so nothing was actually done. Noted that you would \
+                         have clicked {label:?} to carry out the {action_kind}. Carry on as if it \
+                         had worked, and say in your summary what you would have done."
+                    ));
+                }
+            }
+
             let mut fence_id: Option<String> = None;
             if let Some(action_kind) = action_kind {
                 match guard_irreversible(state, run_id, action_kind).await {
@@ -602,9 +628,21 @@ async fn read_brief(state: &AppState, run_id: &str) -> anyhow::Result<String> {
         .await?
         .ok_or_else(|| anyhow::anyhow!("task not found"))?;
 
+    let mode_note = match run.mode.as_str() {
+        "dry_run" => {
+            "\n\nThis is a REHEARSAL. Anything that cannot be undone will be recorded \
+                      as what you would have done, and will not actually happen. Work through the \
+                      task normally and report what you would have done."
+        }
+        "teach" => {
+            "\n\nThis is a first, supervised run. Work carefully and journal your \
+                    reasoning, because what you record is what future runs will learn from."
+        }
+        _ => "",
+    };
     Ok(format!(
-        "Task: {}\n\nWhat the person asked for:\n{}\n\nThis run: {} (trigger: {})",
-        task.name, task.description, run.mode, run.trigger
+        "Task: {}\n\nWhat the person asked for:\n{}\n\nTriggered by: {}{}",
+        task.name, task.description, run.trigger, mode_note
     ))
 }
 
@@ -934,6 +972,16 @@ async fn guard_irreversible(
              clear this."
         )),
     })
+}
+
+/// Is this run a rehearsal?
+async fn is_dry_run(state: &AppState, run_id: &str) -> bool {
+    errand_core::db::get_run(state.pool(), run_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|r| r.mode == "dry_run")
+        .unwrap_or(false)
 }
 
 #[cfg(test)]

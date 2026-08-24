@@ -30,6 +30,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/tasks", get(list_tasks).post(create_task))
         .route("/v1/tasks/{id}", get(get_task))
         .route("/v1/tasks/{id}/activate", post(activate_task))
+        .route("/v1/tasks/{id}/holds", post(resolve_holds))
         .route("/v1/tasks/{id}/pause", post(pause_task))
         .route("/v1/tasks/{id}/resume", post(resume_task))
         .route("/v1/tasks/{id}/run", post(run_task))
@@ -119,13 +120,18 @@ async fn create_task(
              so write it the way you would explain the job to a person.",
         ));
     }
+    let schedule = body.schedule.unwrap_or_else(|| json!({ "kind": "manual" }));
+    errand_core::schedule::ScheduleSpec::from_json(&schedule)
+        .and_then(|s| s.validate())
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+
     let task = errand_core::db::create_task(
         state.pool(),
         errand_core::db::NewTask {
             name: body.name,
             description: body.description,
             emoji: body.emoji,
-            schedule: body.schedule.unwrap_or_else(|| json!({ "kind": "manual" })),
+            schedule,
         },
     )
     .await
@@ -152,6 +158,7 @@ async fn activate_task(
     // A schedule that cannot be read would leave the task armed but unable to
     // compute when it runs, which is worse than refusing here.
     let spec = errand_core::schedule::ScheduleSpec::from_json(&task.schedule)
+        .and_then(|s| s.validate().map(|_| s))
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     let next = spec
         .next_after(chrono::Utc::now())
@@ -180,6 +187,62 @@ async fn activate_task(
             "This task has no schedule, so it will only run when you ask it to."
         }
     })))
+}
+
+#[derive(Deserialize)]
+struct HoldsBody {
+    /// What the person found when they checked the site.
+    outcome: String,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+/// Resolve an unresolved irreversible action so the task can run again.
+///
+/// A run that began a booking and died leaves the task blocked, which is
+/// correct: nobody knows whether it went through. But without a way to say what
+/// you found, the only way out is editing the database, so the safe state
+/// becomes a permanently stuck one.
+async fn resolve_holds(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(body): Json<HoldsBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Saying "this already happened" or "this did not happen" decides whether
+    // a real booking gets made, so it needs the approval scope rather than the
+    // one that merely starts runs.
+    require(&caller, Scope::Approve)?;
+    let note = body
+        .note
+        .unwrap_or_else(|| format!("resolved by {}", caller.token_name));
+
+    let (n, msg) = match body.outcome.as_str() {
+        "did_not_happen" => (
+            errand_core::db::clear_holds(state.pool(), &id, &note)
+                .await
+                .map_err(ApiError::from)?,
+            "Recorded that it did not happen. This task can run again.",
+        ),
+        "already_happened" => (
+            errand_core::db::confirm_holds(state.pool(), &id, &note)
+                .await
+                .map_err(ApiError::from)?,
+            "Recorded that it already happened. This slot will not be attempted again.",
+        ),
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "'{other}' is not something I understand. Say either 'did_not_happen' or \
+                 'already_happened', depending on what you found when you checked the site."
+            )))
+        }
+    };
+
+    if n > 0 {
+        let _ = errand_core::db::set_task_paused(state.pool(), &id, false, None).await;
+    }
+    state.emit(Event::TaskUpdated { task_id: id });
+    Ok(Json(json!({ "resolved": n, "note": msg })))
 }
 
 #[derive(Deserialize, Default)]

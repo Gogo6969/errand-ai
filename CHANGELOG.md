@@ -52,6 +52,32 @@ mattered most:
 - **A window straddling local midnight was always missed**, abandoning every occurrence with an
   explanation that was untrue.
 
+## Unreleased, after M3
+
+### Fixed
+
+Cleared from the same review's major findings, before starting the next milestone.
+
+- **`dry_run` was accepted and then ignored.** A run asked to rehearse would really book, really
+  send, really delete. It is now enforced at the tool layer rather than by asking the model
+  nicely: an irreversible action in a rehearsal is recorded as what would have happened and does
+  not happen. Verified against a real booking site, where a dry run left the booking count at zero.
+- **A task whose run died mid-action could not be recovered.** Blocking it was right, since nobody
+  knew whether the action went through, but there was no way to say what you found short of
+  editing the database, so the safe state was a permanently stuck one. `POST /v1/tasks/{id}/holds`
+  takes `already_happened` or `did_not_happen` and resolves it. It needs the approve scope, because
+  that answer decides whether a real booking gets made.
+- **Occurrences missed during an outage were recorded only when the catch-up plan took none of
+  them.** Under the default policy a five-occurrence outage ran one and silently lost four.
+- **Nothing stopped two runs of the same task overlapping.** A task slower than its own interval
+  accumulated agents, each acting without knowing what the others had done.
+- **Nothing validated a schedule when it was saved,** so an unparseable cron expression or a
+  window time of "quarter past banana" was accepted and only failed at the moment it mattered.
+- **Occurrence ids were minute-resolution,** so every occurrence of a schedule firing more than
+  once a minute collapsed into one and all but the first were discarded as duplicates.
+- The README claimed a unique index prevented double-booking. It prevents a duplicate run; the
+  fence is what prevents a duplicate action, and the two are now described separately.
+
 ## M2b
 
 ### Added

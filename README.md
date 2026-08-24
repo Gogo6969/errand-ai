@@ -49,8 +49,10 @@ These are properties the code is built to hold, not aspirations:
 - **A failure always explains itself.** The database rejects a run recorded as failed that does
   not carry both a machine-readable cause and a plain-language explanation. That is a schema
   constraint, not a convention.
-- **A scheduled occurrence runs exactly once.** Enforced by a unique index, so a crash and
-  restart cannot double-book anything.
+- **A scheduled occurrence produces one run, and one irreversible action.** The run is enforced by
+  a unique index; the action by a fence keyed on the occurrence rather than on what the agent chose
+  to do, so a retry that picks differently cannot slip past it. A run that dies between starting an
+  action and confirming it blocks the task and asks you what you found, rather than guessing.
 - **The agent is contained, and it is checked rather than trusted.** It reads hostile web pages
   unattended, so it gets one tool surface and an empty working directory. The tool list is
   inspected before the model can act, and anything unexpected kills the run rather than

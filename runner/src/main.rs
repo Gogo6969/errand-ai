@@ -16,6 +16,7 @@
 mod api;
 mod browser;
 mod executor;
+mod fixer;
 mod lock;
 mod mcp;
 mod redact;

@@ -103,6 +103,8 @@ fn deny_list() -> String {
 pub struct ExecOptions {
     pub model: String,
     pub max_turns: u32,
+    /// Advice from a previous failed attempt, if this is a repair attempt.
+    pub advice: Option<String>,
 }
 
 impl Default for ExecOptions {
@@ -110,6 +112,7 @@ impl Default for ExecOptions {
         Self {
             model: "sonnet".into(),
             max_turns: 60,
+            advice: None,
         }
     }
 }
@@ -123,6 +126,8 @@ pub enum ExecError {
     Spawn(String),
     NoOutcome,
 }
+
+impl std::error::Error for ExecError {}
 
 impl std::fmt::Display for ExecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -219,6 +224,53 @@ fn run_dir(run_id: &str) -> std::result::Result<PathBuf, ExecError> {
     errand_core::paths::run_dir(run_id).map_err(|e| ExecError::Spawn(e.to_string()))
 }
 
+/// One small, tool-less model call.
+///
+/// Used by the Fixer and the narrator. Deliberately shares the containment
+/// story with the executor: no tools at all, no user settings, no MCP.
+pub async fn ask_model(
+    prompt: &str,
+    model: &str,
+    max_turns: u32,
+) -> std::result::Result<String, ExecError> {
+    let Some(claude) = find_claude() else {
+        return Err(ExecError::NoClaudeBinary);
+    };
+    let scratch = std::env::temp_dir().join(format!("errand-ask-{}", errand_core::new_id()));
+    std::fs::create_dir_all(&scratch).map_err(|e| ExecError::Spawn(e.to_string()))?;
+
+    let out = Command::new(&claude)
+        .current_dir(&scratch)
+        .arg("-p")
+        .arg(prompt)
+        .arg("--model")
+        .arg(model)
+        .arg("--max-turns")
+        .arg(max_turns.to_string())
+        .arg("--setting-sources")
+        .arg("")
+        .arg("--strict-mcp-config")
+        .arg("--disallowedTools")
+        .arg(DENY.join(","))
+        .arg("--output-format")
+        .arg("json")
+        .env_remove("ANTHROPIC_API_KEY")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .stdin(Stdio::null())
+        .output()
+        .await
+        .map_err(|e| ExecError::Spawn(e.to_string()))?;
+
+    let _ = std::fs::remove_dir_all(&scratch);
+    let body = String::from_utf8_lossy(&out.stdout);
+    let v: Value = serde_json::from_str(&body)
+        .map_err(|_| ExecError::Spawn("the model returned something unreadable".into()))?;
+    Ok(v.get("result")
+        .and_then(|r| r.as_str())
+        .unwrap_or_default()
+        .to_string())
+}
+
 /// Run one task with the contained Claude executor.
 pub async fn execute(
     state: &AppState,
@@ -291,7 +343,10 @@ pub async fn execute(
         .arg("--disallowedTools")
         .arg(deny_list())
         .arg("--append-system-prompt")
-        .arg(system_prompt(has_playbook))
+        .arg(match &opts.advice {
+            Some(a) => format!("{}\n\n{a}", system_prompt(has_playbook)),
+            None => system_prompt(has_playbook),
+        })
         .env_remove("ANTHROPIC_API_KEY")
         .env_remove("ANTHROPIC_AUTH_TOKEN")
         .stdin(Stdio::null())
@@ -437,18 +492,16 @@ fn truncate(s: &str, n: usize) -> String {
     }
 }
 
-/// Drive a run to completion and record the result.
+/// Drive a run to completion, repairing itself where that is sensible.
+///
+/// The ladder, in order: run it; if it failed for a reason that suggests the
+/// approach was wrong rather than the job impossible, ask the Fixer what to try
+/// and run again with that advice; give up when the failure is a wall, when the
+/// budget is spent, or when repair has already had its chances.
+///
+/// Repeating a whole run is only safe because of the side-effect fence. Anything
+/// irreversible the failed attempt committed is refused the second time round.
 pub async fn run_to_completion(state: AppState, run_id: String) {
-    let _ = errand_core::db::set_run_status(state.pool(), &run_id, "running").await;
-    if let Ok(Some(r)) = errand_core::db::get_run(state.pool(), &run_id).await {
-        state.emit(Event::RunStatus {
-            run_id: run_id.clone(),
-            task_id: r.task_id,
-            status: RunStatus::Running,
-        });
-    }
-
-    let result = execute(&state, &run_id, ExecOptions::default()).await;
     let task_id = errand_core::db::get_run(state.pool(), &run_id)
         .await
         .ok()
@@ -456,79 +509,232 @@ pub async fn run_to_completion(state: AppState, run_id: String) {
         .map(|r| r.task_id)
         .unwrap_or_default();
 
-    match result {
-        Ok(Outcome::Finished { summary }) => {
-            let _ = errand_core::db::finish_run_ok(state.pool(), &run_id, &summary).await;
-            state.emit(Event::RunFinished {
-                run_id: run_id.clone(),
-                task_id,
-                status: RunStatus::Succeeded,
-                summary: Some(summary),
-            });
-        }
-        Ok(ref o @ Outcome::Failed { ref code, .. }) => {
-            let human = o.failure_human().unwrap_or_default();
-            let _ =
-                errand_core::db::finish_run_failed(state.pool(), &run_id, code, &human, None).await;
-            state.emit(Event::RunFailed {
-                run_id: run_id.clone(),
-                task_id,
-                failure_code: errand_core::models::FailureCode::NeedsHumanDecision,
-                failure_human: human,
-            });
-        }
-        Err(e) => {
-            // Even an infrastructure failure owes the user the same three
-            // answers, so the UI never has to render a bare error string.
-            let (code, next) = match &e {
-                ExecError::Containment(_) => (
-                    errand_core::models::FailureCode::ContainmentBreach,
-                    "Nothing for you to fix here, and nothing was done. This is a bug or a \
-                     changed Claude install, so the task has been paused rather than retried. \
-                     Please report it.",
-                ),
-                ExecError::NoClaudeBinary => (
-                    errand_core::models::FailureCode::ProviderError,
-                    "Install the Claude command line tool, run 'claude /login' once, then \
-                     press Run now.",
-                ),
-                _ => (
-                    errand_core::models::FailureCode::ProviderError,
-                    "Fix the problem above, then press Run now.",
-                ),
-            };
+    let limits = errand_core::db::get_task(state.pool(), &task_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|t| errand_core::limits::Limits::from_json(&t.limits))
+        .unwrap_or_default();
+
+    let mut advice: Option<String> = None;
+    let mut heal_cycles: i64 = 0;
+
+    loop {
+        let _ = errand_core::db::set_run_status(state.pool(), &run_id, "running").await;
+        state.emit(Event::RunStatus {
+            run_id: run_id.clone(),
+            task_id: task_id.clone(),
+            status: RunStatus::Running,
+        });
+
+        let outcome = execute(
+            &state,
+            &run_id,
+            ExecOptions {
+                advice: advice.take(),
+                ..Default::default()
+            },
+        )
+        .await;
+
+        // A run that spent more than it was allowed stops here, whatever it was
+        // in the middle of, and says which ceiling it hit.
+        if let Some(breach) = over_budget(&state, &run_id, &limits).await {
             let human = format!(
-                "**What I was doing:** Starting this task.\n\
-                 **Why I could not finish:** {e}\n\
-                 **What you can do:** {next}"
+                "**What I was doing:** Working on this task.\n\
+                 **Why I could not finish:** It reached a limit set for this task, so it was \
+                 stopped before finishing.\n\
+                 **What you can do:** {}",
+                breach.explain(&limits)
             );
-            let code_str = serde_json::to_value(code)
-                .ok()
-                .and_then(|v| v.as_str().map(String::from))
-                .unwrap_or_else(|| "provider_error".into());
-            let _ = errand_core::db::finish_run_failed(
-                state.pool(),
-                &run_id,
-                &code_str,
-                &human,
-                Some(&e.to_string()),
-            )
-            .await;
-            if code.should_auto_pause() {
-                let _ = errand_core::db::auto_pause_task(state.pool(), &task_id, &code_str).await;
+            finish_failed(&state, &run_id, &task_id, "budget_exceeded", &human, None).await;
+            break;
+        }
+
+        match outcome {
+            Ok(crate::mcp::Outcome::Finished { summary }) => {
+                let _ = errand_core::db::finish_run_ok(state.pool(), &run_id, &summary).await;
+                state.emit(Event::RunFinished {
+                    run_id: run_id.clone(),
+                    task_id: task_id.clone(),
+                    status: RunStatus::Succeeded,
+                    summary: Some(summary),
+                });
+                break;
             }
-            state.emit(Event::RunFailed {
-                run_id: run_id.clone(),
-                task_id,
-                failure_code: code,
-                failure_human: human,
-            });
+
+            Ok(ref o @ crate::mcp::Outcome::Failed { ref code, .. }) => {
+                let human = o.failure_human().unwrap_or_default();
+                let parsed = parse_failure_code(code);
+
+                // Auth failures pause the task rather than failing the same way
+                // every morning until somebody notices.
+                if parsed.should_auto_pause() {
+                    let _ = errand_core::db::auto_pause_task(state.pool(), &task_id, code).await;
+                }
+
+                match crate::fixer::retry_plan(parsed, heal_cycles, limits.max_heal_cycles) {
+                    crate::fixer::Retry::Again => {
+                        heal_cycles += 1;
+                        let _ = journal_note(
+                            &state,
+                            &run_id,
+                            "Something went wrong that often passes on its own. Trying again.",
+                        )
+                        .await;
+                        tokio::time::sleep(std::time::Duration::from_secs(20)).await;
+                        continue;
+                    }
+                    crate::fixer::Retry::AfterDiagnosis => {
+                        heal_cycles += 1;
+                        let _ =
+                            errand_core::db::set_run_status(state.pool(), &run_id, "healing").await;
+                        match crate::fixer::diagnose(&state, &run_id).await {
+                            Ok(d) if !d.is_hopeless() => {
+                                let _ = journal_note(
+                                    &state,
+                                    &run_id,
+                                    &format!(
+                                        "That did not work. Best guess at why: {}. Trying: {}",
+                                        d.cause, d.advice
+                                    ),
+                                )
+                                .await;
+                                advice = Some(d.as_prompt());
+                                continue;
+                            }
+                            Ok(d) => {
+                                let _ = journal_note(
+                                    &state,
+                                    &run_id,
+                                    &format!("Nothing worth trying differently: {}", d.cause),
+                                )
+                                .await;
+                            }
+                            Err(e) => {
+                                tracing::warn!(run_id, "could not diagnose the failure: {e}");
+                            }
+                        }
+                    }
+                    crate::fixer::Retry::No(_) => {}
+                }
+
+                finish_failed(&state, &run_id, &task_id, code, &human, None).await;
+                break;
+            }
+
+            Err(e) => {
+                let (code, next) = match &e {
+                    ExecError::Containment(_) => (
+                        "containment_breach",
+                        "Nothing for you to fix here, and nothing was done. This is a bug or a \
+                         changed Claude install, so the task has been paused rather than retried. \
+                         Please report it.",
+                    ),
+                    ExecError::NoClaudeBinary => (
+                        "provider_error",
+                        "Install the Claude command line tool, run 'claude /login' once, then \
+                         press Run now.",
+                    ),
+                    _ => (
+                        "provider_error",
+                        "Fix the problem above, then press Run now.",
+                    ),
+                };
+                let human = format!(
+                    "**What I was doing:** Starting this task.\n\
+                     **Why I could not finish:** {e}\n\
+                     **What you can do:** {next}"
+                );
+                if code == "containment_breach" {
+                    let _ = errand_core::db::auto_pause_task(state.pool(), &task_id, code).await;
+                }
+                finish_failed(
+                    &state,
+                    &run_id,
+                    &task_id,
+                    code,
+                    &human,
+                    Some(&e.to_string()),
+                )
+                .await;
+                break;
+            }
         }
     }
+
     // A run must not leave a browser or a profile lock behind: the next run
     // needing that site would queue forever behind a process nobody owns.
     state.close_browser(&run_id).await;
     state.clear_run_token(&run_id);
+}
+
+async fn finish_failed(
+    state: &AppState,
+    run_id: &str,
+    task_id: &str,
+    code: &str,
+    human: &str,
+    technical: Option<&str>,
+) {
+    let _ = errand_core::db::finish_run_failed(state.pool(), run_id, code, human, technical).await;
+    state.emit(Event::RunFailed {
+        run_id: run_id.to_string(),
+        task_id: task_id.to_string(),
+        failure_code: parse_failure_code(code),
+        failure_human: human.to_string(),
+    });
+}
+
+async fn journal_note(state: &AppState, run_id: &str, text: &str) -> anyhow::Result<i64> {
+    errand_core::db::append_step(state.pool(), run_id, "heal", text, true, None).await
+}
+
+/// What this run has spent so far, against what it was allowed.
+pub async fn budget_breach(state: &AppState, run_id: &str) -> Option<errand_core::limits::Breach> {
+    let limits = errand_core::db::get_run(state.pool(), run_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|r| r.task_id)?;
+    let limits = errand_core::db::get_task(state.pool(), &limits)
+        .await
+        .ok()
+        .flatten()
+        .map(|t| errand_core::limits::Limits::from_json(&t.limits))
+        .unwrap_or_default();
+    over_budget(state, run_id, &limits).await
+}
+
+async fn over_budget(
+    state: &AppState,
+    run_id: &str,
+    limits: &errand_core::limits::Limits,
+) -> Option<errand_core::limits::Breach> {
+    let run = errand_core::db::get_run(state.pool(), run_id)
+        .await
+        .ok()
+        .flatten()?;
+    let steps = errand_core::db::list_steps(state.pool(), run_id)
+        .await
+        .map(|s| s.len() as i64)
+        .unwrap_or(0);
+    let messages = errand_core::db::list_steps(state.pool(), run_id)
+        .await
+        .map(|s| s.iter().filter(|x| x.kind == "message").count() as i64)
+        .unwrap_or(0);
+    let elapsed = run
+        .started_at
+        .as_deref()
+        .and_then(|t| chrono::DateTime::parse_from_rfc3339(t).ok())
+        .map(|t| (chrono::Utc::now() - t.with_timezone(&chrono::Utc)).num_seconds())
+        .unwrap_or(0);
+    limits.check(steps, elapsed, run.cost_usd, messages)
+}
+
+fn parse_failure_code(code: &str) -> errand_core::models::FailureCode {
+    serde_json::from_value(serde_json::Value::String(code.to_string()))
+        .unwrap_or(errand_core::models::FailureCode::NeedsHumanDecision)
 }
 
 #[cfg(test)]

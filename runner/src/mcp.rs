@@ -359,6 +359,23 @@ pub async fn handle(
 }
 
 async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &Value) -> Value {
+    // Checked before every tool call, not after the run.
+    //
+    // A ceiling only enforced once the agent has stopped is a post-mortem, not
+    // a budget: a run that goes round in circles would spend the whole limit
+    // and more before anyone noticed. The two tools that end a run stay open,
+    // so an over-budget agent can still report what happened.
+    if !matches!(name, "finish" | "fail" | "journal") {
+        if let Some(breach) = crate::executor::budget_breach(state, run_id).await {
+            let limits = task_limits(state, run_id).await;
+            return text_error(format!(
+                "Stop now: this run has reached a limit set for it. {} Call fail with code \
+                 budget_exceeded, saying how far you got.",
+                breach.explain(&limits)
+            ));
+        }
+    }
+
     match name {
         "read_brief" => match read_brief(state, run_id).await {
             Ok(v) => text_result(v),
@@ -1208,6 +1225,18 @@ async fn save_playbook(state: &AppState, run_id: &str, args: &Value) -> anyhow::
          approve it; nothing will follow it until they do.",
         pb.steps.len()
     ))
+}
+
+async fn task_limits(state: &AppState, run_id: &str) -> errand_core::limits::Limits {
+    let Ok(Some(run)) = errand_core::db::get_run(state.pool(), run_id).await else {
+        return Default::default();
+    };
+    errand_core::db::get_task(state.pool(), &run.task_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|t| errand_core::limits::Limits::from_json(&t.limits))
+        .unwrap_or_default()
 }
 
 #[cfg(test)]

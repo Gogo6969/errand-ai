@@ -7,6 +7,7 @@
 pub mod db;
 pub mod keychain;
 pub mod launchd;
+pub mod limits;
 pub mod models;
 pub mod paths;
 pub mod playbook;

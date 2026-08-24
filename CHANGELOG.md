@@ -87,6 +87,37 @@ mattered most:
 - **Runs were ordered by a second-resolution timestamp alone**, so two runs in the same second
   came back in an arbitrary order. The notes fed to an agent could be the wrong way round.
 
+## M5
+
+### Added
+
+- **The retry ladder.** A failure is judged by its taxonomy rather than by how it felt. Something
+  transient is simply tried again; a page that changed gets a diagnosis first and then one attempt
+  with new advice; a wall is never retried at all, because trying again would hit the same wall.
+- **The Fixer.** A small, tool-less model call that reads the tail of the journal and answers two
+  questions: what went wrong, and what to try instead. Its advice is handed to the next attempt as
+  a lead rather than as fact, with instructions to believe the page over the advice and to stop
+  rather than try a third variation.
+- **Repair is a fresh run, not a resumption.** That avoids reasoning about half-finished state, and
+  it is only safe because of the side-effect fence: a repeat cannot redo anything irreversible the
+  failed attempt already committed. Verified against a site that fails its first request, where
+  the ladder retried the whole run and the booking still happened exactly once.
+- **The Fixer never edits the playbook.** It advises one attempt. A failure diagnosed from a
+  hostile page is not a trustworthy source of permanent instruction, so anything worth keeping goes
+  through the same human approval as everything else.
+- **Budgets.** Steps, wall clock, spend, heal cycles, and messages to real people. A breach ends
+  the run naming the ceiling it hit and what to do about it, because "budget exceeded" on its own
+  tells nobody anything they can act on.
+- **Auth failures pause the task** rather than failing the same way every morning until somebody
+  notices.
+
+### Fixed
+
+- **Budgets were a post-mortem rather than a budget.** The ceiling was only checked once the run
+  had already stopped, so a task with a four-step limit ran fourteen steps before anyone noticed.
+  It is now checked before every tool call, and the run winds down at seven. The tools that end a
+  run stay open, so an over-budget agent can still report how far it got.
+
 ## Unreleased, after M3
 
 ### Fixed

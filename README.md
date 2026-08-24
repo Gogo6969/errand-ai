@@ -16,10 +16,10 @@ sites, deciding as it goes, repairing itself when a page changes, and reporting 
 </div>
 
 > [!WARNING]
-> **Early development.** Milestone 4 of 10. A contained agent learns a task from one supervised
-> run, writes down what worked for you to approve, and then repeats it on a schedule, logging into
-> the site with a stored credential. There is no user interface yet, so everything goes through
-> the API.
+> **Early development.** Milestone 5 of 10. A contained agent learns a task from one supervised
+> run, repeats it on a schedule, logs in with a stored credential, adapts when the site changes,
+> and repairs itself within a budget. It cannot yet tell you the outcome anywhere except the API,
+> and there is no user interface.
 
 ---
 
@@ -83,8 +83,8 @@ prompt nobody is awake to answer.
 | M2b | Browser sidecar, symbolic actions, credential fill, redaction | **done** |
 | M3 | Scheduler, run windows, catch-up, the side-effect fence | **done** |
 | M4 | Teach mode and playbooks | **done** |
-| M5 | Self-heal and the failure surface | next |
-| M6 | Telegram, WhatsApp, Apple Mail, Apple Messages | |
+| M5 | Self-heal and the failure surface | **done** |
+| M6 | Telegram, WhatsApp, Apple Mail, Apple Messages | next |
 | M7 | API hardening, scoped tokens, webhooks, TypeScript client | |
 | M8 | The interface, with every control explained | |
 | M9 | Open-source preparation and signing from CI | |
@@ -95,7 +95,7 @@ prompt nobody is awake to answer.
 Requires a stable Rust toolchain and macOS.
 
 ```bash
-cargo test --workspace       # 89 tests, including a real keychain round-trip
+cargo test --workspace       # 102 tests, including a real keychain round-trip
 cargo build
 ```
 

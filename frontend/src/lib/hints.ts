@@ -3,8 +3,8 @@
  *
  * The rule is that nothing goes unexplained, and a rule like that only survives
  * a growing codebase if a machine checks it. So every control is wrapped in a
- * Hint, every Hint names an entry here, and `pnpm hints:audit` fails the build
- * on a control without one or an entry nobody uses.
+ * Hint, every Hint names an entry here, and `npm run hints:audit` fails the
+ * build on a control without one or an entry nobody uses.
  *
  * Write these for someone who has not read the documentation and is slightly
  * worried about what this thing is going to do to their accounts. Say what the
@@ -27,11 +27,32 @@ export const hints = {
       "once while you watch, writes down what worked, and shows you that before it ever does the " +
       "job on its own.",
   },
+  "task.create": {
+    short: "Save this as a draft. Nothing runs yet.",
+    long:
+      "Creating only saves what you wrote. The task cannot run, even once, until you press " +
+      "'Teach it once' on its page, and it cannot run on a schedule until you have approved " +
+      "what it learned.",
+  },
   "task.status": {
     short: "Draft means unfinished. Ready means it can run. Paused means it will not.",
     long:
       "A task starts as a draft. Teaching it once produces a written plan; approving that plan " +
-      "makes it ready. Paused keeps everything, including its schedule, but nothing fires.",
+      "makes it ready. Paused keeps everything, including its schedule, but nothing fires. When a " +
+      "run is going or has just ended, this says what the run is really doing rather than the " +
+      "word stored on the task, because the two can disagree.",
+  },
+  "task.watch_run": {
+    short: "Open the run that is going on now and watch it step by step.",
+    long:
+      "The steps appear as they happen. If the count on this card has stopped moving, the run " +
+      "itself says what it was in the middle of.",
+  },
+  "task.last_run": {
+    short: "Open the newest run and see everything it did.",
+    long:
+      "Every step it took, in order, with the screenshots it kept. If it could not finish, the " +
+      "run says what it was doing when it stopped and what you can do about it.",
   },
   "task.next_run": {
     short: "When this will next run on its own.",
@@ -64,6 +85,13 @@ export const hints = {
       "Pausing keeps the task, its plan, its history and its logins. When you resume, it does not " +
       "go back and do the runs it missed; it simply picks up at the next one.",
   },
+  "task.resume": {
+    short: "Start following its schedule again.",
+    long:
+      "It does not go back and do the runs that were skipped while paused; it simply picks up " +
+      "at the next one. If Errand paused the task itself, check why before resuming: it may be " +
+      "waiting for you to say what you found on a site.",
+  },
   "task.activate": {
     short: "Let this run on its own schedule from now on.",
     long: "Only possible once a plan has been approved, so an unattended run always has an agreed way of doing the job.",
@@ -80,6 +108,15 @@ export const hints = {
     long:
       "A run that goes round in circles is stopped rather than left going. If a run hits a " +
       "ceiling it says which one, so you can tell a genuinely slow site from a stuck agent.",
+  },
+  "task.edit_limits": {
+    short: "Change what one run of this task may spend.",
+    long:
+      "A zero on any of them means no ceiling for that one, which is only sensible for a site " +
+      "you trust to finish. The message limit also caps how many people a run can tell.",
+  },
+  "task.save_limits": {
+    short: "Save them. They apply from the next run.",
   },
 
   // ------------------------------------------------------------- playbook --
@@ -169,7 +206,9 @@ export const hints = {
   },
   "channel.test": {
     short: "Send a real message to yourself, to prove the channel works.",
-    long: "It only ever goes to you, never to anyone else.",
+    long:
+      "It only ever goes to you, never to anyone else, so it needs your own address on this " +
+      "channel to be set first. What happened appears on this card, under the button.",
   },
 
   // ------------------------------------------------------------- settings --
@@ -201,6 +240,13 @@ export const hints = {
       "WhatsApp has no official way for a personal account to send messages, so this points at a " +
       "gateway you run yourself. Results always go to Telegram as well, so this is never the only " +
       "way you find out.",
+  },
+  "settings.save_self": {
+    short: "Save where Errand should reach you on this channel. Only you, nobody else.",
+    long:
+      "A test message has to go somewhere, and this is the somewhere. It is not a recipient: " +
+      "people a task may write to are further down the page, under 'People Errand may message'. " +
+      "Nothing here lets a task message anybody new.",
   },
   "settings.add_person": {
     short: "Save someone a task may message when it finishes.",
@@ -301,7 +347,7 @@ export const hints = {
     short: "Stop telling this person about this task.",
   },
   "task.notify_when": {
-    short: "Whether this person hears about runs that worked, that failed, or both.",
+    short: "Whether this person hears about runs that worked, that failed, or both. Press to change.",
     long:
       "Messages to other people wait until your quiet hours are over. Your own failure alerts do " +
       "not, because hearing at nine that the eight o'clock booking failed is hearing too late.",
@@ -336,7 +382,10 @@ export const hints = {
       "with the reason.",
   },
   "ai.test": {
-    short: "Ask it right now whether it is there, and say what came back.",
+    short: "Ask it right now whether it is there. The answer appears under the model.",
+    long:
+      "The pill is the stored verdict from whenever it was last checked; this asks again this " +
+      "second and says the answer in place, even when the answer has not changed.",
   },
   "ai.enable": {
     short: "Stop using this model without forgetting it.",
@@ -354,9 +403,10 @@ export const hints = {
   "ai.scan_network": {
     short: "Also try the other machines on the network this computer is on.",
     long:
-      "For a model running on a different box — a mini PC, a home server. Errand tries every " +
-      "address on your own subnet, which takes a few seconds. Leave it off on a network that is " +
-      "not yours: sweeping an office or hotel network is rude, and it looks like something worse.",
+      "For a model running on a different box, such as a mini PC or a home server. Errand tries " +
+      "every address on your own subnet, which takes a few seconds. Leave it off on a network " +
+      "that is not yours: sweeping an office or hotel network is rude, and it looks like " +
+      "something worse.",
   },
   "ai.service": {
     short: "Pick a service by name. Errand already knows its address.",

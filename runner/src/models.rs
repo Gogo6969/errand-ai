@@ -316,7 +316,7 @@ pub async fn check_one(p: &Provider) -> (&'static str, String) {
 ///
 /// The near misses matter as much as the hits. A scan that quietly drops an
 /// endpoint needing a key, or one with no model loaded, looks identical to a
-/// network with nothing on it — and the person is left believing Errand looked
+/// network with nothing on it, and the person is left believing Errand looked
 /// properly when it looked and shrugged.
 #[derive(Debug, Default)]
 pub struct Discovery {
@@ -335,7 +335,7 @@ pub struct Discovery {
 /// Since Sequoia, a program needs the user's permission to talk to anything on
 /// the local network, and a background service started by launchd has no way to
 /// raise that prompt where anybody would see it. Denied connections then fail
-/// instantly, so a sweep finishes in half a second and reports nothing — which
+/// instantly, so a sweep finishes in half a second and reports nothing, which
 /// is indistinguishable from a network with nothing on it, and sends people off
 /// to debug their model server instead of their privacy settings.
 ///
@@ -344,7 +344,7 @@ pub struct Discovery {
 /// found without guessing.
 async fn local_network_blocked() -> bool {
     let Some(gateway) = default_gateway() else {
-        // No gateway means no LAN to be blocked from — Wi-Fi off, or a machine
+        // No gateway means no LAN to be blocked from: Wi-Fi off, or a machine
         // with only loopback. Not this problem.
         return false;
     };
@@ -390,7 +390,7 @@ fn file_descriptor_limit() -> Option<usize> {
 ///
 /// Called once at boot. launchd's default of 256 is enough for ordinary work
 /// and far too few for a network sweep, and raising the soft limit to the hard
-/// one needs no privileges — it is what every server does.
+/// one needs no privileges; it is what every server does.
 pub fn raise_file_descriptor_limit() {
     // SAFETY: both calls operate on a struct we own.
     unsafe {
@@ -436,8 +436,8 @@ pub const LOCAL_NETWORK_BLOCKED: &str =
 ///
 /// Two quite different things, which is why they are separate. Loopback is
 /// always safe to try: it is your own computer and nobody else can see it.
-/// Scanning the network is not something to do behind someone's back — on an
-/// office or hotel network it is rude, and it looks like something worse — so
+/// Scanning the network is not something to do behind someone's back: on an
+/// office or hotel network it is rude, and it looks like something worse, so
 /// it happens only when asked for, and only across the subnet this machine is
 /// already on.
 ///
@@ -446,7 +446,7 @@ pub const LOCAL_NETWORK_BLOCKED: &str =
 ///
 /// What this CANNOT find, and no address sweep could: anything reached by name
 /// rather than by number. A server behind a reverse proxy that routes on the
-/// hostname — an Olares app, a Tailscale name, anything with its own domain —
+/// hostname (an Olares app, a Tailscale name, anything with its own domain)
 /// answers nothing useful at its bare address. Those have to be added by
 /// address, which is why that option sits next to this one.
 pub async fn discover(scan_network: bool) -> Discovery {
@@ -457,7 +457,7 @@ pub async fn discover(scan_network: bool) -> Discovery {
 
     // Every port, everywhere. An earlier version tried only five of them across
     // a network, on the theory that the long tail was other people's web
-    // servers — but the cost of a closed port is one refused connection, and
+    // servers, but the cost of a closed port is one refused connection, and
     // the cost of missing somebody's model server is that they conclude the
     // feature does not work.
     let mut jobs = vec![];
@@ -480,7 +480,7 @@ pub async fn discover(scan_network: bool) -> Discovery {
     // Not a constant, because the honest answer depends on where this process
     // is running. launchd hands its children a soft limit of 256 open files
     // while a terminal gets a million, so a sweep tuned for a terminal opens
-    // every socket it is allowed and then fails instantly on all the rest —
+    // every socket it is allowed and then fails instantly on all the rest,
     // giving a scan that finishes in half a second and finds nothing at all,
     // which reads exactly like a network with nothing on it. That is precisely
     // the bug this comment exists to stop somebody reintroducing.
@@ -676,8 +676,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_scan_says_how_hard_it_looked_even_when_it_finds_nothing() {
-        // An empty list has two very different meanings — "there is nothing
-        // there" and "it did not really look" — and only one of them is worth
+        // An empty list has two very different meanings, "there is nothing
+        // there" and "it did not really look", and only one of them is worth
         // acting on. The counts are what tell them apart.
         let d = discover(false).await;
         assert_eq!(d.ports, errand_core::providers::PROBES.len());

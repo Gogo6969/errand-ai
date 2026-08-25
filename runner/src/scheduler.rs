@@ -249,7 +249,7 @@ async fn consider(
     // and waiting when the barrier lifts. One occurrence is enough: a later one
     // starts a whole period further on, so if this one's moment to begin has
     // not arrived, neither has any other's. Counted outside MAX_CATCH_UP on
-    // purpose — the cap is there to bound a replay of the past, and sharing it
+    // purpose: the cap is there to bound a replay of the past, and sharing it
     // with the lookahead is what let the future crowd the past out entirely.
     if let Some(next) = spec.next_after(now)? {
         if next <= now + chrono::Duration::seconds(MAX_ARM_EARLY_S) {
@@ -415,7 +415,7 @@ fn backlog_key(task_id: &str) -> String {
 /// Occurrences after it are still owed. It exists because the sweep cursor is
 /// shared by every task and always moves on, so a make-up run that had to wait
 /// for the run in progress would otherwise be left behind it, unspent and
-/// unreachable — a run promised, never made, and never explained.
+/// unreachable: a run promised, never made, and never explained.
 async fn backlog_cursor(state: &AppState, task_id: &str) -> anyhow::Result<Option<DateTime<Utc>>> {
     let Some(v) = errand_core::db::get_setting(state.pool(), &backlog_key(task_id)).await? else {
         return Ok(None);
@@ -448,8 +448,8 @@ async fn forget_backlog(state: &AppState, task_id: &str) -> anyhow::Result<()> {
 /// When a run for this occurrence should actually begin: early enough to be
 /// logged in before a window opens, plus this task's stable jitter.
 ///
-/// One expression, used by every writer of the time a task will next run — the
-/// sweep, the activate route, and `update_task` in core — so the time shown is
+/// One expression, used by every writer of the time a task will next run: the
+/// sweep, the activate route, and `update_task` in core, so the time shown is
 /// the time it happens. Three separate versions of it is how the countdown came
 /// to jump the moment the scheduler first ticked.
 pub(crate) fn start_instant(
@@ -556,7 +556,7 @@ async fn record_skip(
     .await
     {
         Ok(r) => r,
-        // The slot already has a run, so its history is not a blank — but the
+        // The slot already has a run, so its history is not a blank, but the
         // reason this sweep wanted to skip it is about to be thrown away, and
         // that reason is the only thing that could explain a decision nobody
         // else recorded. It goes to the log rather than nowhere.
@@ -706,8 +706,8 @@ mod tests {
     ///
     /// A sweep that fires spawns the executor, and the executor prefers
     /// CLAUDE_BIN over anything installed. Pointing it at a script that does
-    /// nothing means a test can let a run actually start — which is the only way
-    /// to check that a missed run eventually happens — without launching an
+    /// nothing means a test can let a run actually start, which is the only way
+    /// to check that a missed run eventually happens, without launching an
     /// agent on somebody's machine.
     fn no_real_agent() {
         static ONCE: std::sync::Once = std::sync::Once::new();
@@ -937,7 +937,7 @@ mod tests {
     async fn the_time_a_task_promises_to_run_does_not_move_when_the_sweep_looks_at_it() {
         // The failure this guards against: putting a task on a schedule stored
         // the moment it comes due, while the sweep stored the moment it really
-        // begins — the same moment plus this task's own small delay. The
+        // begins: the same moment plus this task's own small delay. The
         // countdown on the task page therefore jumped the first time the
         // scheduler ticked, by up to a quarter of an hour, with nothing having
         // changed.

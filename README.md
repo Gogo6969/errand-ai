@@ -63,7 +63,7 @@ These are properties the code is built to hold, not aspirations:
 
 ## Documentation
 
-[docs/](docs/) — [getting started](docs/getting-started.md) ·
+[docs/](docs/): [getting started](docs/getting-started.md) ·
 [writing a task](docs/tasks.md) · [which AI does what](docs/ai.md) ·
 [messaging people](docs/messaging.md) · [how it is built](docs/architecture.md) ·
 [what stops it going wrong](docs/safety.md) · [the API](docs/api.md) ·
@@ -93,10 +93,10 @@ prompt nobody is awake to answer.
 | M4 | Teach mode and playbooks | **done** |
 | M5 | Self-heal and the failure surface | **done** |
 | M6 | Telegram, WhatsApp, Apple Mail, Apple Messages | **done** |
-| M8b | Every AI it is given: fifteen services, and models on your own machines | **done** |
-| M8c | The task configuration surface: schedules, sites, limits, people | **done** |
 | M7 | API hardening, scoped tokens, webhooks, TypeScript client | **done** |
 | M8 | The interface, with every control explained | **done** |
+| M8b | Every AI it is given: fifteen services, and models on your own machines | **done** |
+| M8c | The task configuration surface: schedules, sites, limits, people | **done** |
 | M9 | Open-source preparation and signing from CI | next |
 | M10 | Public v0.1.0 | |
 
@@ -105,7 +105,7 @@ prompt nobody is awake to answer.
 Requires a stable Rust toolchain and macOS.
 
 ```bash
-cargo test --workspace       # 266 tests, including a real keychain round-trip
+cargo test --workspace       # 307 tests, including a real keychain round-trip
 ./scripts/smoke.sh           # drives the real daemon through the real API
 cargo tauri build            # produces Errand-AI.app and a DMG
 ```

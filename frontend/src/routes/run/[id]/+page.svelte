@@ -1,12 +1,17 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
+  import { goto } from "$app/navigation";
   import { page } from "$app/state";
-  import { api, followRun, statusLabel, ApiError } from "$lib/api";
+  import { api, artifactUrl, followRun, statusLabel, ApiError } from "$lib/api";
   import Hint from "$lib/components/Hint.svelte";
 
   const id = page.params.id!;
   let run = $state<any>(null);
   let problem = $state<string | null>(null);
+  let retrying = $state(false);
+  // Screenshots load when their step is opened, not before: a run can take
+  // dozens, and most of them nobody looks at.
+  let shots = $state<Record<string, string | null>>({});
   let stop: (() => void) | undefined;
   let timer: any;
 
@@ -17,14 +22,33 @@
     catch (e) { problem = e instanceof ApiError ? e.message : String(e); }
   }
 
+  async function retry() {
+    retrying = true;
+    try {
+      const fresh = await api.run(run.task_id);
+      // The run that just started is the one worth watching, not the failure
+      // that provoked it.
+      goto(`/run/${fresh.id}`);
+    } catch (e) {
+      problem = e instanceof ApiError ? e.message : String(e);
+      retrying = false;
+    }
+  }
+
+  async function showShot(artifactId: string) {
+    if (artifactId in shots) return;
+    try { shots[artifactId] = await artifactUrl(artifactId); }
+    catch { shots[artifactId] = null; }
+  }
+
   onMount(() => {
     load();
     // Each step arrives as it happens rather than up to three seconds later,
     // which matters most while you are watching a task being taught.
     stop = followRun(id, () => load());
 
-    // A slow safety net, not the mechanism. If the stream drops — the daemon
-    // restarts mid-run, say — a stalled page would otherwise look like a
+    // A slow safety net, not the mechanism. If the stream drops, the daemon
+    // restarts mid-run, say, a stalled page would otherwise look like a
     // stalled run, which is the more alarming of the two.
     timer = setInterval(() => {
       if (!run || FINISHED.includes(run.status)) return;
@@ -73,7 +97,7 @@
       {/if}
       <div class="row" style="margin-top:10px">
         <Hint id="run.retry">
-          <button onclick={() => api.run(run.task_id).then(() => location.reload())}>Try again</button>
+          <button disabled={retrying} onclick={retry}>Try again</button>
         </Hint>
       </div>
     </div>
@@ -90,7 +114,34 @@
           <span>{s.title}</span>
           <span class="muted">{s.kind}</span>
         </div>
+        {#if s.artifact_id}
+          {@const aid = s.artifact_id}
+          <details
+            style="margin-top:6px"
+            ontoggle={(e) => {
+              if ((e.currentTarget as HTMLDetailsElement).open) showShot(aid);
+            }}
+          >
+            <summary class="muted" data-hint-exempt="shows the screenshot this step took, labelled by its text">
+              See what it saw
+            </summary>
+            {#if shots[aid]}
+              <img class="shot" src={shots[aid]} alt="The page as the agent saw it at this step" />
+            {:else if shots[aid] === null}
+              <p class="muted">That screenshot is no longer there.</p>
+            {:else}
+              <p class="muted">Loading…</p>
+            {/if}
+          </details>
+        {/if}
       </div>
     {/each}
   </div>
 {/if}
+
+<style>
+  .shot {
+    display: block; max-width: 100%; margin-top: 8px;
+    border: 1px solid var(--rule); border-radius: 6px;
+  }
+</style>

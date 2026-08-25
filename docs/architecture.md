@@ -11,7 +11,7 @@ touches no website. Every screen is an API client.
 
 The split is what lets a task fire at eight in the morning with the window
 closed, and lets you quit the window without stopping a run. It also means the
-app has one job to get right — the API token, which is read in Rust and never
+app has one job to get right: the API token, which is read in Rust and never
 handed to the webview, because a token in JavaScript is a token any page script
 can read, and this one can start runs and read your whole history.
 
@@ -32,15 +32,15 @@ why.
                                     └──► your AI providers
 ```
 
-- **`core/`** — everything with no side effects: the schedule, the playbook
+- **`core/`**: everything with no side effects: the schedule, the playbook
   format, the domain rules, the database, the keychain wrapper, the limits.
   Heavily tested, because it is where the decisions are.
-- **`runner/`** — the daemon: scheduler, executor, MCP tool server, browser
+- **`runner/`**: the daemon: scheduler, executor, MCP tool server, browser
   supervision, outbox, webhooks, API.
-- **`sidecars/browser-agent/`** — a small Node process driving a Chrome-family
+- **`sidecars/browser-agent/`**: a small Node process driving a Chrome-family
   browser through Playwright, speaking newline-delimited JSON over stdin.
-- **`frontend/`** — SvelteKit, served from inside the app bundle.
-- **`packages/client/`** — a TypeScript client for the API.
+- **`frontend/`**: SvelteKit, served from inside the app bundle.
+- **`packages/client/`**: a TypeScript client for the API.
 
 ## How a run happens
 
@@ -55,7 +55,7 @@ why.
 4. Anything irreversible claims a fence slot before it happens and commits
    evidence after.
 5. The run ends by calling `finish` or `fail`. A run that stops without saying
-   which is treated as not done — never as done.
+   which is treated as not done, never as done.
 
 ## Why the agent runs as a separate process
 
@@ -68,7 +68,7 @@ would mean trusting configuration; running it out-of-process means checking.
 
 Everything lives in `~/Library/Application Support/com.errandai.app/`:
 the database, run artifacts, playbooks and logs. Secrets live in the macOS
-keychain and nowhere else — never in the database, the logs, the journal,
+keychain and nowhere else: never in the database, the logs, the journal,
 screenshots, or a model prompt.
 
 ## Other platforms

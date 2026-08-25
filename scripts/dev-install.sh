@@ -21,7 +21,7 @@ DEST="$DEST_DIR/errandd"
 # A release build keeps its secrets in the macOS keychain and is signed with a
 # stable identity, so macOS asks permission once and the answer sticks. A debug
 # build deliberately keeps its secrets in a file instead, because cargo relinks
-# it on every compile and macOS treats each relink as a different program — it
+# it on every compile and macOS treats each relink as a different program; it
 # would ask permission again after every single build, and the habit of clicking
 # Allow without reading is worse than anything the prompt was protecting.
 #

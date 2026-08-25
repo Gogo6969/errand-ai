@@ -30,6 +30,11 @@ export interface Task {
   next_run_at?: string | null;
   paused_reason?: string | null;
   auto_paused: boolean;
+  /**
+   * Armed irreversible actions waiting on a person to say what happened. When
+   * this is above zero the task is blocked until someone resolves the hold.
+   */
+  open_holds?: number;
 }
 
 export interface Failure {
@@ -61,6 +66,8 @@ export interface Step {
   kind: string;
   title: string;
   ok: boolean;
+  /** Set when the step left a file behind; fetch it with getArtifact. */
+  artifact_id?: string | null;
 }
 
 /** An error the daemon reported, carrying its machine-readable code. */
@@ -167,6 +174,36 @@ export class ErrandClient {
 
   async getRun(id: string): Promise<Run & { steps: Step[] }> {
     return this.request("GET", `/v1/runs/${id}`);
+  }
+
+  /**
+   * One file a run left behind, such as a screenshot, fetched by id.
+   *
+   * The id comes from a step's `artifact_id`. There is no list endpoint:
+   * artifacts are addressed by id and never by path, so a file you were not
+   * given the id of does not exist.
+   */
+  async getArtifact(id: string): Promise<{ contentType: string; bytes: ArrayBuffer }> {
+    const res = await fetch(`${this.baseUrl}/v1/artifacts/${id}`, {
+      headers: { Authorization: `Bearer ${this.token}` },
+    });
+    if (!res.ok) {
+      const text = await res.text();
+      let code = "unknown";
+      let detail = `Errand returned ${res.status}`;
+      try {
+        const json = JSON.parse(text);
+        code = json.code ?? code;
+        detail = json.detail ?? json.title ?? detail;
+      } catch {
+        // Not JSON; the status code is the whole story.
+      }
+      throw new ErrandError(res.status, code, detail);
+    }
+    return {
+      contentType: res.headers.get("content-type") ?? "application/octet-stream",
+      bytes: await res.arrayBuffer(),
+    };
   }
 
   async listRuns(taskId?: string, limit = 20): Promise<Run[]> {
@@ -346,7 +383,7 @@ export class ErrandClient {
   /**
    * Mint a key for another program. Give each one only the scopes it needs.
    * The key is returned once and stored only as a hash, so it cannot be shown
-   * again — if you lose it, mint another and revoke this one.
+   * again. If you lose it, mint another and revoke this one.
    */
   async createToken(name: string, scopes: Scope[]): Promise<{ id: string; token: string }> {
     return this.request("POST", "/v1/tokens", { name, scopes: scopes.join(",") });

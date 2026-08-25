@@ -370,6 +370,20 @@ pub struct Step {
     pub duration_ms: Option<i64>,
 }
 
+/// A file a run left behind, such as a screenshot. Addressed by id, never by
+/// client-supplied filename, so being asked for one can never be turned into
+/// reading an arbitrary path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Artifact {
+    pub id: String,
+    pub run_id: String,
+    pub kind: String,
+    pub rel_path: String,
+    pub masked: bool,
+    pub bytes: Option<i64>,
+    pub created_at: String,
+}
+
 /// Credential metadata. There is no field for the secret, at any scope, by
 /// construction rather than by filtering.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -389,8 +403,8 @@ pub struct CredentialMeta {
 /// Somebody a task may contact.
 ///
 /// `address_masked` exists so the agent can be told who it is writing to
-/// without being told how to reach them. It has no use for the real address —
-/// the outbox does the sending — and an address sitting in a model's context is
+/// without being told how to reach them. It has no use for the real address, since
+/// the outbox does the sending, and an address sitting in a model's context is
 /// an address that can leave in an answer.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Recipient {

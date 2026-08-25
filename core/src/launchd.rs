@@ -44,7 +44,7 @@ extern "C" {
 /// script or a different browser. The daemon reads all three at launch, so
 /// without them here the documented workaround works when you run the runner
 /// from a terminal and does nothing at all for the process that actually runs
-/// the tasks — which is the only process that matters at 08:00.
+/// the tasks, which is the only process that matters at 08:00.
 const PASSTHROUGH_ENV: [&str; 3] = ["ERRAND_NODE", "ERRAND_SIDECAR", "ERRAND_BROWSER"];
 
 /// Render the LaunchAgent plist. Separated from writing so it can be tested
@@ -61,7 +61,7 @@ pub fn render_plist(exe: &Path, logs_dir: &Path) -> String {
 }
 
 /// A path or a browser name can contain `&`, and an unescaped one makes the
-/// whole plist unparseable — which launchd reports as the agent simply not
+/// whole plist unparseable, which launchd reports as the agent simply not
 /// being there.
 fn xml_escape(s: &str) -> String {
     s.replace('&', "&amp;")

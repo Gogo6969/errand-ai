@@ -54,6 +54,13 @@ jobs:
           cd frontend && node scripts/audit-hints.mjs
           echo "hints exit=$?"
 
+      # Types are a gate too: vite build does not check them, and an unchecked
+      # gate rots. This failing once stayed failing for weeks unnoticed.
+      - name: Type check
+        run: |
+          npm --prefix frontend run check
+          echo "svelte-check exit=$?"
+
       - name: Build
         run: |
           npm --prefix frontend run build

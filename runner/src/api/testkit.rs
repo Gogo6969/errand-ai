@@ -1,7 +1,7 @@
 //! A real daemon on a real port, for tests that have to go through the API.
 //!
-//! The rules worth testing here — a permission, a refusal, a site list being
-//! rewritten into the form the browser will compare — all live between the wire
+//! The rules worth testing here (a permission, a refusal, a site list being
+//! rewritten into the form the browser will compare) all live between the wire
 //! and the database. A test that calls a handler directly skips the token and
 //! the routing; a test that writes rows skips everything. Either can pass while
 //! the product is broken, which this repository has managed twice. So the tests

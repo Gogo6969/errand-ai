@@ -129,7 +129,7 @@ impl CredStore for MacKeychain {
 ///
 /// macOS ties keychain access to a program's code signature, and `cargo build`
 /// produces a new identity every time it relinks. So a development build asks
-/// permission, you grant it, you rebuild, and it asks again — "Always Allow"
+/// permission, you grant it, you rebuild, and it asks again. "Always Allow"
 /// cannot stick to a program that is a different program on every compile.
 /// After a day of that, the habit of clicking Allow without reading is the real
 /// damage, and that habit is worth more to an attacker than anything in the
@@ -218,7 +218,7 @@ impl CredStore for FileStore {
 /// The keychain is for the copy people actually install: signed once with a
 /// stable identity, so macOS asks permission once and the answer holds. A build
 /// artifact gets a file instead, because it is relinked constantly and macOS
-/// treats every relink as a different program — it would ask again after every
+/// treats every relink as a different program; it would ask again after every
 /// compile, and teach the habit of clicking Allow unread.
 ///
 /// `ERRAND_KEYCHAIN=on` forces the real thing for anyone deliberately testing
@@ -236,7 +236,7 @@ pub fn using_keychain() -> bool {
 /// A `--release` build run straight out of `target/release` is every bit as
 /// unsigned as a debug one, so it hits the same wall: profile alone is the
 /// wrong question. What matters is whether this is the copy somebody installed
-/// — the app bundle, or what `dev-install.sh` signs and puts in place — or an
+/// (the app bundle, or what `dev-install.sh` signs and puts in place) or an
 /// artifact that will be overwritten by the next build.
 fn running_from_build_dir() -> bool {
     std::env::current_exe()
@@ -297,7 +297,7 @@ pub fn store() -> Box<dyn CredStore> {
 /// Where the local API token is kept, and why it is not in the keychain.
 ///
 /// This one secret is deliberately different from the rest. It is read on every
-/// daemon boot, by every `errandd` command, and every time the window opens —
+/// daemon boot, by every `errandd` command, and every time the window opens,
 /// so if it lived in the keychain, macOS would ask permission constantly, and
 /// the habit that teaches is worth more to an attacker than the token is.
 ///
@@ -307,8 +307,8 @@ pub fn store() -> Box<dyn CredStore> {
 /// help themselves to the history directly. The keychain would add a prompt
 /// without adding protection *for this particular secret*.
 ///
-/// Site logins and provider keys are the opposite case — they unlock things
-/// beyond this machine, and they are read rarely — so they stay in the keychain
+/// Site logins and provider keys are the opposite case: they unlock things
+/// beyond this machine, and they are read rarely, so they stay in the keychain
 /// where a prompt is both meaningful and infrequent.
 fn api_token_path() -> Result<std::path::PathBuf> {
     Ok(crate::paths::data_root()?.join("api-token"))
@@ -432,7 +432,7 @@ mod tests {
     fn a_development_build_does_not_reach_for_the_real_keychain() {
         // The whole point. macOS ties keychain access to a code signature and
         // every compile produces a new one, so a debug build would ask
-        // permission forever — and teach the habit of clicking Allow unread,
+        // permission forever, and teach the habit of clicking Allow unread,
         // which is worth more to an attacker than anything it was guarding.
         assert!(
             !using_keychain(),
@@ -474,7 +474,7 @@ mod tests {
     fn the_api_key_is_kept_beside_the_database_and_not_in_the_keychain() {
         // It is read on every boot, every command and every time the window
         // opens, so keychain-holding it means a permission prompt several times
-        // a day — and being trained to click Allow unread costs more than this
+        // a day, and being trained to click Allow unread costs more than this
         // token is worth. It guards a loopback API whose database sits in the
         // same directory under the same permissions anyway.
         let path = api_token_path().expect("the key has a home");

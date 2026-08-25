@@ -110,6 +110,69 @@ fn parse_refs(tree: &str) -> HashMap<String, (String, String)> {
     out
 }
 
+/// Why a page did not open.
+///
+/// The two answers are different accusations and only one of them is about the
+/// allowlist. A caller that cannot tell them apart ends up telling the person
+/// their own rule blocked a site that was in fact simply down.
+#[derive(Debug)]
+pub enum NavError {
+    /// This task is not allowed to go there.
+    NotAllowed { url: String, allowed: Vec<String> },
+    /// Not allowed, and close enough to a site that is that it looks deliberate.
+    Lookalike { url: String, similar: String },
+    /// It was allowed. It did not open.
+    Failed(anyhow::Error),
+}
+
+impl NavError {
+    /// Was this Errand's own rule saying no, rather than the page failing?
+    pub fn is_refusal(&self) -> bool {
+        !matches!(self, Self::Failed(_))
+    }
+
+    /// The site as a person would name it, for a line they will read. Falls
+    /// back to the whole address when there is no host to pull out of it, and
+    /// is empty for a page that failed to open, which is about no site in
+    /// particular.
+    pub fn site(&self) -> String {
+        let url = match self {
+            Self::NotAllowed { url, .. } | Self::Lookalike { url, .. } => url.as_str(),
+            Self::Failed(_) => return String::new(),
+        };
+        url::Url::parse(url)
+            .ok()
+            .and_then(|u| u.host_str().map(str::to_string))
+            .unwrap_or_else(|| url.to_string())
+    }
+}
+
+impl std::error::Error for NavError {}
+
+impl std::fmt::Display for NavError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotAllowed { url, allowed } => write!(
+                f,
+                "Refusing to open {url}. This task may only visit: {}. If it genuinely needs \
+                 another site, add it to the task rather than working around this.",
+                if allowed.is_empty() {
+                    "nothing yet, because no sites have been approved for it".to_string()
+                } else {
+                    allowed.join(", ")
+                }
+            ),
+            Self::Lookalike { url, similar } => write!(
+                f,
+                "Refusing to open {url}. It is not on this task's list of allowed sites, and it \
+                 is suspiciously similar to {similar}, which is on the list. That is what a \
+                 lookalike phishing domain looks like, so nothing was typed into it."
+            ),
+            Self::Failed(e) => write!(f, "{e}"),
+        }
+    }
+}
+
 /// Does this control look like it does something that cannot be undone?
 ///
 /// Judged from what the control actually says, independently of the model's own
@@ -145,6 +208,40 @@ pub fn classify(role: &str, label: &str, submits: bool) -> Option<&'static str> 
     // rather than taking you to the page where you might.
     const BOOKING: &[&str] = &["book", "reserve", "confirm", "submit", "apply", "register"];
     const MESSAGE: &[&str] = &["send", "post", "publish", "reply"];
+    // Controls that offer another go, or a way somewhere else. Reproduced in a
+    // real run: the agent hit an error page, pressed "Try again", and that spent
+    // the run's one irreversible action, so every real step afterwards was
+    // refused and the run failed because of it. A retry is the opposite of a
+    // commitment. So is signing in, and calling that irreversible ruins any task
+    // that has to log in before it can start work.
+    //
+    // Checked after the four sets above and before the catch-all, so a label
+    // carrying a serious word as well is still judged by the serious word:
+    // "Confirm booking" books, "Continue to payment" pays, "Cancel booking"
+    // deletes, "Close account" deletes.
+    const NEVER_COMMITS: &[&str] = &[
+        "try again",
+        "retry",
+        "reload",
+        "refresh",
+        "start over",
+        "search",
+        "next",
+        "previous",
+        "back",
+        "continue",
+        "skip",
+        "close",
+        "dismiss",
+        "show more",
+        "load more",
+        "view more",
+        "see more",
+        "sign in",
+        "log in",
+        "login",
+        "signin",
+    ];
 
     let hit = |set: &[&str]| set.iter().any(|w| l.contains(w));
 
@@ -178,6 +275,10 @@ pub fn classify(role: &str, label: &str, submits: bool) -> Option<&'static str> 
         Some("booking")
     } else if hit(MESSAGE) {
         Some("message")
+    } else if NEVER_COMMITS.iter().any(|w| says_whole_words(&l, w)) {
+        // It may well submit a form. A search box does, and so does the "Try
+        // again" on an error page. That is what made the catch-all below wrong.
+        None
     } else if submits && l.len() < 40 {
         // A form submission whose wording we do not recognise. Treated as a
         // commitment, because the cost of a needless confirmation is a moment
@@ -186,6 +287,23 @@ pub fn classify(role: &str, label: &str, submits: bool) -> Option<&'static str> 
     } else {
         None
     }
+}
+
+/// Does `phrase` appear in `label` as whole words?
+///
+/// Whole words, because plain substring matching is what makes a word list
+/// dangerous: "search" sits inside "research", "back" inside "feedback", and
+/// either would quietly stop guarding a control that does commit something.
+fn says_whole_words(label: &str, phrase: &str) -> bool {
+    let want: Vec<&str> = phrase.split_whitespace().collect();
+    if want.is_empty() {
+        return false;
+    }
+    let words: Vec<&str> = label
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .collect();
+    words.windows(want.len()).any(|w| w == want.as_slice())
 }
 
 fn levenshtein(a: &str, b: &str) -> usize {
@@ -444,27 +562,23 @@ impl Browser {
     }
 
     /// Navigate, with the authoritative allowlist check in front of it.
-    pub async fn goto(&self, url: &str) -> Result<Snapshot> {
+    pub async fn goto(&self, url: &str) -> std::result::Result<Snapshot, NavError> {
         if !self.policy.permits(url) {
             if let Some(similar) = self.policy.looks_like_typosquat(url) {
-                return Err(anyhow!(
-                    "Refusing to open {url}. It is not on this task's list of allowed sites, and \
-                     it is suspiciously similar to {similar}, which is on the list. That is what a \
-                     lookalike phishing domain looks like, so nothing was typed into it."
-                ));
+                return Err(NavError::Lookalike {
+                    url: url.to_string(),
+                    similar,
+                });
             }
-            return Err(anyhow!(
-                "Refusing to open {url}. This task may only visit: {}. If it genuinely needs \
-                 another site, add it to the task rather than working around this.",
-                if self.policy.allowed.is_empty() {
-                    "nothing yet, because no sites have been approved for it".to_string()
-                } else {
-                    self.policy.allowed.join(", ")
-                }
-            ));
+            return Err(NavError::NotAllowed {
+                url: url.to_string(),
+                allowed: self.policy.allowed.clone(),
+            });
         }
-        self.call("page.goto", json!({ "url": url })).await?;
-        self.snapshot().await
+        self.call("page.goto", json!({ "url": url }))
+            .await
+            .map_err(NavError::Failed)?;
+        self.snapshot().await.map_err(NavError::Failed)
     }
 
     /// What a ref says, from the last snapshot: (role, label).
@@ -977,9 +1091,82 @@ mod tests {
     #[test]
     fn an_unrecognised_form_submission_is_treated_as_a_commitment() {
         // The wording is unfamiliar, but it submits a form, so it errs safe.
-        assert_eq!(classify("button", "Continue", true), Some("form_submit"));
-        // The same word on a plain link commits nothing.
-        assert_eq!(classify("link", "Continue", false), None);
+        assert_eq!(
+            classify("button", "Save changes", true),
+            Some("form_submit")
+        );
+        // The same words on a plain link commit nothing.
+        assert_eq!(classify("link", "Save changes", false), None);
+    }
+
+    #[test]
+    fn a_retry_or_a_navigation_never_spends_the_runs_one_irreversible_action() {
+        // Reproduced in a real run: the agent hit an error page, clicked "Try
+        // again", the fence armed on it, and every later action was refused
+        // with "This run's slot has already had its form_submit done".
+        for label in [
+            "Try again",
+            "Try Again",
+            "Retry",
+            "Reload",
+            "Refresh results",
+            "Search",
+            "Search flights",
+            "Next",
+            "Next page",
+            "Continue",
+            "Back",
+            "Back to results",
+            "Close",
+            "Dismiss",
+            "Show more",
+            "Load more results",
+            "Sign in",
+            "Log in",
+            "Login",
+        ] {
+            assert_eq!(
+                classify("button", label, true),
+                None,
+                "'{label}' asks to go somewhere or to have another go, and committing the run's \
+                 one slot to it means the real booking is refused"
+            );
+        }
+    }
+
+    #[test]
+    fn the_words_that_commit_still_commit_when_a_retry_word_sits_beside_them() {
+        assert_eq!(classify("button", "Confirm", true), Some("booking"));
+        assert_eq!(classify("button", "Submit", true), Some("booking"));
+        assert_eq!(classify("button", "Confirm booking", true), Some("booking"));
+        assert_eq!(
+            classify("button", "Continue to payment", true),
+            Some("purchase")
+        );
+        assert_eq!(classify("button", "Cancel booking", true), Some("deletion"));
+        assert_eq!(classify("button", "Close account", true), Some("deletion"));
+        assert_eq!(
+            classify("button", "Sign in and pay", true),
+            Some("purchase")
+        );
+    }
+
+    #[test]
+    fn a_word_inside_a_longer_word_does_not_clear_a_control() {
+        // Substring matching would read "search" inside "Research" and "back"
+        // inside "Feedback", and stop guarding both.
+        assert_eq!(
+            classify("button", "Research this", true),
+            Some("form_submit")
+        );
+        assert_eq!(
+            classify("button", "Give feedback", true),
+            Some("form_submit")
+        );
+        assert_eq!(
+            classify("button", "Backup my data", true),
+            Some("form_submit")
+        );
     }
 
     /// A throwaway directory to stand in for a home folder. Named after the

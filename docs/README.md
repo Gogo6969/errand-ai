@@ -4,7 +4,7 @@ Errand-AI runs real errands on a schedule. You describe a job the way you would
 describe it to a person, it tries it once while you watch, writes down what
 worked, and then does it on its own.
 
-The app explains itself as you use it — every control has a tooltip, and that is
+The app explains itself as you use it: every control has a tooltip, and that is
 enforced by a build check, not by good intentions. These pages are for the
 things a tooltip is too small to hold.
 

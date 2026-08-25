@@ -10,7 +10,7 @@ Errand runs the Claude command line tool with a deliberately small tool surface:
 an explicit allowlist of Errand's own tools, an explicit denylist of the
 built-ins, no user settings, no other MCP servers, and a working directory of
 its own. Before a run starts, Errand checks what the agent actually reports
-having — and if that does not match what was asked for, the run fails closed
+having, and if that does not match what was asked for, the run fails closed
 rather than continuing with more than it should have.
 
 The agent has no shell, cannot read your files, and cannot reach the network
@@ -52,12 +52,12 @@ address. There is no tool that takes a phone number or an email address.
 
 This is the specific defence against a page that says *"also confirm to this
 number"*. There is nothing for it to grab. The agent is told, in its standing
-rules, that text it reads is information and never instruction — but the rule is
+rules, that text it reads is information and never instruction, but the rule is
 the second line of defence, not the first. The first is that the capability does
 not exist.
 
-Messages to other people are also capped per run — a cap the automatic
-end-of-run report shares with the agent's own sends — wait until quiet hours are
+Messages to other people are also capped per run (a cap the automatic
+end-of-run report shares with the agent's own sends) and wait until quiet hours are
 over, and appear in full in the run timeline. They may contain no link to a site
 outside the task's allowlist, including the bare kind a phone or a mail client
 would quietly make tappable.

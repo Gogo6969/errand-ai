@@ -476,7 +476,7 @@ async fn doctor() -> Result<u32> {
 
     // API reachable.
     //
-    // The same port the runner would bind, ERRAND_API_PORT included — a doctor
+    // The same port the runner would bind, ERRAND_API_PORT included. A doctor
     // that checked a port nothing was using would report the service down while
     // it was running perfectly well on another one.
     let port: u16 = std::env::var("ERRAND_API_PORT")
@@ -495,7 +495,7 @@ async fn doctor() -> Result<u32> {
     //
     // Reading one back is not the same as it being accepted, and the difference
     // is not academic: the saved copy and the hash in the database can drift
-    // apart — switching between a debug and a release build does it, because
+    // apart: switching between a debug and a release build does it, because
     // they keep their secrets in different places. Doctor used to report the
     // token as fine in exactly that case, while every window got a 401. A clean
     // bill of health that is not true is worse than no check at all.
@@ -517,7 +517,7 @@ async fn doctor() -> Result<u32> {
         println!("  {}  that token is accepted", tick(accepted));
         if !accepted {
             println!("      The saved key and the running service no longer agree, so every");
-            println!("      window will be refused. Nothing is lost — the key is only a copy.");
+            println!("      window will be refused. Nothing is lost; the key is only a copy.");
             println!("      Mint a matching one:");
             println!();
             println!("        errandd token --new");

@@ -57,7 +57,7 @@ pub fn generate_token() -> Result<String> {
 /// request, so the API is usable even if saving the readable copy then fails.
 ///
 /// But a hash with no readable copy is a locked door: every window gets a 401,
-/// and nothing about that says why. It happens for ordinary reasons — a
+/// and nothing about that says why. It happens for ordinary reasons: a
 /// database carried over from another machine, a copy that was moved or
 /// removed. So a key that cannot be read is treated as no key at all and
 /// replaced. That revokes only the key named "primary"; anything minted for

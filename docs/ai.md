@@ -20,18 +20,18 @@ the containment again, and claiming otherwise would be a lie you only discover
 at eight on a Wednesday.
 
 The other jobs are one question with one answer, so any competent model can do
-them — including one on your own machine, where your run history never leaves
+them, including one on your own machine, where your run history never leaves
 the house.
 
 The plan is normally written by the agent itself at the end of a run, because it
-is the only thing that watched the run happen — it knows *why* it clicked what
+is the only thing that watched the run happen: it knows *why* it clicked what
 it clicked, which is the difference between an intent and a hint.
 
 The fourth job is the fallback for when it does not. An agent that simply forgets
 used to leave nothing at all, and a task with no plan can never be armed, so the
 only remedy was to teach it again and hope. Now the plan is worked out from the
 record of the run instead, by whichever model you choose. It is labelled as
-inferred, and it arrives unapproved like any other — you still read it first.
+inferred, and it arrives unapproved like any other, and you still read it first.
 
 ## Services
 
@@ -60,13 +60,13 @@ on this machine; ticking *look on my network too* tries all twenty on every
 address of the subnet this Mac is on, which takes a few seconds.
 
 It says afterwards how many addresses and ports it tried, and lists anything
-that answered but could not be used — a server that wants an API key, or one
+that answered but could not be used, such as a server that wants an API key, or one
 with no model loaded. Those are worth seeing: a scan that quietly drops them
 looks identical to a network with nothing on it.
 
 **What no scan can find** is a server reached by a *name* rather than a number.
-Anything behind a reverse proxy that routes on the hostname — an Olares app, a
-Tailscale name, a machine with its own domain — answers nothing useful at its
+Anything behind a reverse proxy that routes on the hostname (an Olares app, a
+Tailscale name, a machine with its own domain) answers nothing useful at its
 bare address. Add those with **Add one by address instead**.
 
 The network sweep is off by default and only ever covers your own subnet.
@@ -90,5 +90,5 @@ Claude. Errand will not let you turn it on until there is a local model to use.
 ## What leaves your machine
 
 When a hosted model is used, the wording of your task and what the agent reads
-on a page go to that service to be answered. Your saved logins never do — they
+on a page go to that service to be answered. Your saved logins never do: they
 are typed into pages by the browser process, and the agent never receives them.

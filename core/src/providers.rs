@@ -608,8 +608,8 @@ pub fn explain_empty_chain(role: Role, local_only: bool, providers: &[Provider])
 ///
 /// A model running on your own machine always answers under `/v1`, and nobody
 /// types that, so it is added for a local address and only for a local address.
-/// A hosted service mounts its endpoint wherever it likes — Groq under
-/// `/openai/v1`, Perplexity at the root — so guessing there would break more
+/// A hosted service mounts its endpoint wherever it likes (Groq under
+/// `/openai/v1`, Perplexity at the root), so guessing there would break more
 /// than it fixed, and a cloud address is taken exactly as given.
 pub fn parse_base_url(s: &str) -> Result<String> {
     let trimmed = s.trim().trim_end_matches('/');

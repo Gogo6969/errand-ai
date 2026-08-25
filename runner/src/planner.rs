@@ -2,7 +2,7 @@
 //!
 //! Normally the agent writes its own plan: it calls `save_playbook` near the end
 //! of a run, and it is the right thing to do it because it is the only thing
-//! that watched the run happen — it knows why it clicked what it clicked, which
+//! that watched the run happen: it knows why it clicked what it clicked, which
 //! is the difference between an intent and a hint.
 //!
 //! But an agent that simply forgets leaves nothing at all, and a task with no
@@ -13,7 +13,7 @@
 //! So when a run ends having done real work and left no plan behind, the plan is
 //! distilled from the journal instead. It is a second best and it is labelled as
 //! one: the journal records what happened, not what was intended, so the intents
-//! it produces are inferred. Nothing about the approval gate changes — a
+//! it produces are inferred. Nothing about the approval gate changes: a
 //! distilled plan is written unapproved, and a person still reads it before
 //! anything runs alone.
 
@@ -177,7 +177,7 @@ async fn distil(state: &AppState, run_id: &str) -> anyhow::Result<Option<i64>> {
         never: draft.never.iter().map(|s| red.scrub(s)).collect(),
     };
 
-    // Teach for a supervised first run, refine otherwise — the same distinction
+    // Teach for a supervised first run, refine otherwise, the same distinction
     // the agent's own tool draws, so the history reads consistently.
     let source = if run.mode == "teach" {
         Source::Teach

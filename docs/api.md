@@ -7,7 +7,7 @@ keep an integration API honest: if a screen can do it, so can you.
 http://127.0.0.1:4477
 ```
 
-Loopback only. Use the numeric address rather than `localhost` — the listener is
+Loopback only. Use the numeric address rather than `localhost`: the listener is
 IPv4, and `localhost` resolves to IPv6 first on some systems, which fails in a
 way that looks like the daemon being down.
 
@@ -64,8 +64,12 @@ for await (const event of errand.watchRun(run.id)) {
 | `GET /v1/tasks` | List. `?include_archived=true` for the rest. |
 | `POST /v1/tasks` | Create. `name`, `description`, and optionally `emoji`, `schedule`, `allowed_domains`, `notify`, `limits`. |
 | `GET /v1/tasks/{id}` | One task, including `schedule_describes` and `schedule_preview`. |
-| `PATCH /v1/tasks/{id}` | Change any of the above. Absent fields are left alone. |
-| `POST /v1/tasks/{id}/teach` | Run it once in teach mode, so it can write a plan. |
+
+Every task response also carries `open_holds`: how many armed irreversible
+actions are waiting on a person to say what happened. Above zero, the task is
+blocked until someone resolves the hold, and `POST /v1/tasks/{id}/holds` is the
+way to do it.
+| `PATCH /v1/tasks/{id}` | Change any of the above. Absent fields are left alone. || `POST /v1/tasks/{id}/teach` | Run it once in teach mode, so it can write a plan. |
 | `POST /v1/tasks/{id}/run` | Run now. `{"dry_run": true}` rehearses without doing anything. |
 | `POST /v1/tasks/{id}/activate` | Arm it, once a plan is approved. |
 | `POST /v1/tasks/{id}/pause` · `/resume` | Stop and restart scheduled runs. |
@@ -75,11 +79,11 @@ for await (const event of errand.watchRun(run.id)) {
 
 Two refusals from `PATCH` are worth handling rather than showing raw:
 
-- **`task_not_taught` (409)** — the task has no approved plan, so it cannot be
+- **`task_not_taught` (409)**: the task has no approved plan, so it cannot be
   put on a schedule. This is the one line between "tried once while watched" and
   "runs alone at three in the morning", and it applies to `PATCH` as well as
   `activate`.
-- **`schedule_change_may_repeat` (409)** — the new schedule's first run comes
+- **`schedule_change_may_repeat` (409)**: the new schedule's first run comes
   sooner than the old one's would have, and something irreversible has already
   been done for this slot. Retry with `"acknowledge_repeat": true` only after a
   person has read that.
@@ -92,7 +96,7 @@ first run under a new schedule is the next one, not a missed one.
 `allowed_domains` is a list of bare hosts. A full URL is accepted and tidied.
 Subdomains are included; wildcards, single labels and bare public suffixes are
 refused with a message saying what to type instead, because they would save
-happily and match nothing. The response may carry `warnings` — things worth
+happily and match nothing. The response may carry `warnings`: things worth
 saying but not worth refusing over, such as `www.x.com` without `x.com`.
 
 Order matters: the first entry decides which browser profile the task uses, and
@@ -106,7 +110,7 @@ that profile holds its saved logins.
 ```
 
 `kind` is `manual`, `once` (with `at`) or `cron` (with `expr`). **Six fields,
-seconds first** — an expression copied from elsewhere usually has five and will
+seconds first**: an expression copied from elsewhere usually has five and will
 mean something quite different.
 
 `POST /v1/schedule/preview` takes a schedule and returns
@@ -121,6 +125,7 @@ means, and the next few times it would really fire. Call it before saving one.
 | `GET /v1/runs/{id}` | One run, with every step. |
 | `GET /v1/runs/{id}/stream` | Server-sent events, live. |
 | `GET /v1/events` | Every run, live. |
+| `GET /v1/artifacts/{id}` | A file a run left behind, such as a screenshot. Steps that have one carry an `artifact_id`. Addressed by id, never by path. |
 
 ## People a task may message
 
@@ -159,5 +164,5 @@ work.
 more than a few minutes old so an old delivery cannot be replayed at you. The
 client package exports `verifySignature` for this.
 
-Targets must be loopback or a private address unless you allow otherwise —
+Targets must be loopback or a private address unless you allow otherwise:
 Errand will not be turned into a way of reaching arbitrary hosts.

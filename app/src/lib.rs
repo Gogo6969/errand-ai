@@ -267,12 +267,60 @@ async fn daemon_up(state: tauri::State<'_, Daemon>) -> Result<bool, String> {
         .unwrap_or(false))
 }
 
+/// One run artifact, such as a screenshot, handed to the page as a data URL.
+///
+/// Artifacts are bytes, so they cannot ride the ordinary proxy, which speaks
+/// strings. The rule does not change though: the token stays here, the page
+/// names an id and nothing more, and a data URL is all it gets back.
+#[tauri::command]
+async fn artifact(state: tauri::State<'_, Daemon>, id: String) -> Result<String, String> {
+    // The id goes into a URL, so it must be an id and not a path.
+    if !id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(json_err("bad_path", "That is not a valid artifact."));
+    }
+    let token = state.token().await?;
+    let res = reqwest::Client::new()
+        .get(format!("{}/v1/artifacts/{id}", state.base))
+        .bearer_auth(token)
+        .timeout(std::time::Duration::from_secs(30))
+        .send()
+        .await
+        .map_err(|e| {
+            json_err(
+                "unreachable",
+                &format!("Errand's background service is not answering ({e})."),
+            )
+        })?;
+    if !res.status().is_success() {
+        let status = res.status();
+        let text = res.text().await.unwrap_or_default();
+        return Err(describe(status, text));
+    }
+    let mime = res
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("image/png")
+        .to_string();
+    let bytes = res.bytes().await.map_err(|e| e.to_string())?;
+    use base64::Engine as _;
+    Ok(format!(
+        "data:{mime};base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    ))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(Daemon::new())
-        .invoke_handler(tauri::generate_handler![api, daemon_up, follow_run])
+        .invoke_handler(tauri::generate_handler![
+            api, daemon_up, follow_run, artifact
+        ])
         .setup(|app| {
             // Shown only once the page is ready, so nobody sees a white square.
             if let Some(w) = app.get_webview_window("main") {

@@ -60,6 +60,33 @@
     finally { busy = false; }
   }
 
+  // Checking one model is its own flow, not an `act`: the button says what it
+  // is doing, the answer lands on the row it came from, and a failure is shown
+  // there too rather than at the top of a page nobody is looking at.
+  let checkingId = $state<string | null>(null);
+  let checked = $state<Record<string, string>>({});
+
+  function checkOutcome(before: string | null, after: string): string {
+    const now = health(after).toLowerCase();
+    if (before === after) return `Checked just now: still ${now}.`;
+    const was = before ? health(before).toLowerCase() : "not checked";
+    return `Checked just now: ${now} (was ${was}).`;
+  }
+
+  async function check(p: Provider) {
+    checkingId = p.id;
+    try {
+      const r = await api.testProvider(p.id);
+      checked[p.id] = checkOutcome(p.health, r.health);
+      problem = null;
+      await load();
+    } catch (e) {
+      checked[p.id] = `That check did not work: ${e instanceof ApiError ? e.message : String(e)}`;
+    } finally {
+      checkingId = null;
+    }
+  }
+
   async function runScan() {
     busy = true;
     try {
@@ -172,10 +199,10 @@
               value={r.chosen ?? ""}
               onchange={(e) => act(() => api.bindRole(r.role, (e.currentTarget as HTMLSelectElement).value || null))}
             >
-              <option value="">No preference — use whatever works</option>
+              <option value="">No preference: use whatever works</option>
               {#each setup.providers as p}
                 <option value={p.id} disabled={r.needs_agentic && p.kind !== "claude_cli"}>
-                  {p.label}{r.needs_agentic && p.kind !== "claude_cli" ? " — cannot do this job" : ""}
+                  {p.label}{r.needs_agentic && p.kind !== "claude_cli" ? " (cannot do this job)" : ""}
                 </option>
               {/each}
             </select>
@@ -196,10 +223,13 @@
         </div>
         <div class="muted">{where(p)}{p.base_url ? ` · ${p.base_url}` : ""}{p.model ? ` · ${p.model}` : ""}</div>
         {#if p.health_detail}<div class="muted detail">{p.health_detail}</div>{/if}
+        {#if checked[p.id]}<div class="checked">{checked[p.id]}</div>{/if}
       </div>
       <div class="actions">
         <Hint id="ai.test">
-          <button disabled={busy} onclick={() => act(() => api.testProvider(p.id))}>Check</button>
+          <button disabled={busy || checkingId === p.id} onclick={() => check(p)}>
+            {checkingId === p.id ? "Checking…" : "Check"}
+          </button>
         </Hint>
         <Hint id="ai.enable">
           <button disabled={busy} onclick={() => toggle(p)}>{p.enabled ? "Switch off" : "Switch on"}</button>
@@ -271,7 +301,7 @@
     <div class="muted" style="margin-bottom:10px">
       Ollama, LM Studio, vLLM, llama.cpp, GPT4All and Open WebUI all speak the same language, so
       Errand can use any of them. A model here never sends your task to anyone. It cannot carry
-      out a task on its own — that still needs Claude — but it can do the other jobs.
+      out a task on its own, since that still needs Claude, but it can do the other jobs.
     </div>
 
     <Hint id="ai.scan_network">
@@ -298,7 +328,7 @@
       <!-- Said out loud, so an empty result reads as "it looked and there was
            nothing" rather than "it probably did not work". -->
       <div class="muted" style="margin-top:10px">
-        Tried {scan.ports} ports on {scan.addresses} address{scan.addresses === 1 ? "" : "es"} —
+        Tried {scan.ports} ports on {scan.addresses} address{scan.addresses === 1 ? "" : "es"}:
         {scan.found.length} usable{scan.also_seen.length ? `, ${scan.also_seen.length} that answered but cannot be used as they are` : ""}.
       </div>
     {/if}
@@ -319,9 +349,9 @@
         {/each}
       {:else}
         <div class="muted" style="margin-top:10px">
-          Nothing usable answered. If your model runs somewhere Errand did not look — another
-          machine, a port of its own, or behind a name rather than a number — add it by address
-          below.
+          Nothing usable answered. If your model runs somewhere Errand did not look, such as
+          another machine, a port of its own, or behind a name rather than a number, add it by
+          address below.
         </div>
       {/if}
 
@@ -335,8 +365,8 @@
       {/if}
 
       <div class="muted" style="margin-top:10px">
-        A server reached by a name rather than a number — anything behind a reverse proxy that
-        routes on the hostname — cannot be found by looking at addresses. Add those by address.
+        A server reached by a name rather than a number, such as anything behind a reverse proxy
+        that routes on the hostname, cannot be found by looking at addresses. Add those by address.
       </div>
     {/if}
 
@@ -372,7 +402,7 @@
   <div class="card">
     <Hint id="ai.local_only">
       <button disabled={busy} onclick={() => act(() => api.setLocalOnly(!setup!.local_only))}>
-        {setup.local_only ? "On — nothing leaves your machines" : "Off — Errand may use a service"}
+        {setup.local_only ? "On: nothing leaves your machines" : "Off: Errand may use a service"}
       </button>
     </Hint>
     <div class="muted" style="margin-top:8px">
@@ -394,6 +424,10 @@
   .using { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--ink-soft); }
   .detail { word-break: break-word; }
+  /* The answer to "Check", on the row that was asked. Stays visible until the
+     next check, so an unchanged verdict is a visible answer rather than a
+     click that looked like it did nothing. */
+  .checked { margin-top: 4px; font-size: 12.5px; color: var(--ink-soft); }
   .alsobox {
     margin-top: 10px; padding: 9px 11px; border-radius: 6px;
     background: var(--warn-bg); color: var(--warn); font-size: 12.5px;

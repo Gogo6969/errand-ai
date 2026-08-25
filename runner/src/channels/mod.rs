@@ -96,8 +96,16 @@ impl std::fmt::Display for ChannelError {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Health {
     pub channel: String,
+    /// The same channel said the way a person says it: "Apple Messages", not
+    /// "imessage". A settings screen showing our internal id is showing
+    /// somebody a name they never chose and cannot look up.
+    pub display_name: String,
     pub status: String,
     pub detail: String,
+    /// Where a test message on this channel would go, as the person typed it,
+    /// or None while they have not said. Only ever the saved setting: a chat id
+    /// in the keychain is not shown back, because Errand promises it cannot.
+    pub self_address: Option<String>,
     /// A literal thing the person can do, when there is one.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fix: Option<String>,
@@ -107,35 +115,76 @@ impl Health {
     pub fn ok(c: ChannelId, detail: impl Into<String>) -> Self {
         Self {
             channel: c.as_str().into(),
+            display_name: c.display_name().into(),
             status: "ok".into(),
             detail: detail.into(),
+            self_address: None,
             fix: None,
         }
     }
     pub fn needs_user(c: ChannelId, detail: impl Into<String>, fix: impl Into<String>) -> Self {
         Self {
             channel: c.as_str().into(),
+            display_name: c.display_name().into(),
             status: "needs_user".into(),
             detail: detail.into(),
+            self_address: None,
             fix: Some(fix.into()),
         }
     }
     pub fn down(c: ChannelId, detail: impl Into<String>, fix: Option<String>) -> Self {
         Self {
             channel: c.as_str().into(),
+            display_name: c.display_name().into(),
             status: "down".into(),
             detail: detail.into(),
+            self_address: None,
             fix,
         }
     }
     pub fn off(c: ChannelId) -> Self {
         Self {
             channel: c.as_str().into(),
+            display_name: c.display_name().into(),
             status: "not_configured".into(),
             detail: format!("{} has not been set up.", c.display_name()),
+            self_address: None,
             fix: None,
         }
     }
+
+    /// Fill in where a test message would go.
+    ///
+    /// Separate from the constructors because only the database knows, and a
+    /// channel check that is talking to Telegram or osascript has no pool.
+    pub async fn fill_self_address(&mut self, pool: &errand_core::db::Pool) {
+        if let Some(id) = ChannelId::parse(&self.channel) {
+            self.self_address = self_address(pool, id).await;
+        }
+    }
+}
+
+/// The setting that holds your own address on one channel.
+///
+/// One per channel rather than one address for all of them, because the same
+/// person is a phone number on Messages, an email address in Mail and a chat id
+/// on Telegram, and a message sent to the wrong one reaches nobody at all.
+pub fn self_address_key(c: ChannelId) -> String {
+    format!("messaging.self.{}", c.as_str())
+}
+
+/// Your own address on this channel, if you have said what it is.
+///
+/// Blank counts as unset. A saved empty string would otherwise be handed to a
+/// channel as a recipient, and the send would fail somewhere far from here.
+pub async fn self_address(pool: &errand_core::db::Pool, c: ChannelId) -> Option<String> {
+    errand_core::db::get_setting(pool, &self_address_key(c))
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_str().map(str::to_string))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 pub type SendResult = std::result::Result<String, ChannelError>;
@@ -161,12 +210,16 @@ pub async fn send(pool: &errand_core::db::Pool, m: &Outbound) -> SendResult {
 
 /// Ask every channel how it is doing.
 pub async fn health_all(pool: &errand_core::db::Pool) -> Vec<Health> {
-    vec![
+    let mut all = vec![
         telegram::health().await,
         whatsapp::health(whatsapp::base_url(pool).await).await,
         apple::mail_health().await,
         apple::imessage_health().await,
-    ]
+    ];
+    for h in &mut all {
+        h.fill_self_address(pool).await;
+    }
+    all
 }
 
 /// Should this go out now, or wait until people are awake?
@@ -210,6 +263,45 @@ mod tests {
             assert_eq!(ChannelId::parse(c.as_str()), Some(c));
         }
         assert_eq!(ChannelId::parse("carrier pigeon"), None);
+    }
+
+    #[test]
+    fn every_channel_reports_the_name_a_person_would_recognise() {
+        // The settings screen used to show "imessage", which is our word for
+        // it, not one anybody chose or could look up.
+        for c in [
+            ChannelId::Telegram,
+            ChannelId::Whatsapp,
+            ChannelId::AppleMail,
+            ChannelId::Imessage,
+        ] {
+            for h in [
+                Health::off(c),
+                Health::ok(c, "fine"),
+                Health::needs_user(c, "not yet", "do this"),
+                Health::down(c, "no answer", None),
+            ] {
+                assert_eq!(h.display_name, c.display_name(), "for {}", c.as_str());
+            }
+        }
+        assert_eq!(
+            Health::off(ChannelId::Imessage).display_name,
+            "Apple Messages"
+        );
+    }
+
+    #[test]
+    fn the_setting_holding_your_own_address_is_named_after_the_channel() {
+        // The screen writes this key and the test button reads it. If they ever
+        // disagreed, the box would fill in and the button would still refuse.
+        assert_eq!(
+            self_address_key(ChannelId::Imessage),
+            "messaging.self.imessage"
+        );
+        assert_eq!(
+            self_address_key(ChannelId::AppleMail),
+            "messaging.self.apple_mail"
+        );
     }
 
     #[test]

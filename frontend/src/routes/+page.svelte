@@ -70,7 +70,7 @@
       after it has tried once. You can change it later.
     </p>
     <div class="row" style="margin-top:12px">
-      <Hint id="task.teach">
+      <Hint id="task.create">
         <button class="primary" disabled={!name.trim() || !description.trim()} onclick={create}>Create</button>
       </Hint>
       <button onclick={() => (creating = false)} data-hint-exempt="cancels the form above, changes nothing">Cancel</button>

@@ -419,8 +419,8 @@ impl ScheduleSpec {
 
 /// Drop anything finer than a second from an occurrence instant.
 ///
-/// An occurrence is only ever identified to the second — `occurrence_id`
-/// formats `%Y-%m-%dT%H:%M:%SZ` — but the cron library carries the fractional
+/// An occurrence is only ever identified to the second (`occurrence_id`
+/// formats `%Y-%m-%dT%H:%M:%SZ`), but the cron library carries the fractional
 /// seconds of whatever cursor it was handed straight through, so asking for the
 /// next 08:00 while holding a clock reading 03:34:00.752066 hands back
 /// 08:00:00.752066. The ids still match, which is exactly what makes it
@@ -428,7 +428,7 @@ impl ScheduleSpec {
 /// the scheduler's "is this one of the occurrences I planned" test fails and
 /// every due occurrence is written off as missed while the Mac was asleep.
 /// Truncating here, where the instants are produced, keeps every later
-/// comparison — and the time stored as the next run — honest.
+/// comparison, and the time stored as the next run, honest.
 fn whole_second(d: DateTime<Utc>) -> DateTime<Utc> {
     use chrono::Timelike;
     d.with_nanosecond(0).unwrap_or(d)

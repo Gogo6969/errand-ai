@@ -48,8 +48,8 @@ out.
 
 ## When it runs
 
-Pick from the everyday shapes — every day, every week, every month, once at a
-set time — and Errand writes the schedule for you. Underneath the form it shows
+Pick from the everyday shapes (every day, every week, every month, once at a
+set time) and Errand writes the schedule for you. Underneath the form it shows
 what the engine will *really* do and the next few times it will happen. If the
 sentence disagrees with what you meant, believe the sentence: it comes from the
 part that does the running.
@@ -60,10 +60,10 @@ Three settings are worth understanding:
 the morning across a clock change rather than drifting by an hour.
 
 **Missed runs.** If your Mac was asleep:
-- *Run it once, late* — the sane default.
-- *Skip it* — right for anything time-sensitive. Nobody wants a court booked
+- *Run it once, late*: the sane default.
+- *Skip it*: right for anything time-sensitive. Nobody wants a court booked
   for a slot that has already passed.
-- *Make up every missed run* — only for tasks where each run does distinct work.
+- *Make up every missed run*: only for tasks where each run does distinct work.
 
 **Spreading the start.** If a booking opens at a fixed moment, every bot in the
 country arrives on the same second. Starting a minute either side helps, and
@@ -77,7 +77,7 @@ schedule is the next one.
 
 Every run has a ceiling on steps, minutes, money and messages. A run that goes
 round in circles is stopped rather than left going, and when it stops it says
-which ceiling it hit — so you can tell a genuinely slow website from an agent
+which ceiling it hit, so you can tell a genuinely slow website from an agent
 that is stuck.
 
 The message limit is the one worth setting deliberately: it is the maximum

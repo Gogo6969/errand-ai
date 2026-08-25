@@ -108,7 +108,7 @@ pub fn normalize_domain(input: &str) -> Result<String> {
         };
         bail!(
             "'{typed}' has a * in it. Errand compares addresses exactly, so a site saved that \
-             way would never open — not one page. Subdomains are already included anyway: \
+             way would never open, not one page. Subdomains are already included anyway: \
              example.com covers www.example.com and everything else under it. {advice}"
         );
     }
@@ -130,8 +130,8 @@ pub fn normalize_domain(input: &str) -> Result<String> {
     // perfectly valid-looking entry pointing at a machine nobody meant to allow.
     //
     // Ask the parser what it produced rather than inferring it from the shape of
-    // what was typed. Inferring is what let "127.1" through — it has a dot in
-    // it, so a dot-counting test read it as an ordinary address — while
+    // what was typed. Inferring is what let "127.1" through: it has a dot in
+    // it, so a dot-counting test read it as an ordinary address, while
     // refusing "example。com", whose ideographic full stop the parser turns into
     // the perfectly ordinary domain example.com.
     if let Some(url::Host::Ipv4(_)) = parsed.host() {
@@ -187,8 +187,8 @@ pub fn normalize_domain(input: &str) -> Result<String> {
 /// Tidy a whole list, keeping the order it was given in.
 ///
 /// Order is load-bearing, which is easy to miss. The runner picks the browser
-/// profile for a run — the profile holding whatever this task is already signed
-/// in to — from the FIRST entry in this list. Reordering it therefore changes
+/// profile for a run (the profile holding whatever this task is already signed
+/// in to) from the FIRST entry in this list. Reordering it therefore changes
 /// which profile the task uses, and a task that was logged in yesterday can
 /// find itself logged out today with nothing else having changed. So repeats
 /// are dropped at their later position and the first mention keeps its place.

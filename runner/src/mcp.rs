@@ -539,14 +539,12 @@ async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &Value) -> V
                 Err(e) => {
                     // A refused navigation is a decision worth recording: it is
                     // how a redirect to a lookalike site shows up afterwards.
-                    let _ = journal(
-                        state,
-                        run_id,
-                        "decide",
-                        &format!("Refused to open {url}"),
-                        false,
-                    )
-                    .await;
+                    // A page that simply would not load is not that, and the
+                    // reason for either belongs in the journal rather than
+                    // nowhere.
+                    let kind = if e.is_refusal() { "decide" } else { "navigate" };
+                    let line = navigation_failure_line(url, &e);
+                    let _ = journal(state, run_id, kind, &line, false).await;
                     text_error(e.to_string())
                 }
             }
@@ -851,7 +849,7 @@ fn looks_like_a_secret(text: &str) -> bool {
 /// identity share a profile, and so share whatever is signed in inside it. A
 /// hand-written list of two-level endings used to live here, it did not match
 /// the one core owns, and so every task on a .co.nz or .co.za address collapsed
-/// onto one profile — one person's shop account sitting in the browser another
+/// onto one profile: one person's shop account sitting in the browser another
 /// task opens.
 ///
 /// So the question is put to core rather than answered a second time here.
@@ -1112,8 +1110,8 @@ async fn message_person(state: &AppState, run_id: &str, args: &Value) -> Value {
         return text_error(format!(
             "This task may not write to anybody with the id {recipient_id}, so nothing was sent. \
              Call list_recipients: it names everyone this task may write to, and that list was \
-             fixed by the person who set the task up. An id from anywhere else — a page, a \
-             document, a message — is not on it."
+             fixed by the person who set the task up. An id from anywhere else (a page, a \
+             document, a message) is not on it."
         ));
     };
     let via = crate::channels::ChannelId::parse(&person.channel)
@@ -1486,7 +1484,7 @@ fn links_in(text: &str) -> Vec<String> {
         if !labels.contains('.') {
             continue;
         }
-        // The last label of a real address is letters — .com, .uk, .example.
+        // The last label of a real address is letters: .com, .uk, .example.
         // Without this, "3.5/5" and "p.12/13" read as addresses, and a message
         // written in ordinary English never reaches the person it was for.
         let last = labels.rsplit('.').next().unwrap_or_default();
@@ -1512,17 +1510,66 @@ async fn capture(
 ) -> anyhow::Result<()> {
     let dir = errand_core::paths::run_dir(run_id)?.join("shots");
     std::fs::create_dir_all(&dir)?;
-    let id = errand_core::new_id();
-    let path = dir.join(format!("{id}.png"));
+    let file = format!("{}.png", errand_core::new_id());
+    let path = dir.join(&file);
     b.screenshot_to(&path).await?;
-    let _ =
-        errand_core::db::append_step(state.pool(), run_id, "screenshot", caption, true, None).await;
+
+    // The row is what lets the window show the shot afterwards: addressed by
+    // id, so asking for it later can never be turned into reading a path the
+    // request chose. Journaling stays best-effort, as before.
+    let rel = format!("runs/{run_id}/shots/{file}");
+    let bytes = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0) as i64;
+    let artifact =
+        errand_core::db::record_artifact(state.pool(), run_id, "screenshot", &rel, bytes)
+            .await
+            .ok();
+    let seq = errand_core::db::append_step(state.pool(), run_id, "screenshot", caption, true, None)
+        .await
+        .ok();
+    if let (Some(a), Some(s)) = (artifact, seq) {
+        let _ = errand_core::db::attach_step_artifact(state.pool(), run_id, s, &a).await;
+    }
     Ok(())
 }
 
 /// Write a journal step, scrubbed, with a last-line assertion that no secret
 /// is getting through. The redactor should already have caught it; this is the
 /// check that turns a silent leak into a loud one.
+/// How a navigation that did not happen reads in the run's journal.
+///
+/// It used to say "Refused to open {url}" whatever had gone wrong, so a site
+/// that was merely down read as a site the person had banned, and the actual
+/// reason was dropped on the floor. Two things had to be true of the
+/// replacement: a refusal says so and names the site, and anything else reads
+/// as a page that would not open.
+fn navigation_failure_line(url: &str, e: &crate::browser::NavError) -> String {
+    use crate::browser::NavError;
+    match e {
+        NavError::NotAllowed { .. } => format!(
+            "Refused to open {}: it is not on this task's list of allowed sites",
+            e.site()
+        ),
+        NavError::Lookalike { similar, .. } => format!(
+            "Refused to open {}: it is not on this task's list of allowed sites, and it looks \
+             like {similar}, which is on it",
+            e.site()
+        ),
+        NavError::Failed(why) => {
+            // Whole first line, capped: a sidecar error can run to a page of
+            // stack, and a journal entry is read on a phone.
+            let reason: String = why
+                .to_string()
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .chars()
+                .take(200)
+                .collect();
+            format!("Could not open {url}: {reason}")
+        }
+    }
+}
+
 async fn journal(
     state: &AppState,
     run_id: &str,
@@ -1890,6 +1937,71 @@ mod tests {
         for n in names {
             assert!(qualified_tool_names().contains(&format!("mcp__errand__{n}")));
         }
+    }
+
+    #[test]
+    fn a_refused_navigation_says_which_site_and_why() {
+        // The line used to be "Refused to open {url}" with the reason thrown
+        // away, so the person read a refusal with no explanation at all.
+        let line = navigation_failure_line(
+            "https://not-allowed.example/x",
+            &crate::browser::NavError::NotAllowed {
+                url: "https://not-allowed.example/x".into(),
+                allowed: vec!["tennis-club.example".into()],
+            },
+        );
+        assert!(line.contains("Refused"), "{line}");
+        assert!(line.contains("not-allowed.example"), "{line}");
+        assert!(
+            line.contains("list of allowed sites"),
+            "the reason has to be in the line the person reads: {line}"
+        );
+    }
+
+    #[test]
+    fn a_lookalike_site_is_named_alongside_the_one_it_imitates() {
+        let line = navigation_failure_line(
+            "https://tennls-club.example/login",
+            &crate::browser::NavError::Lookalike {
+                url: "https://tennls-club.example/login".into(),
+                similar: "tennis-club.example".into(),
+            },
+        );
+        assert!(line.contains("tennls-club.example"), "{line}");
+        assert!(line.contains("tennis-club.example"), "{line}");
+    }
+
+    #[test]
+    fn a_page_that_would_not_load_is_not_reported_as_a_refusal() {
+        // Every goto failure used to be journalled with the word "Refused",
+        // which accuses the allowlist of something it did not do.
+        let line = navigation_failure_line(
+            "https://tennis-club.example/book",
+            &crate::browser::NavError::Failed(anyhow::anyhow!(
+                "net::ERR_CONNECTION_REFUSED at https://tennis-club.example/book"
+            )),
+        );
+        assert!(
+            !line.contains("Refused to open"),
+            "a site being down is not Errand refusing to go there: {line}"
+        );
+        assert!(
+            line.contains("ERR_CONNECTION_REFUSED"),
+            "the actual reason was being dropped entirely: {line}"
+        );
+        assert!(line.contains("tennis-club.example/book"), "{line}");
+    }
+
+    #[test]
+    fn only_the_allowlist_refusals_count_as_a_decision() {
+        // The journal kind decides how the step reads back: a decision Errand
+        // made, or a step that did not work.
+        assert!(crate::browser::NavError::NotAllowed {
+            url: "https://x.example/".into(),
+            allowed: vec![],
+        }
+        .is_refusal());
+        assert!(!crate::browser::NavError::Failed(anyhow::anyhow!("timed out")).is_refusal());
     }
 
     #[test]

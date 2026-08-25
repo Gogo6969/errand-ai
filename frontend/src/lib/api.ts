@@ -22,6 +22,8 @@ export interface Task {
   schedule?: unknown;
   notify?: Record<string, boolean>;
   limits?: Record<string, number>;
+  /** Armed irreversible actions waiting on a person to say what happened. */
+  open_holds?: number;
   /** The engine's own words for the schedule. Never interpreted in the browser. */
   schedule_describes?: string;
   schedule_preview?: string[];
@@ -53,6 +55,8 @@ export interface Step {
   kind: string;
   title: string;
   ok: boolean;
+  /** Set on steps that left a file behind, such as a screenshot. */
+  artifact_id?: string | null;
 }
 
 export interface Health {
@@ -64,10 +68,27 @@ export interface Health {
 }
 
 export interface ChannelHealth {
+  /** The internal id, e.g. "imessage". For URLs and settings keys, never for reading. */
   channel: string;
+  /** What a person calls it: "Apple Messages". This is what goes on screen. */
+  display_name: string;
   status: string;
   detail: string;
   fix?: string;
+  /** Where Errand reaches you on this channel, or null while nobody has said. */
+  self_address?: string | null;
+}
+
+/**
+ * The name to put on screen for a channel.
+ *
+ * The daemon sends display_name, but the window and the daemon are updated
+ * separately, and an older daemon sending nothing would put the word "undefined"
+ * where the channel's name belongs. Falling back to the id at least says
+ * something true.
+ */
+export function channelName(c: { channel: string; display_name?: string }): string {
+  return c.display_name || c.channel.replace(/_/g, " ");
 }
 
 /** An error the daemon reported, with its plain-language detail. */
@@ -127,8 +148,8 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
 /**
  * Follow a run as it happens.
  *
- * The page cannot open the daemon's event stream itself — that would mean
- * holding the API token in JavaScript — so Rust holds it and pushes each event
+ * The page cannot open the daemon's event stream itself, since that would mean
+ * holding the API token in JavaScript, so Rust holds it and pushes each event
  * down a channel. Returns a function that stops listening.
  */
 export function followRun(runId: string, onEvent: (e: { event: string; data: unknown }) => void) {
@@ -143,6 +164,16 @@ export function followRun(runId: string, onEvent: (e: { event: string; data: unk
     // The stream ending is normal: the run finished, or the window moved on.
   });
   return () => { stopped = true; };
+}
+
+/**
+ * One screenshot a run took, as a data URL.
+ *
+ * Images are bytes, so they cannot ride the ordinary call path; Rust fetches
+ * them and hands back a data URL, and the token never leaves Rust to do it.
+ */
+export async function artifactUrl(id: string): Promise<string> {
+  return invoke<string>("artifact", { id });
 }
 
 export const api = {
@@ -177,7 +208,8 @@ export const api = {
   deleteCredential: (id: string) => call("DELETE", `/v1/credentials/${id}`),
 
   channels: () => call<{ channels: ChannelHealth[]; notes: Record<string, string> }>("GET", "/v1/channels"),
-  testChannel: (c: string) => call("POST", `/v1/channels/${c}/test`),
+  testChannel: (c: string) =>
+    call<{ queued: string; sent_to: string; note: string }>("POST", `/v1/channels/${c}/test`),
   enableChannel: (c: string) => call<ChannelHealth>("POST", `/v1/channels/${c}/enable`),
   configureChannel: (
     c: string,
@@ -261,7 +293,7 @@ export interface ScanResult {
   looked_at: string;
   addresses: number;
   ports: number;
-  /** Answered, but not usable as it stands — with the reason. */
+  /** Answered, but not usable as it stands, with the reason. */
   also_seen: { url: string; why: string }[];
   /** Set when macOS refused the local network, so an empty result means nothing. */
   blocked?: string | null;
@@ -340,6 +372,14 @@ export function statusLabel(s: string): string {
       healing: "Trying a different way",
       skipped: "Skipped",
       cancelled: "Cancelled",
+      // Run states the engine can reach but rarely does. Unmapped they would
+      // reach the screen as their own internal names, which is how somebody
+      // ends up reading the word "preflight" on a task page.
+      armed: "Ready to start",
+      preflight: "Getting ready",
+      holding: "Waiting on you",
+      waiting_input: "Waiting on you",
+      takeover: "Needs you at the keyboard",
     }[s] ?? s
   );
 }

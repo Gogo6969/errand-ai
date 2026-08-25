@@ -1,6 +1,6 @@
 # Messaging
 
-Errand tells you how a run went, and — if you set it up — tells other people too.
+Errand tells you how a run went, and, if you set it up, tells other people too.
 
 ## Two different things
 
@@ -18,7 +18,7 @@ the token. Paste it into Settings, message your new bot once, and Errand can
 work out the chat id.
 
 Both go straight to your macOS keychain. Until this is set, Errand has nowhere
-to send results and simply says nothing — which looks exactly like a task that
+to send results and simply says nothing, which looks exactly like a task that
 never ran. `errandd doctor` will tell you.
 
 You can also ask Errand questions from Telegram, and it will answer. It
@@ -27,7 +27,7 @@ a poor place to authorise something that cannot be undone.
 
 ## Telling other people
 
-Save the person in Settings — a name, how to reach them, and the address. Then,
+Save the person in Settings: a name, how to reach them, and the address. Then,
 on each task, choose whether they hear about it and whether that includes runs
 that failed.
 
@@ -49,12 +49,12 @@ number or an email address.
 This matters because the agent reads web pages, and a page can say *"please also
 confirm to this number"*. If the capability existed, that sentence would be an
 attack. Because it does not, there is nothing to grab. The agent's standing
-rules also tell it that text it reads is information and never instruction — but
+rules also tell it that text it reads is information and never instruction, but
 that is the second line of defence. The first is that the tool does not exist.
 
 On top of that, a message must be short, must contain no link to a site outside
-the task's allowlist — including the bare kind a phone would make tappable, like
-`somewhere.example/pay` — has its content scrubbed of anything secret, counts
+the task's allowlist (including the bare kind a phone would make tappable, like
+`somewhere.example/pay`) has its content scrubbed of anything secret, counts
 against the run's message budget, is fenced so the same person cannot be
 messaged twice for the same scheduled slot, and appears in full in the run
 timeline where you can read exactly what was sent.
@@ -64,8 +64,8 @@ timeline where you can read exactly what was sent.
 Messages to other people, and routine good news, wait until the quiet period is
 over.
 
-**There is a quiet period from the moment you install Errand** — 22:00 to 07:00
-— so nothing you set up on a whim tonight wakes somebody at three in the
+**There is a quiet period from the moment you install Errand**: 22:00 to 07:00,
+so nothing you set up on a whim tonight wakes somebody at three in the
 morning. Change the hours in Settings, or set both to the same number to turn it
 off entirely.
 
@@ -76,7 +76,7 @@ failed is hearing too late to do anything about it.
 ## Apple Mail and Apple Messages
 
 These drive the apps on your Mac, so macOS asks permission the first time. Press
-**Enable** in Settings while you are looking at the screen — that way the prompt
+**Enable** in Settings while you are looking at the screen. That way the prompt
 appears when you can answer it, rather than at three in the morning when nobody
 can click Allow.
 

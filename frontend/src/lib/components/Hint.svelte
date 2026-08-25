@@ -7,15 +7,14 @@
    * the accessible description, so a screen reader and a mouse get the same
    * answer rather than two different ones.
    */
-  import { hints, type HintId } from "$lib/hints";
+  import { hints, type HintId, type Hint as HintText } from "$lib/hints";
   let { id, children }: { id: HintId; children: any } = $props();
-  const h = hints[id];
-  let open = $state(false);
+  const h: HintText = $derived(hints[id]);
 </script>
 
-<span class="hint" onmouseenter={() => (open = true)} onmouseleave={() => (open = false)}>
+<span class="hint">
   <span aria-describedby={`hint-${id}`}>{@render children()}</span>
-  <span id={`hint-${id}`} class="bubble" class:open role="tooltip">
+  <span id={`hint-${id}`} class="bubble" role="tooltip">
     {h.short}
     {#if h.long}<span class="more">{h.long}</span>{/if}
   </span>
@@ -33,6 +32,9 @@
     opacity: 0; visibility: hidden; transition: opacity .12s;
     pointer-events: none; text-align: left; font-weight: 400;
   }
-  .bubble.open { opacity: 1; visibility: visible; }
+  /* Mouse and keyboard alike: the wrapped control is what gets hovered or
+     focused, so the bubble opens on either and needs no script. */
+  .hint:hover .bubble,
+  .hint:focus-within .bubble { opacity: 1; visibility: visible; }
   .more { display: block; margin-top: 6px; color: var(--ink-soft); }
 </style>

@@ -3,7 +3,7 @@
 
   This is the setting that decides whether a task can do anything at all, and
   the one most likely to be typed slightly wrong. A site is stored as a bare
-  host, subdomains are included automatically, and there are no wildcards — so
+  host, subdomains are included automatically, and there are no wildcards, so
   "*.example.com" looks reasonable, saves happily, and matches nothing. The
   daemon refuses those with an explanation; this screen shows the explanation
   next to the box rather than as a failure ten seconds later.

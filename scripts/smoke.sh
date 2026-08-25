@@ -161,7 +161,7 @@ expect "and the next run it promises is in the future" \
 head2 "Editing a schedule does not quietly delete the parts the form cannot show"
 # The schedule editor builds a spec from five fields. A booking window and a
 # catch-up grace can only be set through the API, so a save from the form must
-# carry them across rather than dropping them — a task that armed five minutes
+# carry them across rather than dropping them: a task that armed five minutes
 # early would otherwise stop doing so with nothing said.
 
 api PATCH "/v1/tasks/$TID" '{"schedule":{"kind":"cron","expr":"0 0 8 * * MON","tz":"UTC","catch_up_grace_min":1440,"window":{"not_before":"08:00","not_after":"09:00","arm_early_s":300}}}' >/dev/null

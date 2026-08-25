@@ -44,12 +44,21 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/runs", get(list_runs))
         .route("/v1/runs/{id}", get(get_run))
         .route("/v1/runs/{id}/stream", get(super::sse::run_stream))
+        .route("/v1/artifacts/{id}", get(get_artifact_file))
         .route("/v1/events", get(super::sse::global_stream))
         .route(
             "/v1/credentials",
             get(list_credentials).post(create_credential),
         )
         .route("/v1/credentials/{id}", delete(delete_credential))
+        .route(
+            "/v1/tasks/{id}/credentials",
+            get(list_task_credentials).post(grant_credential),
+        )
+        .route(
+            "/v1/tasks/{id}/credentials/{credential_id}",
+            delete(revoke_credential),
+        )
         .route(
             "/v1/recipients",
             get(list_recipients).post(create_recipient),
@@ -105,8 +114,8 @@ async fn health_detail(State(state): State<AppState>) -> ApiResult<Json<serde_js
 
 /// How many upcoming runs to show alongside a schedule.
 ///
-/// Enough to see the pattern — three mornings in a row, or the same day next
-/// week — without turning a task page into a diary.
+/// Enough to see the pattern (three mornings in a row, or the same day next
+/// week) without turning a task page into a diary.
 const PREVIEW_COUNT: usize = 3;
 
 /// Said in one place, because two gates enforce this one rule.
@@ -127,8 +136,11 @@ const NOT_TAUGHT: &str =
 /// disagree with the engine, and the disagreement only shows up on the morning
 /// nothing happens. Both of these come from the code that will actually fire
 /// the task, so they cannot drift from it.
-fn task_json(task: &errand_core::models::Task) -> serde_json::Value {
+fn task_json(task: &errand_core::models::Task, open_holds: i64) -> serde_json::Value {
     let mut v = serde_json::to_value(task).unwrap_or_else(|_| json!({}));
+    // The number the "needs you" card keys off. It is a count rather than a
+    // sentence because a sentence can be reworded; an armed fence cannot.
+    v["open_holds"] = json!(open_holds);
     let (describes, preview) = match errand_core::schedule::ScheduleSpec::from_json(&task.schedule)
     {
         Ok(spec) => (
@@ -181,7 +193,13 @@ async fn list_tasks(
     let tasks = errand_core::db::list_tasks(state.pool(), q.include_archived)
         .await
         .map_err(ApiError::from)?;
-    let items: Vec<serde_json::Value> = tasks.iter().map(task_json).collect();
+    let holds = errand_core::db::open_hold_counts(state.pool())
+        .await
+        .map_err(ApiError::from)?;
+    let items: Vec<serde_json::Value> = tasks
+        .iter()
+        .map(|t| task_json(t, *holds.get(&t.id).unwrap_or(&0)))
+        .collect();
     Ok(Json(json!({ "items": items })))
 }
 
@@ -191,11 +209,14 @@ async fn get_task(
     Path(id): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require(&caller, Scope::Read)?;
-    errand_core::db::get_task(state.pool(), &id)
+    let task = errand_core::db::get_task(state.pool(), &id)
         .await
         .map_err(ApiError::from)?
-        .map(|t| Json(task_json(&t)))
-        .ok_or_else(|| ApiError::not_found(format!("No task with id {id}.")))
+        .ok_or_else(|| ApiError::not_found(format!("No task with id {id}.")))?;
+    let holds = errand_core::db::count_open_holds(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(task_json(&task, holds)))
 }
 
 #[derive(Deserialize)]
@@ -278,7 +299,10 @@ async fn create_task(
     state.emit(Event::TaskUpdated {
         task_id: task.id.clone(),
     });
-    let mut out = task_json(&task);
+    let holds = errand_core::db::count_open_holds(state.pool(), &task.id)
+        .await
+        .map_err(ApiError::from)?;
+    let mut out = task_json(&task, holds);
     out["warnings"] = json!(warnings);
     Ok(Json(out))
 }
@@ -374,7 +398,7 @@ async fn patch_task(
         .is_some_and(|d| d.trim().is_empty())
     {
         return Err(ApiError::bad_request(
-            "A task needs a description — it is what the agent actually reads — so nothing was \
+            "A task needs a description: it is what the agent actually reads, so nothing was \
              changed. Leave the description out of the change to keep the one it has.",
         ));
     }
@@ -456,7 +480,10 @@ async fn patch_task(
         task_id: id.clone(),
     });
 
-    let out = json!({ "task": task_json(&updated), "warnings": warnings });
+    let holds = errand_core::db::count_open_holds(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?;
+    let out = json!({ "task": task_json(&updated, holds), "warnings": warnings });
     if let Some(key) = idem {
         let _ = errand_core::db::remember_idempotent(
             state.pool(),
@@ -545,7 +572,7 @@ async fn repeat_risk(
         return Ok(Some(format!(
             "This task already carried out a {what} at {at}: {}. The new schedule's first run, at \
              {}, comes round sooner than the old one would have, and Errand knows what it has \
-             already done by the exact time the run was due — so that run would look like fresh \
+             already done by the exact time the run was due, so that run would look like fresh \
              work and could do the {kind} a second time. Nothing has been changed. Check the site \
              first if that would matter, then confirm if you still want the change.",
             evidence.unwrap_or_else(|| "no details were recorded".into()),
@@ -655,7 +682,7 @@ async fn activate_task(
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
     // The moment the run would actually begin, not the bare occurrence. The
     // sweep stores the started instant, so storing the occurrence here made the
-    // countdown jump the first time the scheduler ticked — by up to the whole
+    // countdown jump the first time the scheduler ticked, by up to the whole
     // jitter, on a screen whose entire job is to say when this will happen.
     let next = spec
         .next_after(chrono::Utc::now())
@@ -786,7 +813,19 @@ async fn configure_channel(
 /// It used to take any key at all, which meant a key spelled slightly wrong was
 /// stored happily, read by nothing, and the person believed they had changed
 /// something they had not.
-const ALLOWED_SETTINGS: &[&str] = &["messaging.quiet", "messaging.whatsapp.base_url"];
+///
+/// The four `messaging.self.*` keys hold your own address on each channel, which
+/// is where a test message goes and the only place it can go. They are spelled
+/// out rather than built, because a const cannot call a function; the test named
+/// after this keeps them the same as the key the test button reads.
+const ALLOWED_SETTINGS: &[&str] = &[
+    "messaging.quiet",
+    "messaging.whatsapp.base_url",
+    "messaging.self.telegram",
+    "messaging.self.whatsapp",
+    "messaging.self.apple_mail",
+    "messaging.self.imessage",
+];
 
 /// The word the outbox actually looks for when deciding whether bad news wakes
 /// you up. See `quiet_hours` in runner/src/outbox.rs: anything else is stored,
@@ -812,6 +851,8 @@ fn check_setting(
         check_quiet_hours(value)
     } else if key == crate::channels::whatsapp::SETTING_BASE_URL {
         Ok((check_gateway_url(value)?, None))
+    } else if let Some(id) = self_address_channel(key) {
+        Ok((check_self_address(id, value)?, None))
     } else {
         Err(format!(
             "'{key}' is not a setting Errand keeps, so nothing has been saved. The ones it does \
@@ -843,7 +884,7 @@ fn check_quiet_hours(v: &serde_json::Value) -> Result<(serde_json::Value, Option
         let raw = obj.get(name).ok_or_else(|| {
             format!(
                 "Quiet hours need a '{name}' hour, so nothing has been saved. Give both, as \
-                 whole hours of the day from 0 to 23 — 22 and 7 for an ordinary night."
+                 whole hours of the day from 0 to 23, such as 22 and 7 for an ordinary night."
             )
         })?;
         let n = raw.as_u64().ok_or_else(|| {
@@ -940,6 +981,61 @@ fn check_gateway_url(v: &serde_json::Value) -> Result<serde_json::Value, String>
         ));
     }
     Ok(json!(trimmed))
+}
+
+/// Which channel a key holds your own address for, if it holds one at all.
+fn self_address_channel(key: &str) -> Option<crate::channels::ChannelId> {
+    crate::channels::ChannelId::parse(key.strip_prefix("messaging.self.")?)
+}
+
+/// Your own address on one channel: the only place a test message can go.
+///
+/// Checked as it is typed, for the same reason a contact's address is. A wrong
+/// one costs ten seconds now; found at send time it costs the test, and the
+/// person is left believing the channel itself is broken.
+fn check_self_address(
+    id: crate::channels::ChannelId,
+    v: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let name = id.display_name();
+    let Some(raw) = v.as_str() else {
+        return Err(format!(
+            "Your own {name} address has to be the address itself, as text. {} Nothing has been \
+             saved.",
+            self_address_shape(id)
+        ));
+    };
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(format!(
+            "Your own {name} address is empty, so a test would have nowhere to go. {} Nothing has \
+             been saved.",
+            self_address_shape(id)
+        ));
+    }
+    check_address(id.as_str(), trimmed)?;
+    Ok(json!(trimmed))
+}
+
+/// What the right answer looks like, said in one place because two people meet
+/// it: whoever types a bad one, and whoever presses Send test having typed none.
+fn self_address_shape(id: crate::channels::ChannelId) -> &'static str {
+    match id {
+        crate::channels::ChannelId::Telegram => {
+            "It is your chat id with the bot: a number such as 123456789. Send the bot a message \
+             once and it will tell you the id."
+        }
+        crate::channels::ChannelId::Whatsapp => {
+            "It is your own phone number, with its country code, like +1 555 0100."
+        }
+        crate::channels::ChannelId::AppleMail => {
+            "It is an email address you read, like you@example.com."
+        }
+        crate::channels::ChannelId::Imessage => {
+            "It is your own phone number with its country code, like +1 555 0100, or the email \
+             address your Apple ID uses."
+        }
+    }
 }
 
 /// Every setting a person can change, and what it is set to now.
@@ -1104,6 +1200,89 @@ struct GrantRecipient {
     on_failure: bool,
 }
 
+/// Which logins this task may use.
+async fn list_task_credentials(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    let mut creds = errand_core::db::credentials_for_task(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?;
+    // Usernames are a map of which accounts exist on which sites, so they follow
+    // the same rule as the full list: admin only.
+    if !caller.has(Scope::Admin) {
+        for c in &mut creds {
+            c.username = None;
+        }
+    }
+    Ok(Json(json!({ "items": creds })))
+}
+
+#[derive(Deserialize)]
+struct GrantCredential {
+    credential_id: String,
+}
+
+/// Let one task use one saved login.
+///
+/// Approve rather than Manage, for the same reason granting a recipient is:
+/// this decides whether an unattended agent may sign in as you somewhere. Until
+/// it is granted the agent cannot see the login at all, which is why saving a
+/// login on its own does nothing: a credential is stored once and then handed
+/// to tasks one at a time.
+async fn grant_credential(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(body): Json<GrantCredential>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Approve)?;
+
+    errand_core::db::get_task(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found(format!("No task with id {id}.")))?;
+
+    let known = errand_core::db::list_credentials(state.pool())
+        .await
+        .map_err(ApiError::from)?;
+    let Some(cred) = known.into_iter().find(|c| c.id == body.credential_id) else {
+        return Err(ApiError::not_found("There is no such saved login."));
+    };
+
+    errand_core::db::link_task_credential(state.pool(), &id, &body.credential_id)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(json!({
+        "granted": true,
+        "label": cred.label,
+        "domain": cred.domain,
+        "note": format!(
+            "This task may now sign in with '{}', and only on {}. It still cannot see the secret \
+             itself: it asks for it to be typed into the page.",
+            cred.label, cred.domain
+        ),
+    })))
+}
+
+async fn revoke_credential(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path((id, credential_id)): Path<(String, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    let gone = errand_core::db::unlink_task_credential(state.pool(), &id, &credential_id)
+        .await
+        .map_err(ApiError::from)?;
+    if !gone {
+        return Err(ApiError::not_found("That task was not using that login."));
+    }
+    Ok(Json(json!({ "revoked": true })))
+}
+
 async fn grant_recipient(
     State(state): State<AppState>,
     Extension(caller): Extension<Caller>,
@@ -1138,7 +1317,7 @@ async fn grant_recipient(
     if !body.on_success && !body.on_failure {
         return Err(ApiError::bad_request(
             "This would let the task contact them about nothing at all. Choose whether they hear \
-             when it works, when it fails, or both — or remove them from the task instead.",
+             when it works, when it fails, or both, or remove them from the task instead.",
         ));
     }
 
@@ -1236,7 +1415,7 @@ fn check_address(channel: &str, address: &str) -> Result<(), String> {
                 "'{a}' is not a Telegram chat id. A chat id is a number, sometimes starting with \
                  a minus sign for a group, such as 123456789; a channel can also be written as \
                  @itsname. A phone number will not work, because Telegram does not let a bot \
-                 start a conversation from one — message the bot once and it will tell you the id."
+                 start a conversation from one: message the bot once and it will tell you the id."
             )
         }),
         other => Err(format!(
@@ -1516,22 +1695,30 @@ async fn test_channel(
         )));
     };
 
-    // Only ever to you. A test that could message someone else would be a
-    // convenient way to make Errand send anything to anyone.
-    let recipient = match id {
-        crate::channels::ChannelId::Telegram => {
-            crate::channels::telegram::configured_chat_id().await
-        }
-        _ => None,
-    };
+    // Only ever to you, and only ever to the address you saved for yourself.
+    // Nothing here reads the request body: a test that could name a recipient
+    // would be a convenient way to make Errand send anything to anyone.
+    let mut recipient = crate::channels::self_address(state.pool(), id).await;
+    if recipient.is_none() && id == crate::channels::ChannelId::Telegram {
+        // Anyone with Telegram already working set a chat id long before this
+        // box existed, and should not have to type the same thing twice.
+        recipient = crate::channels::telegram::configured_chat_id().await;
+    }
     let Some(recipient) = recipient else {
+        let name = id.display_name();
         return Err(ApiError::conflict(
             "no_self_recipient",
-            "A test only ever goes to you, and Errand does not know where that is for this \
-             channel yet. Set your own address for it first.",
+            format!(
+                "A test only ever goes to you, and Errand does not know your own {name} address \
+                 yet. Fill in your own address for {name} on the settings screen, which is the \
+                 setting {key}, then press Send test again. {shape}",
+                key = crate::channels::self_address_key(id),
+                shape = self_address_shape(id),
+            ),
         ));
     };
 
+    let recipient_shown = recipient.clone();
     let queued = errand_core::db::enqueue_message(
         state.pool(),
         errand_core::db::NewMessage {
@@ -1554,14 +1741,21 @@ async fn test_channel(
 
     Ok(Json(json!({
         "queued": queued,
-        "note": "Queued. It goes out within a few seconds; check the channel list afterwards to \
-                 see whether it actually sent."
+        // Said back, and the screen puts it on the button too. A test sends a
+        // real message to a real device: firing one without knowing where it
+        // is going is how somebody messages a number they typed to try the
+        // feature out.
+        "sent_to": recipient_shown,
+        "note": format!(
+            "Queued for {recipient_shown}. It goes out within a few seconds; check this channel \
+             afterwards to see whether it really sent."
+        ),
     })))
 }
 
 /// Ask macOS for Automation permission now, while somebody is watching.
 async fn enable_channel(
-    State(_state): State<AppState>,
+    State(state): State<AppState>,
     Extension(caller): Extension<Caller>,
     Path(channel): Path<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
@@ -1574,7 +1768,10 @@ async fn enable_channel(
     // The prompt has to come from the daemon, because macOS grants Automation
     // to the process that sends the Apple Event. Asking from anywhere else
     // grants it to the wrong thing and the 03:00 run still fails.
-    let health = crate::channels::apple::request_consent(id).await;
+    let mut health = crate::channels::apple::request_consent(id).await;
+    // The screen draws this the same way it draws the channel list, so it needs
+    // the same fields: the name to show, and where a test would go.
+    health.fill_self_address(state.pool()).await;
     Ok(Json(serde_json::to_value(health).unwrap_or(json!({}))))
 }
 
@@ -2049,6 +2246,50 @@ async fn get_run(
     Ok(Json(body))
 }
 
+/// One file a run left behind, such as a screenshot, served by id.
+///
+/// The id is the whole story: the row decides the path, never the request,
+/// and the path then has to prove it sits under the data root before a byte
+/// is read. An artifact id a token cannot see simply does not exist.
+async fn get_artifact_file(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<axum::response::Response> {
+    use axum::response::IntoResponse;
+
+    require(&caller, Scope::Read)?;
+    let artifact = errand_core::db::get_artifact(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("No artifact with that id."))?;
+
+    let root = errand_core::paths::data_root().map_err(ApiError::from)?;
+    let canon_root =
+        std::fs::canonicalize(&root).map_err(|e| ApiError::from(anyhow::anyhow!(e)))?;
+    let canon = std::fs::canonicalize(root.join(&artifact.rel_path))
+        .map_err(|_| ApiError::not_found("That artifact's file is no longer there."))?;
+    if !canon.starts_with(&canon_root) {
+        return Err(ApiError::not_found("No artifact with that id."));
+    }
+
+    let bytes = tokio::fs::read(&canon)
+        .await
+        .map_err(|_| ApiError::not_found("That artifact's file is no longer there."))?;
+    let mime = match artifact.kind.as_str() {
+        "screenshot" => "image/png",
+        _ => "application/octet-stream",
+    };
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, mime),
+            (axum::http::header::CACHE_CONTROL, "private, max-age=3600"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
 // ------------------------------------------------------------- credentials --
 
 async fn list_credentials(
@@ -2182,8 +2423,8 @@ async fn quiesce(
 // ---------------------------------------------------------------------- ai --
 //
 // Which AI does the work is a question the app has to be able to answer out
-// loud, so all of it — what is configured, what is reachable, and what each job
-// would actually use right now — comes back from one call.
+// loud, so all of it (what is configured, what is reachable, and what each job
+// would actually use right now) comes back from one call.
 
 async fn get_ai(
     State(state): State<AppState>,
@@ -2560,7 +2801,7 @@ async fn set_local_only(
         if !providers.iter().any(|p| p.enabled && p.is_local()) {
             return Err(ApiError::bad_request(
                 "There is no model on this machine for Errand to use, so turning this on would \
-                 stop everything. Add one first — Find models on this machine will look.",
+                 stop everything. Add one first: Find models on this machine will look.",
             ));
         }
     }
@@ -3319,6 +3560,159 @@ mod tests {
             api.get("/v1/settings").await["messaging.whatsapp.base_url"],
             "http://localhost:3000"
         );
+    }
+
+    // ------------------------------------------- where a test message goes --
+
+    #[test]
+    fn the_key_the_settings_screen_writes_is_the_key_the_test_button_reads() {
+        // Spelled out in one place and built in the other, so this is the only
+        // thing keeping them the same. If they drifted, the box would fill in
+        // and Send test would still say it does not know where to send.
+        for id in [
+            crate::channels::ChannelId::Telegram,
+            crate::channels::ChannelId::Whatsapp,
+            crate::channels::ChannelId::AppleMail,
+            crate::channels::ChannelId::Imessage,
+        ] {
+            let key = crate::channels::self_address_key(id);
+            assert!(
+                super::ALLOWED_SETTINGS.contains(&key.as_str()),
+                "{key} is read by the test button but the settings route would refuse to save it"
+            );
+            assert_eq!(super::self_address_channel(&key), Some(id));
+        }
+        assert_eq!(super::self_address_channel("messaging.self.fax"), None);
+        assert_eq!(super::self_address_channel("messaging.quiet"), None);
+    }
+
+    #[tokio::test]
+    async fn send_test_works_on_a_channel_once_you_have_said_where_you_are() {
+        // The defect: the recipient was None for everything except Telegram, so
+        // the button could never work and there was nowhere to set an address.
+        let api = testkit::start().await;
+
+        let (code, body) = api.post("/v1/channels/imessage/test", json!({})).await;
+        assert_eq!(code, 409, "{body}");
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("Apple Messages"),
+            "the refusal must name the channel: {detail}"
+        );
+        assert!(
+            detail.contains("messaging.self.imessage"),
+            "and say exactly which box to fill in: {detail}"
+        );
+        assert!(
+            detail.contains("+1 555 0100"),
+            "and what the right answer looks like: {detail}"
+        );
+
+        let (code, body) = api
+            .post(
+                "/v1/channels/imessage/config",
+                json!({ "settings": { "messaging.self.imessage": " +1 555 0100 " } }),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(
+            api.get("/v1/settings").await["messaging.self.imessage"],
+            "+1 555 0100",
+            "saved tidied, the way a recipient is"
+        );
+
+        let (code, body) = api.post("/v1/channels/imessage/test", json!({})).await;
+        assert_eq!(code, 200, "the button must now work: {body}");
+
+        // And the screen can say so, in words a person recognises.
+        let listed = api.get("/v1/channels").await;
+        let shown = listed["channels"]
+            .as_array()
+            .expect("a channel list")
+            .iter()
+            .find(|c| c["channel"] == "imessage")
+            .expect("Apple Messages is one of them")
+            .clone();
+        assert_eq!(
+            shown["display_name"], "Apple Messages",
+            "the screen showed 'imessage', which is our word for it and nobody else's: {shown}"
+        );
+        assert_eq!(shown["self_address"], "+1 555 0100");
+
+        // And the message that was queued is addressed to that person, not to
+        // anything the caller sent.
+        let queued = errand_core::db::due_outbox(&api.pool, 10)
+            .await
+            .expect("reading the outbox");
+        let test = queued
+            .iter()
+            .find(|m| m.channel == "imessage")
+            .expect("a queued test message");
+        assert_eq!(test.recipient, "+1 555 0100");
+    }
+
+    #[tokio::test]
+    async fn a_test_never_goes_anywhere_the_request_asks_it_to() {
+        // A test that could name a recipient would be a way to make Errand send
+        // anything to anyone, so the body is ignored entirely.
+        let api = testkit::start().await;
+        let (code, body) = api
+            .post(
+                "/v1/channels/apple_mail/config",
+                json!({ "settings": { "messaging.self.apple_mail": "me@example.com" } }),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+
+        let (code, body) = api
+            .post(
+                "/v1/channels/apple_mail/test",
+                json!({ "recipient": "stranger@example.com", "to": "stranger@example.com" }),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+
+        let queued = errand_core::db::due_outbox(&api.pool, 10)
+            .await
+            .expect("reading the outbox");
+        let test = queued
+            .iter()
+            .find(|m| m.channel == "apple_mail")
+            .expect("a queued test message");
+        assert_eq!(test.recipient, "me@example.com");
+    }
+
+    #[tokio::test]
+    async fn an_address_of_the_wrong_shape_is_refused_with_the_right_shape() {
+        let api = testkit::start().await;
+        for (channel, bad, expect) in [
+            ("apple_mail", "0123456789", "someone@example.com"),
+            ("imessage", "not an address", "+1 555 0100"),
+            ("telegram", "+1 555 0100", "123456789"),
+        ] {
+            let key = format!("messaging.self.{channel}");
+            let mut settings = serde_json::Map::new();
+            settings.insert(key.clone(), json!(bad));
+            let (code, body) = api
+                .post(
+                    &format!("/v1/channels/{channel}/config"),
+                    json!({ "settings": settings }),
+                )
+                .await;
+            assert_eq!(code, 400, "{channel}: {body}");
+            let detail = body["detail"].as_str().unwrap_or_default();
+            assert!(
+                detail.contains(expect),
+                "{channel} must say what the right shape looks like: {detail}"
+            );
+            assert!(
+                errand_core::db::get_setting(&api.pool, &key)
+                    .await
+                    .expect("reading it back")
+                    .is_none(),
+                "a refused address must not be saved anyway"
+            );
+        }
     }
 
     #[tokio::test]

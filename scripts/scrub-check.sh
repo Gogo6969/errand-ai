@@ -105,6 +105,15 @@ else
   note "gitleaks not installed locally; CI runs it on every push"
 fi
 
+# --- 7. Em dashes -------------------------------------------------------------
+# SPEC-M1 is absolute: no em dashes in any file, code comment, doc, or UI
+# string. Ever. It went unchecked for months and 140 of them accumulated, which
+# is exactly how a rule nobody checks stops being true.
+if hits=$(echo "$FILES" | xargs grep -nI $'\u2014' 2>/dev/null); then
+  problem "em dash found. The rule is none, anywhere, ever:"
+  echo "$hits" | head -10 | sed 's/^/        /'
+fi
+
 echo
 if [ "$fail" -eq 0 ]; then
   echo "Scrub check passed."

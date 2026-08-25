@@ -6,10 +6,10 @@ Start here:
 errandd doctor
 ```
 
-It checks everything that has to be true for a task to run — the data
+It checks everything that has to be true for a task to run: the data
 directory, launchd, the database, the keychain, the API token, the port, the
 Claude command line tool, Node, the browser sidecar and which browser would be
-driven — and prints the fix for anything that is not. Every failing line says
+driven, and prints the fix for anything that is not. Every failing line says
 what to do, not just what is broken.
 
 ## The window says the background service is not answering
@@ -39,22 +39,22 @@ the database instead, readable only by you. That is an honest trade rather than
 a convenient one: the key guards a loopback API whose entire database sits in
 the same directory under the same permissions, so anyone who could read the key
 could read the history directly. Site logins and provider keys are the opposite
-case — they unlock things beyond this machine and are read rarely — so those
+case: they unlock things beyond this machine and are read rarely, so those
 stay in the keychain.
 
 **A build you are still compiling never touches the keychain either:**
 
-- A **release** build — the app, and what `scripts/dev-install.sh` installs —
+- A **release** build (the app, and what `scripts/dev-install.sh` installs)
   uses the keychain and is signed with a stable identity. macOS asks once and
   the answer holds.
-- A **debug** build — `cargo run`, `cargo test`, `scripts/smoke.sh` — keeps its
+- A **debug** build (`cargo run`, `cargo test`, `scripts/smoke.sh`) keeps its
   secrets in `dev-secrets.json` beside its own database, readable only by you.
   It never raises a prompt. `errandd doctor` says which of the two is in use.
 
 Override it either way with `ERRAND_KEYCHAIN=on` or `ERRAND_KEYCHAIN=off`.
 
 If you are still being asked, it is an old item nothing reads any more. The
-obsolete API key is safe to remove — note the `-a`, which removes only that one
+obsolete API key is safe to remove. Note the `-a`, which removes only that one
 entry and leaves your Telegram and provider keys alone:
 
 ```bash
@@ -77,13 +77,13 @@ match is one-directional, so `www.example.com` does not cover `example.com`.
 Check the list on the task's page and add the plain form of the site.
 
 If the message names a site that *is* on the list, the page redirected somewhere
-that is not — which is the allowlist doing its job.
+that is not, which is the allowlist doing its job.
 
 ## Nothing happens at the scheduled time
 
 Four things have to be true, in this order:
 
-1. The task is **Armed** — not a draft, not paused.
+1. The task is **Armed**, not a draft, not paused.
 2. It has an **approved plan**. Nothing runs unattended without one.
 3. Its schedule is a real schedule. The task page shows what it means in words
    and the next few run times; if that says "only when you ask", it is manual.
@@ -93,7 +93,7 @@ Four things have to be true, in this order:
 ## No message ever arrives
 
 Errand needs somewhere to send it. Until Telegram has a bot token and a chat id
-in Settings, it has nowhere to send results and says nothing — which looks
+in Settings, it has nowhere to send results and says nothing, which looks
 exactly like a task that never ran. `errandd doctor` reports this.
 
 Messages to *other people* also wait for quiet hours to end. Your own failure
@@ -124,7 +124,7 @@ up from there.
 ## A run cost far more than usual
 
 A run that costs much more than usual is normally stuck rather than busy. Open
-it and read the timeline — a loop is obvious from three lines that repeat. Lower
+it and read the timeline: a loop is obvious from three lines that repeat. Lower
 the step or minute limit on that task, and consider whether the description is
 specific enough about what to do when the obvious path is not there.
 
@@ -135,4 +135,4 @@ specific enough about what to do when the obvious path is not there.
 ```
 
 Secrets are scrubbed before anything is written. If you find one there, that is
-a bug worth reporting — see [SECURITY.md](../SECURITY.md).
+a bug worth reporting; see [SECURITY.md](../SECURITY.md).

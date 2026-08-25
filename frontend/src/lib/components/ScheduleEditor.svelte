@@ -27,7 +27,6 @@
   // Mac actually knows about rather than a list that rots in the source.
   const ZONES: string[] = (() => {
     try {
-      // @ts-expect-error - supportedValuesOf is newer than the DOM types here
       return Intl.supportedValuesOf("timeZone");
     } catch {
       return [Intl.DateTimeFormat().resolvedOptions().timeZone, "UTC"];
@@ -67,7 +66,7 @@
   // express. A booking window and a catch-up grace can be set through the API
   // and this form has no controls for them, so without carrying them across,
   // opening the editor and pressing Save with no change at all would quietly
-  // delete a task's arm-early window — the one thing that has it logged in and
+  // delete a task's arm-early window, the one thing that has it logged in and
   // waiting when a booking opens.
   const carried = {
     ...(value?.window ? { window: value.window } : {}),

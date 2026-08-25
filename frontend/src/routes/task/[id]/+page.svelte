@@ -1,7 +1,7 @@
 <script lang="ts">
-  import { onMount } from "svelte";
+  import { onMount, onDestroy } from "svelte";
   import { page } from "$app/state";
-  import { api, statusLabel, when, ApiError, type Task, type Run, type TaskRecipient, type Recipient } from "$lib/api";
+  import { api, channelName, followRun, statusLabel, when, ApiError, type Task, type Run, type TaskRecipient, type Recipient } from "$lib/api";
   import Hint from "$lib/components/Hint.svelte";
   import ScheduleEditor from "$lib/components/ScheduleEditor.svelte";
   import SitesEditor from "$lib/components/SitesEditor.svelte";
@@ -19,13 +19,98 @@
   let draftSchedule = $state<any>(null);
   let editingSites = $state(false);
   let draftSites = $state<string[]>([]);
+  let editingLimits = $state(false);
+  let draftLimits = $state({ max_steps: 60, max_minutes: 15, max_usd: 0.5, max_messages: 3 });
   let warnings = $state<string[]>([]);
   // A refusal the person can answer. The daemon refuses a schedule change that
   // might repeat something irreversible and says to send it again with an
-  // acknowledgement — so there has to be something to press.
+  // acknowledgement, so there has to be something to press.
   let mustConfirm = $state<{ detail: string; patch: any } | null>(null);
   let people = $state<TaskRecipient[]>([]);
   let everyone = $state<Recipient[]>([]);
+  let channelNames = $state<Record<string, string>>({});
+  const named = (channel: string) => channelNames[channel] ?? channel.replace(/_/g, " ");
+
+  // A run that has stopped. Anything else is still going, which is the thing
+  // somebody standing at this page actually wants to know.
+  const FINISHED = ["succeeded", "failed", "cancelled", "skipped"];
+
+  // How many steps the run in flight has taken. Fetched once, then moved by the
+  // live stream, so a number on screen going up is itself the answer to "is it
+  // doing anything".
+  let liveSteps = $state(0);
+  // Which run is being followed. Deliberately not $state: the effect below reads
+  // it, and a reactive read there would keep waking the effect up.
+  let following: string | null = null;
+  let stopFollow: (() => void) | undefined;
+  let heartbeat: any;
+
+  const newest = $derived(runs[0] ?? null);
+  const liveRun = $derived(newest && !FINISHED.includes(newest.status) ? newest : null);
+  const finishedRun = $derived(newest && FINISHED.includes(newest.status) ? newest : null);
+
+  /**
+   * The status to put at the top of the page.
+   *
+   * The word stored on the task lags the run that is meant to change it, and a
+   * task still saying "Learning" hours after its teaching run failed is the
+   * exact lie this page was rebuilt to stop telling. Where the newest run
+   * disagrees with the task, the run is the one that knows.
+   */
+  const headline = $derived.by(() => {
+    if (liveRun) return { text: statusLabel(liveRun.status), cls: "" };
+    if (task?.status === "teaching" && finishedRun) {
+      return finishedRun.status === "succeeded"
+        ? { text: "Learned, waiting for you", cls: "warn" }
+        : { text: "Learning did not finish", cls: "bad" };
+    }
+    return { text: task ? statusLabel(task.status) : "", cls: "" };
+  });
+
+  /** "The teaching run could not finish", in words nobody has to decode. */
+  function ranHeadline(r: Run): string {
+    const what =
+      r.trigger === "teach" ? "The teaching run"
+      : r.mode === "dry_run" ? "The last rehearsal"
+      : "The last run";
+    const how =
+      r.status === "succeeded" ? "worked"
+      : r.status === "failed" ? "could not finish"
+      : r.status === "cancelled" ? "was stopped"
+      : "was skipped";
+    return `${what} ${how}`;
+  }
+
+  async function countSteps(runId: string) {
+    try {
+      const detail = await api.runDetail(runId);
+      liveSteps = detail.steps.length;
+      // The stream can be missed entirely, so this has to be able to notice an
+      // ending on its own rather than trusting an event that never came.
+      if (FINISHED.includes(detail.status)) await load();
+    } catch {
+      // The step count is a comfort, not the point. A page that still works
+      // without it beats a page that breaks over it.
+    }
+  }
+
+  $effect(() => {
+    const runId = liveRun?.id ?? null;
+    if (runId === following) return;
+    stopFollow?.();
+    stopFollow = undefined;
+    following = runId;
+    liveSteps = 0;
+    if (!runId) return;
+    countSteps(runId);
+    stopFollow = followRun(runId, (e) => {
+      const data = e.data as any;
+      if (typeof data?.seq === "number") liveSteps = Math.max(liveSteps, data.seq);
+      // The moment a run ends, everything else on this page is out of date.
+      if (e.event === "run.finished" || e.event === "run.failed") load();
+      if (e.event === "run.status" && FINISHED.includes(data?.status)) load();
+    });
+  });
 
   async function load() {
     try {
@@ -35,12 +120,30 @@
       try {
         [people, everyone] = await Promise.all([api.taskRecipients(id), api.recipients()]);
       } catch { people = []; everyone = []; }
+      // A recipient carries only a channel's id, and "imessage" is not a word
+      // anybody uses. The names come from the daemon rather than a second list
+      // kept here, which would drift away from it.
+      try {
+        const known = await api.channels();
+        channelNames = Object.fromEntries(known.channels.map((c) => [c.channel, channelName(c)]));
+      } catch { /* the id reads badly, but it beats a blank where a name should be */ }
       problem = null;
     } catch (e) {
       problem = e instanceof ApiError ? e.message : String(e);
     }
   }
-  onMount(load);
+  onMount(() => {
+    load();
+    // A slow safety net, not the mechanism. If the stream drops, a run that
+    // ended would otherwise sit at the top of this page still claiming to be
+    // working, which is the failure this whole section exists to prevent.
+    heartbeat = setInterval(() => { if (following) countSteps(following); }, 20000);
+  });
+
+  onDestroy(() => {
+    stopFollow?.();
+    clearInterval(heartbeat);
+  });
 
   async function save(patch: Parameters<typeof api.patchTask>[1]) {
     busy = true;
@@ -77,6 +180,36 @@
   }
   async function saveSites() {
     if (await save({ allowed_domains: draftSites })) editingSites = false;
+  }
+  async function saveLimits() {
+    const limits = {
+      max_steps: Math.max(0, Math.round(draftLimits.max_steps)),
+      max_minutes: Math.max(0, Math.round(draftLimits.max_minutes)),
+      max_usd: Math.max(0, draftLimits.max_usd),
+      max_messages: Math.max(0, Math.round(draftLimits.max_messages)),
+    };
+    if (await save({ limits })) editingLimits = false;
+  }
+
+  function startEditLimits() {
+    // Prefill from what the daemon reports, falling back to its defaults, so
+    // the form never invents a number the daemon would not recognise.
+    draftLimits = {
+      max_steps: task?.limits?.max_steps ?? 60,
+      max_minutes: task?.limits?.max_minutes ?? 15,
+      max_usd: task?.limits?.max_usd ?? 0.5,
+      max_messages: task?.limits?.max_messages ?? 3,
+    };
+    editingLimits = true;
+  }
+
+  // The link is an upsert on the daemon's side, so changing when somebody
+  // hears is the same call as granting it in the first place.
+  async function togglePerson(p: TaskRecipient, which: "success" | "failure") {
+    const onSuccess = which === "success" ? !p.on_success : p.on_success;
+    const onFailure = which === "failure" ? !p.on_failure : p.on_failure;
+    if (!onSuccess && !onFailure) return; // "hears about nothing" is Remove, not a toggle
+    await act(() => api.linkRecipient(id, p.id, onSuccess, onFailure));
   }
 
   const unlinked = $derived(everyone.filter((r) => !people.some((p) => p.id === r.id)));
@@ -128,9 +261,47 @@
 {#if task}
   <div class="row spread">
     <h1>{task.emoji ?? ""} {task.name}</h1>
-    <Hint id="task.status"><span class="pill">{statusLabel(task.status)}</span></Hint>
+    <Hint id="task.status"><span class="pill {headline.cls}">{headline.text}</span></Hint>
   </div>
   <p class="deck">{task.description}</p>
+
+  <!-- Before anything else this page has to answer two questions: is it doing
+       anything, and if it has stopped, what happened. Neither should need
+       anybody to know what a run is, or to go looking in History for it. -->
+  {#if liveRun}
+    <div class="card now">
+      <div class="row spread">
+        <div>
+          <strong><span class="blip"></span>Working on it now</strong>
+          <div class="muted" style="margin-top:4px">
+            {statusLabel(liveRun.status)} ·
+            {liveSteps === 0 ? "getting started" : `${liveSteps} step${liveSteps === 1 ? "" : "s"} so far`}
+            · began {when(liveRun.started_at ?? liveRun.created_at)}
+          </div>
+        </div>
+        <Hint id="task.watch_run">
+          <a class="golink" href={`/run/${liveRun.id}`}>Watch it</a>
+        </Hint>
+      </div>
+    </div>
+  {:else if finishedRun}
+    <div class="card ended" class:bad={finishedRun.status === "failed"}>
+      <div class="row spread">
+        <div>
+          <strong>{ranHeadline(finishedRun)}</strong>
+          <span class="muted"> · {when(finishedRun.finished_at ?? finishedRun.created_at)}</span>
+          {#if finishedRun.failure}
+            <div style="margin-top:6px">{finishedRun.failure.plain_reason}</div>
+          {:else if finishedRun.summary}
+            <div class="muted" style="margin-top:6px">{finishedRun.summary.split("\n")[0]}</div>
+          {/if}
+        </div>
+        <Hint id="task.last_run">
+          <a class="golink" href={`/run/${finishedRun.id}`}>See what happened</a>
+        </Hint>
+      </div>
+    </div>
+  {/if}
 
   <div class="row" style="flex-wrap:wrap; gap:8px">
     {#if !plan?.active}
@@ -147,7 +318,7 @@
         <button disabled={busy} onclick={() => act(() => api.run(id, true))}>Rehearse</button>
       </Hint>
       {#if task.status === "paused"}
-        <Hint id="task.pause">
+        <Hint id="task.resume">
           <button disabled={busy} onclick={() => act(() => api.resume(id))}>Resume</button>
         </Hint>
       {:else}
@@ -165,7 +336,7 @@
     <div class="err" style="margin-top:16px">
       <h3>This task needs you</h3>
       <div>Errand paused it: {task.paused_reason}</div>
-      {#if task.paused_reason?.includes("verification") || task.paused_reason?.includes("interrupted")}
+      {#if (task.open_holds ?? 0) > 0}
         <p class="muted" style="margin:8px 0">
           A run began something that cannot be undone and stopped before confirming it. Check the
           site, then tell Errand what you found.
@@ -249,12 +420,42 @@
 
     <div class="row spread" style="margin-top:14px">
       <Hint id="task.limits"><span>Limits on a single run</span></Hint>
-      <span class="muted">
-        {task.limits
-          ? `at most ${task.limits.max_steps} steps, ${task.limits.max_minutes} minutes, $${task.limits.max_usd}, ${task.limits.max_messages} messages`
-          : "stops if it runs too long or spends too much"}
-      </span>
+      {#if !editingLimits}
+        <div class="row" style="gap:8px">
+          <span class="muted">
+            {task.limits
+              ? `at most ${task.limits.max_steps} steps, ${task.limits.max_minutes} minutes, $${task.limits.max_usd}, ${task.limits.max_messages} messages`
+              : "stops if it runs too long or spends too much"}
+          </span>
+          <Hint id="task.edit_limits">
+            <button disabled={busy} onclick={startEditLimits}>Change</button>
+          </Hint>
+        </div>
+      {/if}
     </div>
+    {#if editingLimits}
+      <div class="limits-form">
+        <label for="lim-steps">Most things it may do in one run</label>
+        <input id="lim-steps" type="number" min="0" bind:value={draftLimits.max_steps} />
+        <label for="lim-min">Most minutes one run may take</label>
+        <input id="lim-min" type="number" min="0" bind:value={draftLimits.max_minutes} />
+        <label for="lim-usd">Most dollars one run may spend</label>
+        <input id="lim-usd" type="number" min="0" step="0.1" bind:value={draftLimits.max_usd} />
+        <label for="lim-msg">Most messages one run may send</label>
+        <input id="lim-msg" type="number" min="0" bind:value={draftLimits.max_messages} />
+        <p class="muted" style="margin:6px 0 0">
+          A zero means no ceiling for that one. A run that hits a ceiling stops and says which one.
+        </p>
+      </div>
+      <div class="row" style="margin-top:12px; gap:6px">
+        <Hint id="task.save_limits">
+          <button class="primary" disabled={busy} onclick={saveLimits}>Save the limits</button>
+        </Hint>
+        <Hint id="task.cancel_edit">
+          <button disabled={busy} onclick={() => (editingLimits = false)}>Never mind</button>
+        </Hint>
+      </div>
+    {/if}
   </div>
 
   <h2>Who it tells when it is done</h2>
@@ -269,14 +470,22 @@
         <div class="row spread" style="margin-bottom:6px">
           <div>
             <strong>{p.label}</strong>
-            <span class="muted"> · {p.channel.replace("_", " ")} · {p.address}</span>
+            <span class="muted"> · {named(p.channel)} · {p.address}</span>
           </div>
           <div class="row" style="gap:6px">
             <Hint id="task.notify_when">
-              <span class="pill {p.on_success ? 'ok' : ''}">{p.on_success ? "when it works" : "not on success"}</span>
+              <button
+                class="pill toggle {p.on_success ? 'ok' : ''}"
+                disabled={busy}
+                onclick={() => togglePerson(p, "success")}
+              >{p.on_success ? "when it works" : "not on success"}</button>
             </Hint>
             <Hint id="task.notify_when">
-              <span class="pill {p.on_failure ? 'warn' : ''}">{p.on_failure ? "when it fails" : "not on failure"}</span>
+              <button
+                class="pill toggle {p.on_failure ? 'warn' : ''}"
+                disabled={busy}
+                onclick={() => togglePerson(p, "failure")}
+              >{p.on_failure ? "when it fails" : "not on failure"}</button>
             </Hint>
             <Hint id="task.unlink_person">
               <button disabled={busy} onclick={() => act(() => api.unlinkRecipient(id, p.id))}>Remove</button>
@@ -307,7 +516,7 @@
           >
             <option value="">Tell someone when this finishes…</option>
             {#each unlinked as r}
-              <option value={r.id}>{r.label} — {r.channel.replace("_", " ")}</option>
+              <option value={r.id}>{r.label} · {named(r.channel)}</option>
             {/each}
           </select>
         </Hint>
@@ -381,4 +590,32 @@
     padding: 9px 11px; border-radius: 6px; font-size: 12.5px;
     display: flex; flex-direction: column; gap: 4px; margin: 12px 0;
   }
+  /* A pill that is also a button: the notify flags switch on click, so they
+     must look pressable rather than purely informative. */
+  .pill.toggle { cursor: pointer; border: 1px solid var(--rule); background: transparent; }
+  .pill.toggle:disabled { cursor: default; opacity: 0.5; }
+  .limits-form { display: grid; gap: 4px; margin-top: 10px; max-width: 340px; }
+  .limits-form input { width: 110px; }
+
+  /* The two cards at the top of the page. A rule down the side, so which of the
+     two you are looking at is answered before you have read a word. */
+  .now { border-left: 3px solid var(--accent); }
+  .ended { border-left: 3px solid var(--ok); }
+  .ended.bad { border-left-color: var(--bad); }
+  /* A link that behaves like a button, because getting to the run is the point
+     of both cards and a plain underline is easy to miss. */
+  .golink {
+    display: inline-block; padding: 6px 12px; border-radius: 6px;
+    border: 1px solid var(--rule); background: var(--surface-2);
+    color: var(--ink); text-decoration: none; white-space: nowrap;
+  }
+  .golink:hover { border-color: var(--accent); }
+  /* Something on the page has to be moving, or "working on it" is just a claim. */
+  .blip {
+    display: inline-block; width: 7px; height: 7px; border-radius: 50%;
+    background: var(--accent); margin-right: 7px; vertical-align: middle;
+    animation: blip 1.4s ease-in-out infinite;
+  }
+  @keyframes blip { 50% { opacity: 0.25; } }
+  @media (prefers-reduced-motion: reduce) { .blip { animation: none; } }
 </style>

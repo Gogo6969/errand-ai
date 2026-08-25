@@ -199,8 +199,8 @@ pub struct TaskPatch {
 /// `None` means the caller did not mention this setting at all, so the column
 /// is left alone. An object is merged rather than substituted, because the
 /// callers upstream send only what changed: a body naming `max_usd` alone must
-/// not take `max_messages` with it. Anything that is not an object — a null, a
-/// list, a stored value that is not readable as JSON — replaces what is there,
+/// not take `max_messages` with it. Anything that is not an object (a null, a
+/// list, a stored value that is not readable as JSON) replaces what is there,
 /// since there is nothing to merge into.
 fn merge_settings(stored: &str, patch: Option<&serde_json::Value>) -> Result<Option<String>> {
     let Some(patch) = patch else {
@@ -275,7 +275,7 @@ pub async fn update_task(pool: &Pool, id: &str, patch: TaskPatch) -> Result<crat
     // object with it would quietly drop the other four: a task whose owner set
     // a ceiling of one message would fall back to the default of three because
     // somebody adjusted its spending limit. A schedule is deliberately not
-    // treated this way — see the field's own note.
+    // treated this way; see the field's own note.
     let notify_json = merge_settings(
         &row.try_get::<String, _>("notify_json")?,
         patch.notify.as_ref(),
@@ -623,6 +623,67 @@ pub async fn list_steps(pool: &Pool, run_id: &str) -> Result<Vec<crate::models::
             })
         })
         .collect()
+}
+
+/// Record a file a run left behind. The id is minted here and the row is
+/// addressed by it alone: a request can name an artifact id, never a path, so
+/// being asked for a file can never be turned into reading an arbitrary one.
+pub async fn record_artifact(
+    pool: &Pool,
+    run_id: &str,
+    kind: &str,
+    rel_path: &str,
+    bytes: i64,
+) -> Result<String> {
+    let id = crate::new_id();
+    sqlx::query(
+        "INSERT INTO run_artifacts (id, run_id, kind, rel_path, masked, bytes)
+         VALUES (?, ?, ?, ?, 1, ?)",
+    )
+    .bind(&id)
+    .bind(run_id)
+    .bind(kind)
+    .bind(rel_path)
+    .bind(bytes)
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+/// Point a journal step at the artifact it produced.
+pub async fn attach_step_artifact(
+    pool: &Pool,
+    run_id: &str,
+    seq: i64,
+    artifact_id: &str,
+) -> Result<()> {
+    sqlx::query("UPDATE run_steps SET artifact_id = ? WHERE run_id = ? AND seq = ?")
+        .bind(artifact_id)
+        .bind(run_id)
+        .bind(seq)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Look an artifact up by id.
+pub async fn get_artifact(pool: &Pool, id: &str) -> Result<Option<crate::models::Artifact>> {
+    let row = sqlx::query("SELECT * FROM run_artifacts WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    row.map(|r| {
+        Ok(crate::models::Artifact {
+            id: r.try_get("id")?,
+            run_id: r.try_get("run_id")?,
+            kind: r.try_get("kind")?,
+            rel_path: r.try_get("rel_path")?,
+            masked: r.try_get::<i64, _>("masked")? != 0,
+            bytes: r.try_get("bytes")?,
+            created_at: r.try_get("created_at")?,
+        })
+    })
+    .transpose()
 }
 
 /// Append one journal step. Journal-then-act is the rule: a step is recorded
@@ -1029,6 +1090,24 @@ pub async fn link_task_credential(pool: &Pool, task_id: &str, credential_id: &st
     Ok(())
 }
 
+/// Stop a task using a login. Always safe: the login itself is untouched, and a
+/// run that needed it will say so plainly rather than signing in as somebody.
+pub async fn unlink_task_credential(
+    pool: &Pool,
+    task_id: &str,
+    credential_id: &str,
+) -> Result<bool> {
+    Ok(
+        sqlx::query("DELETE FROM task_credentials WHERE task_id = ? AND credential_id = ?")
+            .bind(task_id)
+            .bind(credential_id)
+            .execute(pool)
+            .await?
+            .rows_affected()
+            > 0,
+    )
+}
+
 pub async fn credential_keychain_ref(
     pool: &Pool,
     cred_id: &str,
@@ -1306,7 +1385,7 @@ fn fence_key(task_id: &str, occurrence_id: &str, action_kind: &str, scope: &str)
 /// `scope` is the one exception, and it does not weaken that rule. The warning
 /// above is about outcomes the AGENT picks: key on one of those and a retry
 /// simply picks differently and walks through. A scope is picked by the PERSON,
-/// from a closed set the agent cannot add to — a recipient they chose, say — so
+/// from a closed set the agent cannot add to (a recipient they chose, say), so
 /// "message this person once for this slot" is a promise the agent has no way
 /// to reinterpret. Pass an empty scope when there is no such set, which is
 /// most of the time.
@@ -1477,8 +1556,8 @@ pub async fn finish_run_skipped(pool: &Pool, run_id: &str, code: &str, human: &s
 ///
 /// `scope` narrows it to one recipient, the same way it narrows the fence key.
 /// An empty scope is not a wildcard: it matches only the rows written with no
-/// scope at all. Ask this when the question really is about one person — "has
-/// Mum already been told" — and `recent_commit_of_any_scope` when it is about
+/// scope at all. Ask this when the question really is about one person ("has
+/// Mum already been told") and `recent_commit_of_any_scope` when it is about
 /// the task as a whole.
 pub async fn recent_commit(
     pool: &Pool,
@@ -1674,6 +1753,32 @@ pub async fn confirm_holds(pool: &Pool, task_id: &str, note: &str) -> Result<u64
     .execute(pool)
     .await?;
     Ok(res.rows_affected())
+}
+
+/// How many armed side effects block one task right now.
+///
+/// The interface keys its "needs you" card off this number rather than off
+/// the wording of the pause reason, which is a sentence that can change.
+pub async fn count_open_holds(pool: &Pool, task_id: &str) -> Result<i64> {
+    let row =
+        sqlx::query("SELECT COUNT(*) AS n FROM side_effects WHERE task_id = ? AND state = 'armed'")
+            .bind(task_id)
+            .fetch_one(pool)
+            .await?;
+    Ok(row.try_get("n")?)
+}
+
+/// The same count for every task at once, so a list page does not ask one
+/// task at a time.
+pub async fn open_hold_counts(pool: &Pool) -> Result<std::collections::HashMap<String, i64>> {
+    let rows = sqlx::query(
+        "SELECT task_id, COUNT(*) AS n FROM side_effects WHERE state = 'armed' GROUP BY task_id",
+    )
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| Ok((r.try_get("task_id")?, r.try_get("n")?)))
+        .collect()
 }
 
 // --------------------------------------------------------------- playbooks --
@@ -3927,7 +4032,7 @@ mod tests {
             .unwrap();
 
         // Every message is armed against the person it is for, so asking with
-        // no scope finds nothing — which is how a guard meant to catch repeats
+        // no scope finds nothing, which is how a guard meant to catch repeats
         // came to wave them all through.
         assert!(recent_commit(&pool, &t.id, "message", "", 10)
             .await
@@ -4103,6 +4208,95 @@ mod tests {
         // Nothing useful to hide behind, so nothing is shown.
         assert_eq!(masked_address("whatsapp", "12"), "•••");
         assert_eq!(masked_address("apple_mail", "  "), "•••");
+    }
+
+    #[tokio::test]
+    async fn an_artifact_is_recorded_and_found_by_id_and_linked_to_its_step() {
+        let pool = open_memory().await.unwrap();
+        let t = create_task(
+            &pool,
+            NewTask {
+                name: "T".into(),
+                description: "d".into(),
+                emoji: None,
+                schedule: serde_json::json!({"kind":"manual"}),
+            },
+        )
+        .await
+        .unwrap();
+        let r = create_run(&pool, &t.id, "s", "manual", "normal", None)
+            .await
+            .unwrap();
+
+        let artifact = record_artifact(&pool, &r.id, "screenshot", "runs/x/shots/y.png", 1234)
+            .await
+            .unwrap();
+        let found = get_artifact(&pool, &artifact).await.unwrap().unwrap();
+        assert_eq!(found.run_id, r.id);
+        assert_eq!(found.rel_path, "runs/x/shots/y.png");
+        assert!(found.masked);
+        assert_eq!(found.bytes, Some(1234));
+        // An id that was never issued is simply absent, never an error.
+        assert!(get_artifact(&pool, "no-such-id").await.unwrap().is_none());
+
+        let seq = append_step(&pool, &r.id, "screenshot", "the login page", true, None)
+            .await
+            .unwrap();
+        attach_step_artifact(&pool, &r.id, seq, &artifact)
+            .await
+            .unwrap();
+        let steps = list_steps(&pool, &r.id).await.unwrap();
+        assert_eq!(steps[0].artifact_id.as_deref(), Some(artifact.as_str()));
+    }
+
+    #[tokio::test]
+    async fn open_holds_are_counted_per_task_until_they_are_resolved() {
+        let pool = open_memory().await.unwrap();
+        let mk = |name: &str| {
+            create_task(
+                &pool,
+                NewTask {
+                    name: name.into(),
+                    description: "d".into(),
+                    emoji: None,
+                    schedule: serde_json::json!({"kind":"manual"}),
+                },
+            )
+        };
+        let t = mk("T").await.unwrap();
+        let other = mk("U").await.unwrap();
+        let r = create_run(&pool, &t.id, "s", "manual", "normal", None)
+            .await
+            .unwrap();
+
+        assert_eq!(count_open_holds(&pool, &t.id).await.unwrap(), 0);
+        assert!(open_hold_counts(&pool).await.unwrap().is_empty());
+
+        arm_side_effect(&pool, &r.id, &t.id, "slot", "booking", "")
+            .await
+            .unwrap();
+        assert_eq!(count_open_holds(&pool, &t.id).await.unwrap(), 1);
+        assert_eq!(count_open_holds(&pool, &other.id).await.unwrap(), 0);
+        let counts = open_hold_counts(&pool).await.unwrap();
+        assert_eq!(counts.get(&t.id), Some(&1));
+        // A task with nothing armed is absent rather than zero, so the list
+        // page can tell "nothing to say" from "something to say".
+        assert!(!counts.contains_key(&other.id));
+
+        // "It did not happen" releases the fence; the count drops.
+        clear_holds(&pool, &t.id, "checked: not booked")
+            .await
+            .unwrap();
+        assert_eq!(count_open_holds(&pool, &t.id).await.unwrap(), 0);
+
+        // So does "it already happened".
+        arm_side_effect(&pool, &r.id, &t.id, "slot2", "booking", "")
+            .await
+            .unwrap();
+        confirm_holds(&pool, &t.id, "checked: booked")
+            .await
+            .unwrap();
+        assert_eq!(count_open_holds(&pool, &t.id).await.unwrap(), 0);
     }
 }
 

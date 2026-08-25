@@ -285,7 +285,7 @@ async fn serve(foreground: bool) -> Result<()> {
     tokio::spawn(async move {
         match api::auth::ensure_primary_token(&pool).await {
             Ok(Some(token)) => {
-                tracing::info!("minted primary API token (stored in your keychain)");
+                tracing::info!("minted a primary API key and saved it beside the database");
                 if foreground {
                     println!(
                         "\n  Primary API token (also saved to your keychain):\n\n    {token}\n"
@@ -436,28 +436,12 @@ async fn doctor() -> Result<u32> {
     if !has_token {
         problems += 1;
     }
-    println!("  {}  API token saved", tick(has_token));
+    println!("  {}  API key saved", tick(has_token));
     if !has_token {
         println!("      The API itself still works: what authenticates a request is the hash");
-        println!("      in the database, and the saved copy is only there so the app and the");
-        println!("      command line can read it back. Usual causes:");
-        println!("        - The runner has never started. Start it and it mints one.");
-        println!("        - You switched between a debug and a release build. Those keep their");
-        println!("          secrets in different places on purpose, so each needs its own.");
-        // The remedy is genuinely different for the two stores, and sending
-        // somebody to Keychain Access for a build that never wrote there is how
-        // a diagnostic loses the trust that makes it worth reading.
-        if errand_core::keychain::using_keychain() {
-            println!("        - The binary was rebuilt and re-signed, so the stored item's access");
-            println!("          list no longer matches it.");
-            println!(
-                "      For the last two: delete the '{}' items in",
-                errand_core::keychain_service_internal()
-            );
-            println!("      Keychain Access, then restart the runner.");
-        } else {
-            println!("      Mint one with 'errandd token --new', or just start the runner.");
-        }
+        println!("      in the database, and the saved copy is only there so the window and the");
+        println!("      command line can read it back.");
+        println!("      Mint one with 'errandd token --new', or just start the runner.");
     }
 
     // Claude CLI: the flagship executor
@@ -485,14 +469,56 @@ async fn doctor() -> Result<u32> {
     // each of which used to surface as the same shrug at 08:00.
     problems += browsing_checks().await;
 
-    // API reachable
-    let port = errand_core::DEFAULT_API_PORT;
+    // API reachable.
+    //
+    // The same port the runner would bind, ERRAND_API_PORT included — a doctor
+    // that checked a port nothing was using would report the service down while
+    // it was running perfectly well on another one.
+    let port: u16 = std::env::var("ERRAND_API_PORT")
+        .ok()
+        .and_then(|p| p.parse().ok())
+        .unwrap_or(errand_core::DEFAULT_API_PORT);
     let reachable = tokio::net::TcpStream::connect(("127.0.0.1", port))
         .await
         .is_ok();
     println!("  {}  API on 127.0.0.1:{port}", tick(reachable));
     if !reachable {
         println!("      Nothing is listening. The runner is not up.");
+    }
+
+    // Does the token actually WORK?
+    //
+    // Reading one back is not the same as it being accepted, and the difference
+    // is not academic: the saved copy and the hash in the database can drift
+    // apart — switching between a debug and a release build does it, because
+    // they keep their secrets in different places. Doctor used to report the
+    // token as fine in exactly that case, while every window got a 401. A clean
+    // bill of health that is not true is worse than no check at all.
+    if reachable && has_token {
+        let accepted = match api::auth::read_primary_token().await {
+            Ok(t) => reqwest::Client::new()
+                .get(format!("http://127.0.0.1:{port}/v1/health/detail"))
+                .bearer_auth(t)
+                .timeout(std::time::Duration::from_secs(5))
+                .send()
+                .await
+                .map(|r| r.status().is_success())
+                .unwrap_or(false),
+            Err(_) => false,
+        };
+        if !accepted {
+            problems += 1;
+        }
+        println!("  {}  that token is accepted", tick(accepted));
+        if !accepted {
+            println!("      The saved key and the running service no longer agree, so every");
+            println!("      window will be refused. Nothing is lost — the key is only a copy.");
+            println!("      Mint a matching one:");
+            println!();
+            println!("        errandd token --new");
+            println!();
+            println!("      Then reopen the Errand-AI window.");
+        }
     }
 
     println!();

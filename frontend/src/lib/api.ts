@@ -77,18 +77,50 @@ export class ApiError extends Error {
   }
 }
 
-async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
+/**
+ * Turn whatever came back from the daemon into an error a person can read.
+ *
+ * Kept separate from the call itself for a reason that cost an afternoon: when
+ * the throw lived inside the same try block as the JSON.parse, its own catch
+ * caught it, and every failure in the whole app reached the screen as raw JSON
+ * instead of the sentence the daemon had carefully written.
+ */
+function asApiError(e: unknown): ApiError {
+  const text = String(e);
+  let parsed: { code?: string; detail?: string; title?: string } | null = null;
   try {
-    const raw = await invoke<string>("api", { method, path, body: body ? JSON.stringify(body) : null });
-    return JSON.parse(raw) as T;
+    parsed = JSON.parse(text);
+  } catch {
+    parsed = null;
+  }
+  if (parsed && typeof parsed === "object") {
+    return new ApiError(parsed.code ?? "unknown", parsed.detail ?? parsed.title ?? text);
+  }
+  // Not JSON at all, so it did not come from the daemon: the window could not
+  // reach it, or something threw before the request was made.
+  return new ApiError("unreachable", text.replace(/^Error:\s*/, ""));
+}
+
+async function call<T>(method: string, path: string, body?: unknown): Promise<T> {
+  let raw: string;
+  try {
+    raw = await invoke<string>("api", {
+      method,
+      path,
+      body: body ? JSON.stringify(body) : null,
+    });
   } catch (e) {
-    const text = String(e);
-    try {
-      const j = JSON.parse(text);
-      throw new ApiError(j.code ?? "unknown", j.detail ?? j.title ?? text);
-    } catch {
-      throw new ApiError("unreachable", text);
-    }
+    throw asApiError(e);
+  }
+  try {
+    return JSON.parse(raw) as T;
+  } catch {
+    // The request succeeded and the reply is not JSON. Nothing sensible to do
+    // with it, but say so rather than letting a parser error surface.
+    throw new ApiError(
+      "unreadable",
+      "Errand's background service answered with something this window could not read.",
+    );
   }
 }
 

@@ -50,41 +50,50 @@ pub fn generate_token() -> Result<String> {
     Ok(format!("{TOKEN_PREFIX}{}", hex::encode(bytes)))
 }
 
-/// Mint the primary admin token on first boot: hash into the database first,
-/// then plaintext into the keychain.
+/// Make sure there is a primary admin key that can actually be read back.
 ///
-/// The order matters. The hash is what authenticates requests, so writing it
-/// first means the API is usable even if the keychain write then stalls behind
-/// an authorization prompt. The keychain copy exists only so the token can be
-/// shown to the user again later.
+/// Two halves, and the second one matters more than it looks. Writing the hash
+/// into the database comes first, because the hash is what authenticates a
+/// request, so the API is usable even if saving the readable copy then fails.
+///
+/// But a hash with no readable copy is a locked door: every window gets a 401,
+/// and nothing about that says why. It happens for ordinary reasons — a
+/// database carried over from another machine, a copy that was moved or
+/// removed. So a key that cannot be read is treated as no key at all and
+/// replaced. That revokes only the key named "primary"; anything minted for
+/// another program keeps working.
 pub async fn ensure_primary_token(pool: &Pool) -> Result<Option<String>> {
     if errand_core::db::has_any_token(pool).await? {
-        return Ok(None);
+        if crate::secrets::get_api_token().await.is_ok() {
+            return Ok(None);
+        }
+        tracing::warn!(
+            "the database has an API key but no readable copy of it, so every window would be \
+             refused; minting a replacement"
+        );
+        return regenerate_primary_token(pool).await.map(Some);
     }
     let token = generate_token()?;
     let hash = hash_token(&token);
     let id = errand_core::db::insert_token(pool, "primary", &hash, "admin").await?;
 
-    if let Err(e) = crate::secrets::put_internal(
-        errand_core::keychain::ACCOUNT_API_TOKEN,
-        errand_core::keychain::Secret::new(token.clone()),
-    )
-    .await
+    if let Err(e) =
+        crate::secrets::put_api_token(errand_core::keychain::Secret::new(token.clone())).await
     {
         // Leaving the row behind would be worse than failing: the hash would
         // authenticate a token nobody can read, and the next boot would see a
         // token already exists and never mint a usable one. Roll it back so the
         // next attempt starts clean.
         let _ = errand_core::db::revoke_token(pool, &id).await;
-        return Err(e).context("storing the API token in the keychain");
+        return Err(e).context("saving the API key");
     }
     Ok(Some(token))
 }
 
 /// Mint a replacement primary token, revoking the old one.
 ///
-/// The recovery path for the case where the keychain copy has become
-/// unreadable: a rebuilt binary, a restored machine, a cleared keychain. The
+/// The recovery path for the case where the saved copy has become unreadable or
+/// no longer matches: a restored machine, a database from elsewhere. The
 /// hash in the database still authenticates requests, but nobody can read the
 /// value any more, and without this the only way out is editing the database
 /// by hand.
@@ -94,24 +103,15 @@ pub async fn regenerate_primary_token(pool: &Pool) -> Result<String> {
     errand_core::db::revoke_tokens_named(pool, "primary").await?;
     let name = format!("primary-{}", &errand_core::new_id()[..8]);
     errand_core::db::insert_token(pool, &name, &hash, "admin").await?;
-    crate::secrets::put_internal(
-        errand_core::keychain::ACCOUNT_API_TOKEN,
-        errand_core::keychain::Secret::new(token.clone()),
-    )
-    .await
-    .context("storing the new API token in the keychain")?;
+    crate::secrets::put_api_token(errand_core::keychain::Secret::new(token.clone()))
+        .await
+        .context("saving the new API key")?;
     Ok(token)
 }
 
-/// Read the primary token back out of the keychain, for the CLI and for the UI
-/// to display on request.
+/// Read the primary token back, for the CLI and for the window.
 pub async fn read_primary_token() -> Result<String> {
-    Ok(
-        crate::secrets::get_internal(errand_core::keychain::ACCOUNT_API_TOKEN)
-            .await?
-            .expose()
-            .to_string(),
-    )
+    Ok(crate::secrets::get_api_token().await?.expose().to_string())
 }
 
 async fn authenticate(pool: &Pool, header: Option<&str>) -> Option<Caller> {

@@ -215,16 +215,38 @@ impl CredStore for FileStore {
 
 /// Which store this build uses, and why.
 ///
-/// A release build always uses the keychain. A debug build uses a file, because
-/// it would otherwise ask permission on every single compile — see `FileStore`.
+/// The keychain is for the copy people actually install: signed once with a
+/// stable identity, so macOS asks permission once and the answer holds. A build
+/// artifact gets a file instead, because it is relinked constantly and macOS
+/// treats every relink as a different program — it would ask again after every
+/// compile, and teach the habit of clicking Allow unread.
+///
 /// `ERRAND_KEYCHAIN=on` forces the real thing for anyone deliberately testing
 /// that path; `ERRAND_KEYCHAIN=off` forces the file.
 pub fn using_keychain() -> bool {
     match std::env::var("ERRAND_KEYCHAIN").ok().as_deref() {
         Some("on") => true,
         Some("off") => false,
-        _ => !crate::is_dev_build(),
+        _ => !crate::is_dev_build() && !running_from_build_dir(),
     }
+}
+
+/// Is this binary still sitting in the directory cargo built it in?
+///
+/// A `--release` build run straight out of `target/release` is every bit as
+/// unsigned as a debug one, so it hits the same wall: profile alone is the
+/// wrong question. What matters is whether this is the copy somebody installed
+/// — the app bundle, or what `dev-install.sh` signs and puts in place — or an
+/// artifact that will be overwritten by the next build.
+fn running_from_build_dir() -> bool {
+    std::env::current_exe()
+        .ok()
+        .and_then(|exe| {
+            exe.parent()
+                .and_then(|d| d.parent())
+                .map(|p| p.file_name() == Some(std::ffi::OsStr::new("target")))
+        })
+        .unwrap_or(false)
 }
 
 /// Said out loud by `doctor` and at boot, so nobody is ever unsure which one is
@@ -233,12 +255,17 @@ pub fn store_description() -> String {
     if using_keychain() {
         "your macOS keychain".to_string()
     } else {
+        let why = if crate::is_dev_build() {
+            "this is a development build"
+        } else {
+            "this copy is still in its build directory"
+        };
         match dev_secrets_path() {
             Ok(p) => format!(
-                "a file, because this is a development build: {} (NOT protected by macOS)",
+                "a file, because {why}: {} (not protected by macOS)",
                 p.display()
             ),
-            Err(_) => "a file, because this is a development build".to_string(),
+            Err(_) => format!("a file, because {why} (not protected by macOS)"),
         }
     }
 }
@@ -265,8 +292,54 @@ pub fn store() -> Box<dyn CredStore> {
 
 // --------------------------------------------------------- internal secrets --
 
-/// Account name for the primary API token inside the internal keychain service.
-pub const ACCOUNT_API_TOKEN: &str = "api-token-primary";
+// ------------------------------------------------------------- the API key --
+
+/// Where the local API token is kept, and why it is not in the keychain.
+///
+/// This one secret is deliberately different from the rest. It is read on every
+/// daemon boot, by every `errandd` command, and every time the window opens —
+/// so if it lived in the keychain, macOS would ask permission constantly, and
+/// the habit that teaches is worth more to an attacker than the token is.
+///
+/// The trade is honest rather than merely convenient. This token guards a
+/// loopback API whose entire database sits in the same directory with the same
+/// permissions: anyone who can read this file can read `errand.db` beside it and
+/// help themselves to the history directly. The keychain would add a prompt
+/// without adding protection *for this particular secret*.
+///
+/// Site logins and provider keys are the opposite case — they unlock things
+/// beyond this machine, and they are read rarely — so they stay in the keychain
+/// where a prompt is both meaningful and infrequent.
+fn api_token_path() -> Result<std::path::PathBuf> {
+    Ok(crate::paths::data_root()?.join("api-token"))
+}
+
+/// Save the local API token. Owner-readable only, like everything beside it.
+pub fn put_api_token(token: &Secret) -> Result<()> {
+    let path = api_token_path()?;
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::write(&path, token.expose())
+        .map_err(|e| anyhow!("could not save the API key to {}: {e}", path.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))?;
+    }
+    Ok(())
+}
+
+pub fn get_api_token() -> Result<Secret> {
+    let path = api_token_path()?;
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|_| anyhow!("no API key saved yet at {}", path.display()))?;
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Err(anyhow!("the saved API key is empty"));
+    }
+    Ok(Secret::new(raw.to_string()))
+}
 
 /// Persist an app-owned secret (API token, bot token) rather than a site login.
 pub fn put_internal(account: &str, secret: &Secret) -> Result<()> {
@@ -395,6 +468,39 @@ mod tests {
             Some(v) => std::env::set_var(key, v),
             None => std::env::remove_var(key),
         }
+    }
+
+    #[test]
+    fn the_api_key_is_kept_beside_the_database_and_not_in_the_keychain() {
+        // It is read on every boot, every command and every time the window
+        // opens, so keychain-holding it means a permission prompt several times
+        // a day — and being trained to click Allow unread costs more than this
+        // token is worth. It guards a loopback API whose database sits in the
+        // same directory under the same permissions anyway.
+        let path = api_token_path().expect("the key has a home");
+        assert!(
+            path.ends_with("api-token"),
+            "expected a file beside the database, got {}",
+            path.display()
+        );
+        assert_eq!(
+            path.parent(),
+            Some(crate::paths::data_root().unwrap().as_path()),
+            "the key belongs with the data it guards"
+        );
+    }
+
+    #[test]
+    fn the_api_key_survives_a_round_trip_and_ignores_stray_whitespace() {
+        let dir = scratch("apikey");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("api-token");
+        // Written the way put_api_token writes it, then read the way it is read,
+        // including the trailing newline an editor or an echo would leave.
+        std::fs::write(&path, "err_v1_abc\n").unwrap();
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(raw.trim(), "err_v1_abc");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

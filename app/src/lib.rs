@@ -37,8 +37,7 @@ impl Daemon {
             return Ok(t);
         }
         let fetched = tokio::task::spawn_blocking(|| {
-            errand_core::keychain::get_internal(errand_core::keychain::ACCOUNT_API_TOKEN)
-                .map(|s| s.expose().to_string())
+            errand_core::keychain::get_api_token().map(|s| s.expose().to_string())
         })
         .await
         .map_err(|e| e.to_string())?
@@ -53,6 +52,11 @@ impl Daemon {
 
         *self.token.write().await = Some(fetched.clone());
         Ok(fetched)
+    }
+
+    /// Drop the held token so the next call reads it afresh from the keychain.
+    async fn forget_token(&self) {
+        *self.token.write().await = None;
     }
 }
 
@@ -75,21 +79,58 @@ async fn api(
         return Err(json_err("bad_path", "That is not a valid request."));
     }
 
+    if !matches!(method.as_str(), "GET" | "POST" | "DELETE" | "PATCH") {
+        return Err(json_err(
+            "bad_method",
+            &format!("{method} is not supported."),
+        ));
+    }
+
+    let (status, text) = send_once(&state, &method, &path, body.clone()).await?;
+    if status.is_success() {
+        return Ok(text);
+    }
+
+    // A 401 usually means this window is holding a token the daemon no longer
+    // knows: the daemon minted a new one after this window read the old one.
+    // The window can fix that by itself, so it does, once, rather than showing
+    // somebody a status code and asking them to restart the app.
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        state.forget_token().await;
+        let (status, text) = send_once(&state, &method, &path, body).await?;
+        if status.is_success() {
+            return Ok(text);
+        }
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            return Err(json_err(
+                "token_mismatch",
+                "Errand's key and its background service no longer agree, so the service is \
+                 refusing this window. This happens after switching between a development and a \
+                 release build. Run 'errandd token --new' in a terminal and reopen this window.",
+            ));
+        }
+        return Err(describe(status, text));
+    }
+
+    Err(describe(status, text))
+}
+
+/// One attempt, with whatever token is currently held.
+async fn send_once(
+    state: &tauri::State<'_, Daemon>,
+    method: &str,
+    path: &str,
+    body: Option<String>,
+) -> Result<(reqwest::StatusCode, String), String> {
     let token = state.token().await?;
     let url = format!("{}{}", state.base, path);
     let client = reqwest::Client::new();
 
-    let mut req = match method.as_str() {
+    let mut req = match method {
         "GET" => client.get(&url),
         "POST" => client.post(&url),
         "DELETE" => client.delete(&url),
-        "PATCH" => client.patch(&url),
-        other => {
-            return Err(json_err(
-                "bad_method",
-                &format!("{other} is not supported."),
-            ))
-        }
+        _ => client.patch(&url),
     }
     .bearer_auth(token)
     .timeout(std::time::Duration::from_secs(30));
@@ -109,15 +150,31 @@ async fn api(
     })?;
 
     let status = res.status();
-    let text = res.text().await.unwrap_or_default();
-    if status.is_success() {
-        Ok(text)
-    } else {
-        Err(if text.trim_start().starts_with('{') {
-            text
-        } else {
-            json_err("http_error", &format!("The service returned {status}."))
-        })
+    Ok((status, res.text().await.unwrap_or_default()))
+}
+
+/// The daemon writes its own refusals in plain language, so those are passed
+/// through untouched. Anything else gets a sentence rather than a number.
+fn describe(status: reqwest::StatusCode, text: String) -> String {
+    if text.trim_start().starts_with('{') {
+        return text;
+    }
+    match status.as_u16() {
+        404 => json_err("not_found", "That is no longer there."),
+        408 | 504 => json_err(
+            "timeout",
+            "Errand's background service took too long to answer. It may be in the middle of a \
+             run; try again in a moment.",
+        ),
+        500..=599 => json_err(
+            "service_error",
+            "Something went wrong inside Errand's background service. 'errandd doctor' in a \
+             terminal will say what.",
+        ),
+        _ => json_err(
+            "http_error",
+            &format!("Errand's background service refused that request ({status})."),
+        ),
     }
 }
 

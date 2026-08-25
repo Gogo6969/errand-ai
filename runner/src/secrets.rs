@@ -77,6 +77,19 @@ pub async fn get_internal(account: &str) -> Result<Secret> {
     .await
 }
 
+/// The local API key, which lives in a file rather than the keychain.
+///
+/// See `errand_core::keychain::put_api_token` for why this one is different.
+/// Still on a blocking thread, for the same reason as the rest: a filesystem
+/// call has no business stalling the async runtime.
+pub async fn put_api_token(secret: Secret) -> Result<()> {
+    tokio::task::spawn_blocking(move || errand_core::keychain::put_api_token(&secret)).await?
+}
+
+pub async fn get_api_token() -> Result<Secret> {
+    tokio::task::spawn_blocking(errand_core::keychain::get_api_token).await?
+}
+
 pub async fn delete_internal(account: &str) -> Result<()> {
     delete(
         errand_core::keychain_service_internal(),

@@ -30,8 +30,19 @@ macOS ties keychain access to a program's *code signature*, and `cargo build`
 relinks the binary every time, so each compile looks like a different program.
 That is why "Always Allow" never sticks for a build you made yourself.
 
-Errand handles this by not putting a development build's secrets in your
-keychain at all:
+Two things keep this from happening.
+
+**The local API key is not in the keychain at all.** It is read on every daemon
+start, every `errandd` command and every time the window opens, so keychain-
+holding it meant a prompt several times a day. It lives in `api-token` beside
+the database instead, readable only by you. That is an honest trade rather than
+a convenient one: the key guards a loopback API whose entire database sits in
+the same directory under the same permissions, so anyone who could read the key
+could read the history directly. Site logins and provider keys are the opposite
+case — they unlock things beyond this machine and are read rarely — so those
+stay in the keychain.
+
+**A build you are still compiling never touches the keychain either:**
 
 - A **release** build — the app, and what `scripts/dev-install.sh` installs —
   uses the keychain and is signed with a stable identity. macOS asks once and
@@ -42,16 +53,22 @@ keychain at all:
 
 Override it either way with `ERRAND_KEYCHAIN=on` or `ERRAND_KEYCHAIN=off`.
 
-If you are still being asked, it is an old item whose access list no longer
-matches anything. Clear the development ones — they hold nothing you need:
+If you are still being asked, it is an old item nothing reads any more. The
+obsolete API key is safe to remove — note the `-a`, which removes only that one
+entry and leaves your Telegram and provider keys alone:
+
+```bash
+security delete-generic-password -s com.errandai.app.internal -a api-token-primary
+```
+
+The development leftovers can go entirely, since a build no longer writes there:
 
 ```bash
 security delete-generic-password -s com.errandai.app.internal.dev
 ```
 
-Repeat until it says the item cannot be found, and do the same for
-`com.errandai.app.credentials.dev`. Leave the entries without `.dev` alone:
-those belong to the real app.
+Repeat that one until it says the item cannot be found, and do the same for
+`com.errandai.app.credentials.dev`.
 
 ## A task says it cannot open a website
 

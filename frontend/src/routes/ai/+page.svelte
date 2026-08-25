@@ -12,7 +12,7 @@
 -->
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api, ApiError, type AiSetup, type KnownService, type Provider } from "$lib/api";
+  import { api, ApiError, type AiSetup, type KnownService, type Provider, type ScanResult } from "$lib/api";
   import Hint from "$lib/components/Hint.svelte";
 
   let setup = $state<AiSetup | null>(null);
@@ -20,6 +20,7 @@
   let problem = $state<string | null>(null);
   let busy = $state(false);
   let found = $state<Provider[] | null>(null);
+  let scan = $state<ScanResult | null>(null);
   let scanned = $state(false);
   let scanNetwork = $state(false);
 
@@ -59,10 +60,11 @@
     finally { busy = false; }
   }
 
-  async function scan() {
+  async function runScan() {
     busy = true;
     try {
-      found = (await api.discoverProviders(scanNetwork)).found;
+      scan = await api.discoverProviders(scanNetwork);
+      found = scan.found;
       scanned = true;
       problem = null;
     } catch (e) { problem = e instanceof ApiError ? e.message : String(e); }
@@ -285,8 +287,21 @@
     </div>
 
     <Hint id="ai.scan">
-      <button disabled={busy} onclick={scan}>{busy ? "Looking…" : "Look for models"}</button>
+      <button disabled={busy} onclick={runScan}>{busy ? "Looking…" : "Look for models"}</button>
     </Hint>
+
+    {#if scan?.blocked}
+      <div class="warnbox" style="margin-top:10px">{scan.blocked}</div>
+    {/if}
+
+    {#if scanned && scan && !scan.blocked}
+      <!-- Said out loud, so an empty result reads as "it looked and there was
+           nothing" rather than "it probably did not work". -->
+      <div class="muted" style="margin-top:10px">
+        Tried {scan.ports} ports on {scan.addresses} address{scan.addresses === 1 ? "" : "es"} —
+        {scan.found.length} usable{scan.also_seen.length ? `, ${scan.also_seen.length} that answered but cannot be used as they are` : ""}.
+      </div>
+    {/if}
 
     {#if scanned}
       {#if found && found.length}
@@ -304,10 +319,25 @@
         {/each}
       {:else}
         <div class="muted" style="margin-top:10px">
-          Nothing answered. If your model runs somewhere Errand did not look — another machine, or
-          a port of your own — add it by address below.
+          Nothing usable answered. If your model runs somewhere Errand did not look — another
+          machine, a port of its own, or behind a name rather than a number — add it by address
+          below.
         </div>
       {/if}
+
+      {#if scan?.also_seen.length}
+        <div class="alsobox">
+          <strong>Also answered, but not usable as they are</strong>
+          {#each scan.also_seen as a}
+            <div class="muted">{a.why} <span class="mono">{a.url}</span></div>
+          {/each}
+        </div>
+      {/if}
+
+      <div class="muted" style="margin-top:10px">
+        A server reached by a name rather than a number — anything behind a reverse proxy that
+        routes on the hostname — cannot be found by looking at addresses. Add those by address.
+      </div>
     {/if}
 
     <Hint id="ai.custom">
@@ -364,6 +394,16 @@
   .using { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--ink-soft); }
   .detail { word-break: break-word; }
+  .alsobox {
+    margin-top: 10px; padding: 9px 11px; border-radius: 6px;
+    background: var(--warn-bg); color: var(--warn); font-size: 12.5px;
+    display: flex; flex-direction: column; gap: 3px;
+  }
+  .alsobox .mono { opacity: 0.85; }
+  .warnbox {
+    background: var(--warn-bg); color: var(--warn);
+    padding: 9px 11px; border-radius: 6px; font-size: 12.5px; max-width: 520px;
+  }
   .row { display: flex; align-items: flex-start; gap: 12px; }
   .row.found { border-top: 1px solid var(--line); padding-top: 10px; margin-top: 10px; }
   .grow { flex: 1; min-width: 0; }

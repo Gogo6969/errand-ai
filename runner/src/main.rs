@@ -203,6 +203,10 @@ async fn serve(foreground: bool) -> Result<()> {
         return Ok(());
     };
 
+    // Before anything opens a socket. launchd's default of 256 open files is
+    // fine for ordinary work and nowhere near enough to sweep a network.
+    models::raise_file_descriptor_limit();
+
     errand_core::paths::ensure_dirs()?;
     let pool = errand_core::db::open()
         .await

@@ -312,6 +312,126 @@ pub async fn check_one(p: &Provider) -> (&'static str, String) {
     }
 }
 
+/// What a scan turned up, including the things it could not use.
+///
+/// The near misses matter as much as the hits. A scan that quietly drops an
+/// endpoint needing a key, or one with no model loaded, looks identical to a
+/// network with nothing on it — and the person is left believing Errand looked
+/// properly when it looked and shrugged.
+#[derive(Debug, Default)]
+pub struct Discovery {
+    pub found: Vec<Provider>,
+    /// Answered, but not usable as it stands. Reported with the reason.
+    pub also_seen: Vec<(String, String)>,
+    pub addresses: usize,
+    pub ports: usize,
+    /// Set when macOS is refusing this process the local network entirely, in
+    /// which case an empty result says nothing about what is out there.
+    pub blocked: Option<String>,
+}
+
+/// Is macOS refusing this process access to the local network?
+///
+/// Since Sequoia, a program needs the user's permission to talk to anything on
+/// the local network, and a background service started by launchd has no way to
+/// raise that prompt where anybody would see it. Denied connections then fail
+/// instantly, so a sweep finishes in half a second and reports nothing — which
+/// is indistinguishable from a network with nothing on it, and sends people off
+/// to debug their model server instead of their privacy settings.
+///
+/// The router is the test. Every working LAN has one, it answers on at least
+/// one of these ports, and it is the one address on the network that can be
+/// found without guessing.
+async fn local_network_blocked() -> bool {
+    let Some(gateway) = default_gateway() else {
+        // No gateway means no LAN to be blocked from — Wi-Fi off, or a machine
+        // with only loopback. Not this problem.
+        return false;
+    };
+    for port in [80u16, 443, 53, 8080] {
+        let ok = tokio::time::timeout(
+            std::time::Duration::from_millis(700),
+            tokio::net::TcpStream::connect(format!("{gateway}:{port}")),
+        )
+        .await;
+        if matches!(ok, Ok(Ok(_))) {
+            return false;
+        }
+    }
+    true
+}
+
+/// How many sockets this process may safely have open at once.
+///
+/// Two thirds of whatever is left after the descriptors already in use, capped
+/// at a number that is polite to the network stack. The daemon also raises its
+/// own soft limit at boot, but this has to stand on its own: a limit that was
+/// not raised must slow the scan down, never silently empty it.
+fn socket_budget() -> usize {
+    let limit = file_descriptor_limit().unwrap_or(256);
+    // Leave room for the database pool, the log, the browser and the API.
+    let spare = limit.saturating_sub(64);
+    (spare * 2 / 3).clamp(16, 256)
+}
+
+/// The soft limit on open files, or None if it cannot be read.
+fn file_descriptor_limit() -> Option<usize> {
+    // SAFETY: getrlimit fills a struct we own and returns 0 on success.
+    unsafe {
+        let mut rl: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
+            return None;
+        }
+        Some(rl.rlim_cur as usize)
+    }
+}
+
+/// Ask for as many open files as the system will allow.
+///
+/// Called once at boot. launchd's default of 256 is enough for ordinary work
+/// and far too few for a network sweep, and raising the soft limit to the hard
+/// one needs no privileges — it is what every server does.
+pub fn raise_file_descriptor_limit() {
+    // SAFETY: both calls operate on a struct we own.
+    unsafe {
+        let mut rl: libc::rlimit = std::mem::zeroed();
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut rl) != 0 {
+            return;
+        }
+        let wanted = rl.rlim_max.min(8192);
+        if rl.rlim_cur >= wanted {
+            return;
+        }
+        let was = rl.rlim_cur;
+        rl.rlim_cur = wanted;
+        if libc::setrlimit(libc::RLIMIT_NOFILE, &rl) == 0 {
+            tracing::debug!("raised the open-file limit from {was} to {wanted}");
+        }
+    }
+}
+
+fn default_gateway() -> Option<String> {
+    let out = std::process::Command::new("/sbin/route")
+        .args(["-n", "get", "default"])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|l| {
+            l.trim()
+                .strip_prefix("gateway:")
+                .map(|g| g.trim().to_string())
+        })
+        .filter(|g| g.parse::<std::net::Ipv4Addr>().is_ok())
+}
+
+/// What to tell somebody whose scan was refused by the operating system.
+pub const LOCAL_NETWORK_BLOCKED: &str =
+    "macOS is not letting Errand's background service reach your local network, so it could only \
+     look at this machine. Open System Settings, go to Privacy & Security, then Local Network, and \
+     switch on Errand-AI. Then try again. Until that is done, a model on another machine cannot be \
+     found or used, however it is added.";
+
 /// Look for models, on this machine and optionally on this network.
 ///
 /// Two quite different things, which is why they are separate. Loopback is
@@ -323,37 +443,48 @@ pub async fn check_one(p: &Provider) -> (&'static str, String) {
 ///
 /// Nothing found is switched on. Finding a model and trusting it are separate
 /// decisions, and the second one is not Errand's to make.
-pub async fn discover(scan_network: bool) -> Vec<Provider> {
+///
+/// What this CANNOT find, and no address sweep could: anything reached by name
+/// rather than by number. A server behind a reverse proxy that routes on the
+/// hostname — an Olares app, a Tailscale name, anything with its own domain —
+/// answers nothing useful at its bare address. Those have to be added by
+/// address, which is why that option sits next to this one.
+pub async fn discover(scan_network: bool) -> Discovery {
     let mut hosts: Vec<String> = vec!["127.0.0.1".into()];
     if scan_network {
         hosts.extend(subnet_hosts());
     }
 
-    // The ports worth trying on another machine. Loopback tries everything;
-    // across a network the long tail is mostly other people's web servers.
-    let lan_ports = [11434u16, 1234, 3000, 8080, 8000];
-
+    // Every port, everywhere. An earlier version tried only five of them across
+    // a network, on the theory that the long tail was other people's web
+    // servers — but the cost of a closed port is one refused connection, and
+    // the cost of missing somebody's model server is that they conclude the
+    // feature does not work.
     let mut jobs = vec![];
     for host in &hosts {
-        let local = host == "127.0.0.1";
         for probe in errand_core::providers::PROBES {
-            if !local && !lan_ports.contains(&probe.port) {
-                continue;
-            }
             jobs.push((host.clone(), probe.port, probe.what));
         }
     }
 
     tracing::info!(
         addresses = hosts.len(),
+        ports = errand_core::providers::PROBES.len(),
         probes = jobs.len(),
         scan_network,
         "looking for models"
     );
 
-    // Bounded, so a /24 does not open two thousand sockets at once and get the
-    // machine throttled by its own network stack.
-    let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(64));
+    // How many sockets to have open at once.
+    //
+    // Not a constant, because the honest answer depends on where this process
+    // is running. launchd hands its children a soft limit of 256 open files
+    // while a terminal gets a million, so a sweep tuned for a terminal opens
+    // every socket it is allowed and then fails instantly on all the rest —
+    // giving a scan that finishes in half a second and finds nothing at all,
+    // which reads exactly like a network with nothing on it. That is precisely
+    // the bug this comment exists to stop somebody reintroducing.
+    let limit = std::sync::Arc::new(tokio::sync::Semaphore::new(socket_budget()));
     let mut tasks = tokio::task::JoinSet::new();
     for (host, port, what) in jobs {
         let limit = limit.clone();
@@ -365,34 +496,64 @@ pub async fn discover(scan_network: bool) -> Vec<Provider> {
             // request to a dead address costs the whole timeout.
             let addr = format!("{host}:{port}");
             let connected = tokio::time::timeout(
-                std::time::Duration::from_millis(400),
+                std::time::Duration::from_millis(500),
                 tokio::net::TcpStream::connect(&addr),
             )
             .await;
             if !matches!(connected, Ok(Ok(_))) {
                 return None;
             }
+            tracing::debug!(%addr, "something is listening");
 
-            let base = format!("http://{host}:{port}/v1");
-            let models = tokio::time::timeout(
-                std::time::Duration::from_millis(2500),
-                list_models(&base, None),
-            )
-            .await
-            .ok()?
-            .ok()?;
-            if models.is_empty() {
-                return None;
-            }
+            let scheme = if errand_core::providers::TLS_PORTS.contains(&port) {
+                "https"
+            } else {
+                "http"
+            };
+            let base = format!("{scheme}://{host}:{port}/v1");
+            let where_ = if host == "127.0.0.1" {
+                format!("{what} on this machine")
+            } else {
+                format!("{what} on {host}")
+            };
 
-            Some(Provider {
+            let outcome =
+                tokio::time::timeout(std::time::Duration::from_secs(4), list_models(&base, None))
+                    .await;
+
+            let models = match outcome {
+                // Something is listening but never answered. Almost always a
+                // service that is not HTTP at all, so not worth reporting.
+                Err(_) => {
+                    tracing::debug!(%addr, "listening, but did not answer");
+                    return None;
+                }
+                Ok(Ok(m)) if m.is_empty() => {
+                    return Some(Err((
+                        base,
+                        format!("{where_} answered, but has no model loaded"),
+                    )));
+                }
+                Ok(Ok(m)) => m,
+                Ok(Err(e)) => {
+                    tracing::debug!(%addr, "listening, but not a model server: {e}");
+                    // A refused key is the interesting one: it means an
+                    // OpenAI-compatible server really is there and only needs
+                    // adding by hand with its key.
+                    if e.contains("refused the key") {
+                        return Some(Err((
+                            base,
+                            format!("{where_} needs a key. Add it by address below."),
+                        )));
+                    }
+                    return None;
+                }
+            };
+
+            Some(Ok(Provider {
                 id: format!("found:{base}"),
                 kind: Kind::OpenAiCompat.as_str().into(),
-                label: if host == "127.0.0.1" {
-                    format!("{what} on this machine")
-                } else {
-                    format!("{what} on {host}")
-                },
+                label: where_,
                 base_url: Some(base),
                 model: models.first().cloned(),
                 enabled: false,
@@ -408,19 +569,31 @@ pub async fn discover(scan_network: bool) -> Vec<Provider> {
                         .collect::<Vec<_>>()
                         .join(", ")
                 )),
-            })
+            }))
         });
     }
 
-    let mut found = vec![];
+    let mut out = Discovery {
+        addresses: hosts.len(),
+        ports: errand_core::providers::PROBES.len(),
+        ..Default::default()
+    };
+    // Asked only when it matters, and only after the sweep, so the check costs
+    // nothing on the common path.
+    if scan_network && local_network_blocked().await {
+        out.blocked = Some(LOCAL_NETWORK_BLOCKED.to_string());
+    }
     while let Some(res) = tasks.join_next().await {
-        if let Ok(Some(p)) = res {
-            found.push(p);
+        match res {
+            Ok(Some(Ok(p))) => out.found.push(p),
+            Ok(Some(Err((url, why)))) => out.also_seen.push((url, why)),
+            _ => {}
         }
     }
     // A stable order, so the same scan twice does not reshuffle the list.
-    found.sort_by(|a, b| a.base_url.cmp(&b.base_url));
-    found
+    out.found.sort_by(|a, b| a.base_url.cmp(&b.base_url));
+    out.also_seen.sort();
+    out
 }
 
 /// Every other address on the networks this machine is already on.
@@ -483,14 +656,35 @@ mod tests {
     async fn the_network_is_never_scanned_unless_it_was_asked_for() {
         // Sweeping somebody's network unasked is rude, and on a work network it
         // looks like something else entirely. The default must stay loopback.
-        let found = discover(false).await;
-        for p in &found {
-            let url = p.base_url.clone().unwrap_or_default();
+        let d = discover(false).await;
+        assert_eq!(
+            d.addresses, 1,
+            "only this machine should have been looked at"
+        );
+        for url in d
+            .found
+            .iter()
+            .filter_map(|p| p.base_url.clone())
+            .chain(d.also_seen.iter().map(|(u, _)| u.clone()))
+        {
             assert!(
                 url.starts_with("http://127.0.0.1:"),
                 "an unasked-for scan reached {url}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn a_scan_says_how_hard_it_looked_even_when_it_finds_nothing() {
+        // An empty list has two very different meanings — "there is nothing
+        // there" and "it did not really look" — and only one of them is worth
+        // acting on. The counts are what tell them apart.
+        let d = discover(false).await;
+        assert_eq!(d.ports, errand_core::providers::PROBES.len());
+        assert!(
+            d.ports >= 15,
+            "a handful of ports misses most of the ecosystem"
+        );
     }
 
     #[test]

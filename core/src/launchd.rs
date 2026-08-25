@@ -109,7 +109,16 @@ fn render_plist_with(exe: &Path, logs_dir: &Path, extra_env: &[(String, String)]
         <string>{exe}</string>
         <string>--launchd</string>
     </array>
-    <key>RunAtLoad</key>
+    <key>SoftResourceLimits</key>
+  <dict>
+    <!-- launchd hands its children 256 open files, which is fine for ordinary
+         work and nowhere near enough to sweep a network for model servers. The
+         daemon also raises this itself at boot; asking here means it starts
+         with the room rather than having to take it. -->
+    <key>NumberOfFiles</key>
+    <integer>8192</integer>
+  </dict>
+  <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
     <dict>

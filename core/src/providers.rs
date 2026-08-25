@@ -423,7 +423,17 @@ pub const PROBES: &[Probe] = &[
         models_path: "/v1/models",
     },
     Probe {
+        port: 11435,
+        what: "Ollama",
+        models_path: "/v1/models",
+    },
+    Probe {
         port: 1234,
+        what: "LM Studio",
+        models_path: "/v1/models",
+    },
+    Probe {
+        port: 1235,
         what: "LM Studio",
         models_path: "/v1/models",
     },
@@ -433,18 +443,38 @@ pub const PROBES: &[Probe] = &[
         models_path: "/v1/models",
     },
     Probe {
+        port: 8001,
+        what: "vLLM",
+        models_path: "/v1/models",
+    },
+    Probe {
         port: 8080,
         what: "llama.cpp",
         models_path: "/v1/models",
     },
     Probe {
-        port: 5000,
-        what: "a local server",
+        port: 8081,
+        what: "llama.cpp",
         models_path: "/v1/models",
     },
     Probe {
-        port: 8081,
-        what: "a local server",
+        port: 8090,
+        what: "a model server",
+        models_path: "/v1/models",
+    },
+    Probe {
+        port: 3000,
+        what: "Open WebUI",
+        models_path: "/v1/models",
+    },
+    Probe {
+        port: 3001,
+        what: "AnythingLLM",
+        models_path: "/v1/models",
+    },
+    Probe {
+        port: 4000,
+        what: "LiteLLM",
         models_path: "/v1/models",
     },
     Probe {
@@ -453,11 +483,48 @@ pub const PROBES: &[Probe] = &[
         models_path: "/v1/models",
     },
     Probe {
-        port: 3000,
-        what: "Open WebUI",
+        port: 5000,
+        what: "a model server",
+        models_path: "/v1/models",
+    },
+    Probe {
+        port: 5001,
+        what: "KoboldCpp",
+        models_path: "/v1/models",
+    },
+    Probe {
+        port: 1337,
+        what: "Jan",
+        models_path: "/v1/models",
+    },
+    Probe {
+        port: 9997,
+        what: "Xinference",
+        models_path: "/v1/models",
+    },
+    Probe {
+        port: 30000,
+        what: "SGLang",
+        models_path: "/v1/models",
+    },
+    Probe {
+        port: 7860,
+        what: "a model server",
+        models_path: "/v1/models",
+    },
+    Probe {
+        port: 8443,
+        what: "a model server",
         models_path: "/v1/models",
     },
 ];
+
+/// Ports where a server is normally behind TLS, so the scan speaks https there.
+///
+/// Everything else is tried over plain http: a model server on a home network
+/// almost never has a certificate, and trying both on every port would double a
+/// scan that is already the slowest thing in the app.
+pub const TLS_PORTS: &[u16] = &[443, 8443];
 
 /// Which model each role uses when nobody has said otherwise.
 ///

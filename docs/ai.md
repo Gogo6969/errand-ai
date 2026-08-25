@@ -48,10 +48,20 @@ service. They never reach Errand's database, its logs, or the app window.
 
 ## Models on your own machines
 
-Ollama, LM Studio, vLLM, llama.cpp, GPT4All and Open WebUI all speak the same
-format. **Look for models** tries the ports they use on this machine; ticking
-*look on my network too* also tries every address on the subnet this Mac is on,
-which takes a few seconds.
+Ollama, LM Studio, vLLM, llama.cpp, GPT4All, KoboldCpp, Jan, LiteLLM, Xinference
+and Open WebUI all speak the same format. **Look for models** tries twenty ports
+on this machine; ticking *look on my network too* tries all twenty on every
+address of the subnet this Mac is on, which takes a few seconds.
+
+It says afterwards how many addresses and ports it tried, and lists anything
+that answered but could not be used — a server that wants an API key, or one
+with no model loaded. Those are worth seeing: a scan that quietly drops them
+looks identical to a network with nothing on it.
+
+**What no scan can find** is a server reached by a *name* rather than a number.
+Anything behind a reverse proxy that routes on the hostname — an Olares app, a
+Tailscale name, a machine with its own domain — answers nothing useful at its
+bare address. Add those with **Add one by address instead**.
 
 The network sweep is off by default and only ever covers your own subnet.
 Scanning a network you do not own is rude, and on a work network it looks like

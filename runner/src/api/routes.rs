@@ -2477,12 +2477,24 @@ async fn discover_providers(
     Query(q): Query<Discover>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require(&caller, Scope::Manage)?;
-    let found = crate::models::discover(q.scan_network).await;
+    let d = crate::models::discover(q.scan_network).await;
     Ok(Json(json!({
-        "found": found,
+        "found": d.found,
         // Said back, so nobody has to infer from an empty list whether the scan
-        // they asked for actually happened.
+        // they asked for actually happened, or how hard it looked.
         "looked_at": scanned_where(q.scan_network),
+        "addresses": d.addresses,
+        "ports": d.ports,
+        // When macOS is refusing the local network, an empty result says
+        // nothing about what is out there, and must not be read as if it did.
+        "blocked": d.blocked,
+        // Answered, but not usable as it stands. Reported rather than dropped:
+        // a server that only needs a key looks exactly like an empty network if
+        // nobody says otherwise.
+        "also_seen": d.also_seen
+            .iter()
+            .map(|(url, why)| json!({ "url": url, "why": why }))
+            .collect::<Vec<_>>(),
         // Nothing is switched on by this call. Finding something and using it
         // are separate decisions, and the second one is the person's.
         "note": "Nothing has been added yet. Pick the ones you want to use.",

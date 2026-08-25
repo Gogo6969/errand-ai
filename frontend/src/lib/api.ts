@@ -209,10 +209,7 @@ export const api = {
   removeProvider: (id: string) => call("DELETE", `/v1/ai/providers/${id}`),
   testProvider: (id: string) => call<{ health: string; health_detail: string }>("POST", `/v1/ai/providers/${id}/test`),
   discoverProviders: (scanNetwork = false) =>
-    call<{ found: Provider[]; looked_at: string; note: string }>(
-      "POST",
-      `/v1/ai/discover?scan_network=${scanNetwork}`,
-    ),
+    call<ScanResult>("POST", `/v1/ai/discover?scan_network=${scanNetwork}`),
   bindRole: (role: string, providerId: string | null) =>
     call("POST", `/v1/ai/roles/${role}`, { provider_id: providerId }),
   setLocalOnly: (enabled: boolean) => call("POST", "/v1/ai/local-only", { enabled }),
@@ -256,6 +253,19 @@ export interface Recipient {
 export interface TaskRecipient extends Recipient {
   on_success: boolean;
   on_failure: boolean;
+}
+
+/** What a scan turned up, including what it could not use. */
+export interface ScanResult {
+  found: Provider[];
+  looked_at: string;
+  addresses: number;
+  ports: number;
+  /** Answered, but not usable as it stands — with the reason. */
+  also_seen: { url: string; why: string }[];
+  /** Set when macOS refused the local network, so an empty result means nothing. */
+  blocked?: string | null;
+  note: string;
 }
 
 export interface Provider {

@@ -263,6 +263,26 @@ else
 fi
 
 # ---------------------------------------------------------------------------
+head2 "A scan opens enough sockets to be worth running"
+# The bug this guards: launchd gives its children 256 open files while a
+# terminal gets a million, so a sweep tuned for a terminal blew past the limit
+# and every connection failed instantly. The scan finished in half a second and
+# found nothing, which reads exactly like a network with nothing on it.
+
+expect "a scan of this machine reports how hard it looked" \
+  "$(api POST '/v1/ai/discover?scan_network=false')" \
+  "d.get('ports', 0) >= 15 and d.get('addresses') == 1"
+
+# Loopback alone must still find whatever is running here, if anything is.
+LOCAL=$(api POST '/v1/ai/discover?scan_network=false')
+if printf '%s' "$LOCAL" | grep -q '"found":\[\]'; then
+  ok "no model server is running on this machine, and the scan says so plainly"
+else
+  expect "a model server on this machine is found, not silently skipped" \
+    "$LOCAL" "all(f['base_url'].startswith('http://127.0.0.1:') for f in d['found'])"
+fi
+
+# ---------------------------------------------------------------------------
 head2 "Nothing leaked"
 # The database and the log are the two places a secret most easily ends up.
 

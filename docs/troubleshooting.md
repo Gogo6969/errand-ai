@@ -26,10 +26,32 @@ that failed its integrity check.
 
 ## Errand keeps asking for keychain permission
 
-macOS ties keychain access to a program's code signature, so a differently
-signed build is a different program as far as the keychain is concerned. If you
-are building it yourself, sign with a stable identity rather than ad-hoc
-(`codesign --sign -`), which produces a new identity on every build.
+macOS ties keychain access to a program's *code signature*, and `cargo build`
+relinks the binary every time, so each compile looks like a different program.
+That is why "Always Allow" never sticks for a build you made yourself.
+
+Errand handles this by not putting a development build's secrets in your
+keychain at all:
+
+- A **release** build — the app, and what `scripts/dev-install.sh` installs —
+  uses the keychain and is signed with a stable identity. macOS asks once and
+  the answer holds.
+- A **debug** build — `cargo run`, `cargo test`, `scripts/smoke.sh` — keeps its
+  secrets in `dev-secrets.json` beside its own database, readable only by you.
+  It never raises a prompt. `errandd doctor` says which of the two is in use.
+
+Override it either way with `ERRAND_KEYCHAIN=on` or `ERRAND_KEYCHAIN=off`.
+
+If you are still being asked, it is an old item whose access list no longer
+matches anything. Clear the development ones — they hold nothing you need:
+
+```bash
+security delete-generic-password -s com.errandai.app.internal.dev
+```
+
+Repeat until it says the item cannot be found, and do the same for
+`com.errandai.app.credentials.dev`. Leave the entries without `.dev` alone:
+those belong to the real app.
 
 ## A task says it cannot open a website
 

@@ -11,7 +11,7 @@
 //! that names the real cause.
 
 use anyhow::{anyhow, Result};
-use errand_core::keychain::{CredStore, Secret};
+use errand_core::keychain::Secret;
 use std::time::Duration;
 
 /// Long enough for a healthy keychain, short enough that a blocked prompt does

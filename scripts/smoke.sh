@@ -87,9 +87,11 @@ export ERRAND_API_PORT="$PORT"
 # Never let a smoke test send a real message to a real person.
 export ERRAND_APPLE_DRY=1
 
-# A token minted against THIS database. Note the keychain is shared across data
-# directories, so this rewrites the developer's own token — scripts/dev-install
-# mints a fresh one, and so does the daemon at boot.
+# The binary under test is a debug build, so its secrets go to a file beside
+# this scratch database rather than into the real keychain. That is what stops
+# this script raising an OS permission dialog, and what stops it overwriting the
+# token the installed release daemon is using.
+export ERRAND_KEYCHAIN=off
 TOKEN=$("$BIN" token --new 2>/dev/null | head -1)
 [ -n "$TOKEN" ] || { echo "could not mint a token"; exit 1; }
 

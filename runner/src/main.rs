@@ -400,12 +400,27 @@ async fn doctor() -> Result<u32> {
         if !ok {
             problems += 1;
         }
-        println!("  {}  keychain read/write: {}", tick(ok), ks.as_str());
+        println!(
+            "  {}  secrets kept in: {}",
+            tick(ok),
+            errand_core::keychain::store_description()
+        );
+        println!("  {}  read/write: {}", tick(ok), ks.as_str());
         match ks {
             secrets::KeychainState::Blocked => {
                 println!("      macOS is waiting on an authorization prompt for an item whose");
                 println!("      access list no longer matches this build. Open Keychain Access,");
                 println!("      delete the 'com.errandai.app' items, and start the runner again.");
+            }
+            #[allow(unreachable_patterns)]
+            _ if !errand_core::keychain::using_keychain() => {
+                println!("      This is a development build, so its secrets are in a plain file");
+                println!(
+                    "      rather than your keychain. That is deliberate: macOS ties keychain"
+                );
+                println!("      access to a code signature, and every rebuild produces a new one,");
+                println!("      so a development build would ask permission on every compile.");
+                println!("      Do not keep anything you actually care about in this build.");
             }
             secrets::KeychainState::Error => {
                 println!(
@@ -421,21 +436,28 @@ async fn doctor() -> Result<u32> {
     if !has_token {
         problems += 1;
     }
-    println!("  {}  API token in keychain", tick(has_token));
+    println!("  {}  API token saved", tick(has_token));
     if !has_token {
         println!("      The API itself still works: what authenticates a request is the hash");
-        println!("      in the database, and the keychain only holds a readable copy. Usual");
-        println!("      causes, in order of likelihood:");
+        println!("      in the database, and the saved copy is only there so the app and the");
+        println!("      command line can read it back. Usual causes:");
         println!("        - The runner has never started. Start it and it mints one.");
-        println!("        - You switched between a debug and a release build. They deliberately");
-        println!("          use separate keychain services, so each needs its own token.");
-        println!("        - The binary was rebuilt and re-signed, so the stored item's access");
-        println!("          list no longer matches it.");
-        println!(
-            "      For the last two: delete the '{}' items in",
-            errand_core::keychain_service_internal()
-        );
-        println!("      Keychain Access, then restart the runner.");
+        println!("        - You switched between a debug and a release build. Those keep their");
+        println!("          secrets in different places on purpose, so each needs its own.");
+        // The remedy is genuinely different for the two stores, and sending
+        // somebody to Keychain Access for a build that never wrote there is how
+        // a diagnostic loses the trust that makes it worth reading.
+        if errand_core::keychain::using_keychain() {
+            println!("        - The binary was rebuilt and re-signed, so the stored item's access");
+            println!("          list no longer matches it.");
+            println!(
+                "      For the last two: delete the '{}' items in",
+                errand_core::keychain_service_internal()
+            );
+            println!("      Keychain Access, then restart the runner.");
+        } else {
+            println!("      Mint one with 'errandd token --new', or just start the runner.");
+        }
     }
 
     // Claude CLI: the flagship executor

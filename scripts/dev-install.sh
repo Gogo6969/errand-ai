@@ -16,7 +16,18 @@ cd "$(dirname "$0")/.."
 
 DEST_DIR="$HOME/Library/Application Support/com.errandai.app/bin"
 DEST="$DEST_DIR/errandd"
-PROFILE="${1:-debug}"
+# Release by default, and that is not just about speed.
+#
+# A release build keeps its secrets in the macOS keychain and is signed with a
+# stable identity, so macOS asks permission once and the answer sticks. A debug
+# build deliberately keeps its secrets in a file instead, because cargo relinks
+# it on every compile and macOS treats each relink as a different program — it
+# would ask permission again after every single build, and the habit of clicking
+# Allow without reading is worse than anything the prompt was protecting.
+#
+# So the daemon you actually live with should be a release build. Pass "debug"
+# if you want the other one for a moment.
+PROFILE="${1:-release}"
 
 echo "Building ($PROFILE)"
 if [ "$PROFILE" = "release" ]; then

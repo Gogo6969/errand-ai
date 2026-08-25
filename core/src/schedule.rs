@@ -212,6 +212,81 @@ impl ScheduleSpec {
         Ok(())
     }
 
+    /// This schedule in plain English.
+    ///
+    /// Shown back to the person immediately after they set it, because a form
+    /// that builds a cron expression can be wrong in ways nobody notices until
+    /// the run does not happen. This reads the expression that will actually be
+    /// used, so it disagrees with the form rather than agreeing with it.
+    ///
+    /// Deliberately conservative: anything it cannot describe with confidence
+    /// is shown as the raw expression rather than guessed at. A wrong sentence
+    /// here is worse than a cryptic one, because a wrong one is believed.
+    pub fn describe(&self) -> String {
+        let base = match &self.kind {
+            Kind::Manual => return "Only when you ask. It will not run on its own.".into(),
+            Kind::Once { at } => format!("Once, on {at}"),
+            Kind::Cron { expr } => match describe_cron(expr) {
+                Some(words) => words,
+                None => format!("On the schedule {expr}"),
+            },
+        };
+
+        let mut out = format!("{base} ({})", self.tz);
+        if let Some(w) = &self.window {
+            out.push_str(&format!(
+                ", and only between {} and {}",
+                w.not_before, w.not_after
+            ));
+            if w.arm_early_s > 0 {
+                out.push_str(&format!(
+                    ", starting {} beforehand so it is ready",
+                    plain_duration(w.arm_early_s)
+                ));
+            }
+        }
+        if self.jitter_s > 0 {
+            out.push_str(&format!(
+                ", give or take up to {}",
+                plain_duration(self.jitter_s)
+            ));
+        }
+        out.push('.');
+
+        out.push_str(match self.catch_up {
+            CatchUp::Skip => " If it is missed, it is skipped rather than run late.",
+            CatchUp::RunOnceLate => "",
+            CatchUp::RunAll => " Every missed run is made up afterwards.",
+        });
+        if self.catch_up == CatchUp::RunOnceLate {
+            out.push_str(&format!(
+                " If your Mac was asleep, it runs late as long as it is within {}.",
+                plain_duration(self.catch_up_grace_min * 60)
+            ));
+        }
+        out
+    }
+
+    /// The next few times this would actually run.
+    ///
+    /// The other half of the honesty loop: the words say what was meant, and
+    /// these say what the engine will really do. Anyone can check one against
+    /// the other without waiting until tomorrow morning to find out.
+    pub fn preview(&self, from: DateTime<Utc>, count: usize) -> Result<Vec<DateTime<Utc>>> {
+        let mut out = vec![];
+        let mut cursor = from;
+        for _ in 0..count {
+            match self.next_after(cursor)? {
+                Some(next) => {
+                    out.push(next);
+                    cursor = next;
+                }
+                None => break,
+            }
+        }
+        Ok(out)
+    }
+
     /// When the runner should actually start, given a window that wants the
     /// agent logged in and waiting before the barrier lifts.
     pub fn start_at(&self, occurrence: DateTime<Utc>) -> DateTime<Utc> {
@@ -399,6 +474,91 @@ pub fn jitter_for(task_id: &str, occurrence: DateTime<Utc>, jitter_s: i64) -> Du
         h = h.wrapping_mul(1099511628211);
     }
     Duration::seconds((h % (jitter_s as u64 + 1)) as i64)
+}
+
+/// A number of seconds, said the way a person would say it, and exactly.
+///
+/// Rounding is not allowed here. This phrasing goes into a sentence describing
+/// what the app will do, and "1 minute" for ninety seconds is a small lie that
+/// makes the description disagree with the schedule.
+fn plain_duration(secs: i64) -> String {
+    let s = secs.max(0);
+    if s < 60 {
+        return format!("{s} second{}", if s == 1 { "" } else { "s" });
+    }
+    let (mins, rem_s) = (s / 60, s % 60);
+    if mins < 60 {
+        return if rem_s == 0 {
+            format!("{mins} minute{}", if mins == 1 { "" } else { "s" })
+        } else {
+            format!("{mins}m {rem_s}s")
+        };
+    }
+    let (hours, rem_m) = (mins / 60, mins % 60);
+    match (rem_m, rem_s) {
+        (0, 0) => format!("{hours} hour{}", if hours == 1 { "" } else { "s" }),
+        (m, 0) => format!("{hours}h {m}m"),
+        (m, sec) => format!("{hours}h {m}m {sec}s"),
+    }
+}
+
+/// Turn the common cron shapes into a sentence, or give up honestly.
+///
+/// croner takes six fields, seconds first, which is a real trap: a five-field
+/// expression copied from somewhere else means something entirely different
+/// here. Only the shapes below are described; anything else is shown raw.
+fn describe_cron(expr: &str) -> Option<String> {
+    let f: Vec<&str> = expr.split_whitespace().collect();
+    if f.len() != 6 {
+        return None;
+    }
+    let (sec, min, hour, dom, mon, dow) = (f[0], f[1], f[2], f[3], f[4], f[5]);
+
+    // Only an exact time of day is described. A range or a step in the seconds,
+    // minutes or hours field means something this cannot say in one clause.
+    let time = match (sec.parse::<u32>(), min.parse::<u32>(), hour.parse::<u32>()) {
+        (Ok(0), Ok(m), Ok(h)) if m < 60 && h < 24 => format!("{h:02}:{m:02}"),
+        _ => return None,
+    };
+
+    if mon != "*" {
+        return None;
+    }
+
+    match (dom, dow) {
+        ("*", "*") => Some(format!("Every day at {time}")),
+        ("*", d) => weekday_name(d).map(|n| format!("Every {n} at {time}")),
+        (day, "*") => day
+            .parse::<u32>()
+            .ok()
+            .filter(|d| (1..=31).contains(d))
+            .map(|d| format!("On the {} of every month at {time}", ordinal(d))),
+        _ => None,
+    }
+}
+
+fn weekday_name(d: &str) -> Option<&'static str> {
+    Some(match d.to_ascii_uppercase().as_str() {
+        "0" | "7" | "SUN" => "Sunday",
+        "1" | "MON" => "Monday",
+        "2" | "TUE" => "Tuesday",
+        "3" | "WED" => "Wednesday",
+        "4" | "THU" => "Thursday",
+        "5" | "FRI" => "Friday",
+        "6" | "SAT" => "Saturday",
+        _ => return None,
+    })
+}
+
+fn ordinal(n: u32) -> String {
+    let suffix = match (n % 10, n % 100) {
+        (_, 11..=13) => "th",
+        (1, _) => "st",
+        (2, _) => "nd",
+        (3, _) => "rd",
+        _ => "th",
+    };
+    format!("{n}{suffix}")
 }
 
 #[cfg(test)]
@@ -790,5 +950,140 @@ mod tests {
             ScheduleSpec::default().not_before_instant(occ).unwrap(),
             None
         );
+    }
+
+    // ------------------------------------------------- saying it in words --
+
+    #[test]
+    fn the_everyday_shapes_are_described_in_words() {
+        assert_eq!(
+            cron("0 0 8 * * *", "Europe/Vienna").describe(),
+            "Every day at 08:00 (Europe/Vienna). If your Mac was asleep, it runs late as long as \
+             it is within 2 hours."
+        );
+        assert!(cron("0 30 6 * * WED", "UTC")
+            .describe()
+            .starts_with("Every Wednesday at 06:30 (UTC)"));
+        assert!(cron("0 0 9 1 * *", "UTC")
+            .describe()
+            .starts_with("On the 1st of every month at 09:00"));
+        assert!(cron("0 0 9 22 * *", "UTC")
+            .describe()
+            .starts_with("On the 22nd of every month at 09:00"));
+        assert!(cron("0 0 9 3 * *", "UTC")
+            .describe()
+            .starts_with("On the 3rd of every month at 09:00"));
+    }
+
+    #[test]
+    fn a_schedule_it_cannot_phrase_is_shown_raw_rather_than_guessed_at() {
+        // The important half. A confident wrong sentence is believed; a raw
+        // expression makes someone check.
+        let odd = cron("*/10 * * * * *", "UTC").describe();
+        assert!(
+            odd.contains("*/10 * * * * *"),
+            "should show the expression: {odd}"
+        );
+
+        let ranged = cron("0 0 8-18 * * *", "UTC").describe();
+        assert!(
+            ranged.contains("8-18"),
+            "a range is not a time of day: {ranged}"
+        );
+
+        // A five-field expression means something different under croner, so it
+        // must never be described as though it were the six-field form.
+        assert!(describe_cron("0 8 * * *").is_none());
+    }
+
+    #[test]
+    fn a_duration_is_never_rounded_into_a_small_lie() {
+        assert_eq!(plain_duration(45), "45 seconds");
+        assert_eq!(plain_duration(60), "1 minute");
+        assert_eq!(plain_duration(90), "1m 30s");
+        assert_eq!(plain_duration(120), "2 minutes");
+        assert_eq!(plain_duration(3600), "1 hour");
+        assert_eq!(plain_duration(3660), "1h 1m");
+        assert_eq!(plain_duration(3661), "1h 1m 1s");
+    }
+
+    #[test]
+    fn a_manual_task_says_it_will_not_run_by_itself() {
+        let d = ScheduleSpec::default().describe();
+        assert!(d.contains("will not run on its own"), "{d}");
+    }
+
+    #[test]
+    fn the_window_and_the_wobble_are_admitted() {
+        let s = ScheduleSpec {
+            jitter_s: 90,
+            window: Some(Window {
+                not_before: "07:00".into(),
+                not_after: "07:10".into(),
+                arm_early_s: 120,
+            }),
+            ..cron("0 0 7 * * *", "UTC")
+        };
+        let d = s.describe();
+        assert!(d.contains("between 07:00 and 07:10"), "{d}");
+        assert!(d.contains("2 minutes beforehand"), "{d}");
+        assert!(d.contains("give or take up to 1m 30s"), "{d}");
+    }
+
+    #[test]
+    fn skipping_and_catching_up_are_both_said_out_loud() {
+        let skip = ScheduleSpec {
+            catch_up: CatchUp::Skip,
+            ..cron("0 0 8 * * *", "UTC")
+        };
+        assert!(skip.describe().contains("skipped rather than run late"));
+
+        let all = ScheduleSpec {
+            catch_up: CatchUp::RunAll,
+            ..cron("0 0 8 * * *", "UTC")
+        };
+        assert!(all.describe().contains("Every missed run is made up"));
+    }
+
+    #[test]
+    fn the_preview_shows_what_will_really_happen() {
+        // The other half of the loop: words say what was meant, these say what
+        // the engine will do.
+        let s = cron("0 0 8 * * *", "UTC");
+        let from = "2026-03-01T09:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        let next = s.preview(from, 3).unwrap();
+        assert_eq!(next.len(), 3);
+        assert_eq!(next[0].to_rfc3339(), "2026-03-02T08:00:00+00:00");
+        assert_eq!(next[1].to_rfc3339(), "2026-03-03T08:00:00+00:00");
+        assert!(next[1] > next[0] && next[2] > next[1]);
+    }
+
+    #[test]
+    fn a_manual_or_finished_schedule_previews_as_nothing() {
+        let from = Utc::now();
+        assert!(ScheduleSpec::default().preview(from, 3).unwrap().is_empty());
+
+        let past = ScheduleSpec {
+            kind: Kind::Once {
+                at: "2020-01-01T08:00:00".into(),
+            },
+            ..ScheduleSpec::default()
+        };
+        assert!(
+            past.preview(from, 3).unwrap().is_empty(),
+            "a one-off that has already been is not coming again"
+        );
+    }
+
+    #[test]
+    fn a_one_off_preview_does_not_repeat_forever() {
+        let at = (Utc::now() + Duration::days(1))
+            .format("%Y-%m-%dT%H:%M:%S")
+            .to_string();
+        let s = ScheduleSpec {
+            kind: Kind::Once { at },
+            ..ScheduleSpec::default()
+        };
+        assert_eq!(s.preview(Utc::now(), 5).unwrap().len(), 1);
     }
 }

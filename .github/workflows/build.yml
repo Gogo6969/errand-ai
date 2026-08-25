@@ -65,6 +65,132 @@ jobs:
           npx --prefix packages/client tsc -p packages/client/tsconfig.json
           echo "client exit=$?"
 
+  # Everything above can be green while the app that reaches a user cannot open
+  # a web page at all: the tests exercise the sidecar from the source tree, and
+  # for a long time nothing here ever built a bundle to notice that the sidecar
+  # was not being copied into it. So this job builds the real .app, looks inside
+  # it, and then drives the copy that is actually in there.
+  bundle:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with: { node-version: 20 }
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The sidecar installs from its lockfile, because the browser a user gets
+      # has to be the playwright-core this was tested against. The frontend uses
+      # install rather than ci to match the job above: its lockfile is not
+      # tracked yet, and npm ci refuses to run without one.
+      - name: Dependencies
+        run: |
+          npm --prefix frontend install
+          echo "frontend deps exit=$?"
+          npm --prefix sidecars/browser-agent ci --omit=dev
+          echo "sidecar deps exit=$?"
+
+      # The bundler finds externalBin sources by target triple and strips the
+      # suffix again inside the app, which is how the daemon lands on
+      # Contents/MacOS/errandd, the path core/src/launchd.rs writes into the
+      # LaunchAgent.
+      - name: Stage the daemon for the bundler
+        run: |
+          cargo build --release -p errand-runner --bin errandd
+          mkdir -p app/binaries
+          cp target/release/errandd "app/binaries/errandd-$(rustc -vV | sed -n 's/host: //p')"
+          echo "stage exit=$?"
+
+      - name: Build the bundle
+        run: |
+          cargo install tauri-cli --version "^2" --locked
+          cd app && cargo tauri build
+          echo "bundle exit=$?"
+
+      # Positive evidence that the pieces are inside the app, named one at a
+      # time so a failure says which one is missing.
+      - name: The sidecar is really in the bundle
+        run: |
+          APP="target/release/bundle/macos/Errand-AI.app"
+          test -f "$APP/Contents/Resources/browser-agent/src/main.mjs"
+          echo "sidecar script exit=$?"
+          test -f "$APP/Contents/Resources/browser-agent/node_modules/playwright-core/package.json"
+          echo "playwright-core exit=$?"
+          test -x "$APP/Contents/MacOS/errandd"
+          echo "daemon exit=$?"
+
+      # A file being present is not the same as the sidecar working, and the
+      # failure this job exists to catch was a browser that could not launch on
+      # a machine that had never run Playwright. So talk to the bundled copy.
+      - name: The bundled sidecar answers
+        run: |
+          SIDECAR="target/release/bundle/macos/Errand-AI.app/Contents/Resources/browser-agent/src/main.mjs"
+          printf '%s\n' '{"id":1,"method":"ping"}' | node "$SIDECAR" | tee /tmp/ping.ndjson
+          grep -q '"pong":true' /tmp/ping.ndjson
+          echo "ping exit=$?"
+
+      - name: The bundled sidecar opens a real page
+        run: |
+          cat > /tmp/smoke.mjs <<'SMOKE'
+          // Speaks the sidecar's NDJSON-RPC the way runner/src/browser.rs does.
+          import { spawn } from 'node:child_process';
+          const child = spawn(process.execPath, [process.argv[2]], {
+            stdio: ['pipe', 'pipe', 'inherit'],
+          });
+          const waiting = new Map();
+          let buf = '';
+          child.stdout.on('data', (c) => {
+            buf += c;
+            let i;
+            while ((i = buf.indexOf('\n')) >= 0) {
+              const line = buf.slice(0, i);
+              buf = buf.slice(i + 1);
+              if (!line.trim()) continue;
+              console.log('<-', line.slice(0, 400));
+              let msg;
+              try { msg = JSON.parse(line); } catch { continue; }
+              if (msg.id && waiting.has(msg.id)) {
+                waiting.get(msg.id)(msg);
+                waiting.delete(msg.id);
+              }
+            }
+          });
+          let nextId = 0;
+          function call(method, params = {}) {
+            const id = ++nextId;
+            return new Promise((resolve, reject) => {
+              const t = setTimeout(() => reject(new Error(`no reply to ${method} within 90s`)), 90000);
+              waiting.set(id, (m) => {
+                clearTimeout(t);
+                if (m.error) reject(new Error(m.error.message));
+                else resolve(m.result);
+              });
+              child.stdin.write(JSON.stringify({ id, method, params }) + '\n');
+            });
+          }
+          const probe = await call('browser.probe');
+          if (!probe.found) throw new Error(probe.message);
+          console.log('browser found:', probe.name);
+          const opened = await call('session.open', {
+            profile_dir: '/tmp/errand-ci-profile',
+            headless: true,
+            allowed_domains: ['example.com'],
+          });
+          console.log('session opened with:', opened.browser);
+          const page = await call('page.goto', { url: 'https://example.com/' });
+          if (!/example domain/i.test(page.title || '')) {
+            throw new Error(`unexpected page title: ${JSON.stringify(page.title)}`);
+          }
+          console.log('page title:', page.title);
+          await call('session.close', {});
+          child.stdin.end();
+          SMOKE
+          node /tmp/smoke.mjs "target/release/bundle/macos/Errand-AI.app/Contents/Resources/browser-agent/src/main.mjs"
+          echo "smoke exit=$?"
+
   scrub:
     runs-on: ubuntu-latest
     steps:

@@ -10,6 +10,8 @@
 pub mod auth;
 pub mod routes;
 pub mod sse;
+#[cfg(test)]
+pub mod testkit;
 
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};

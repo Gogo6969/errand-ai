@@ -19,6 +19,12 @@ export interface Task {
   auto_paused: boolean;
   playbook_version?: number | null;
   allowed_domains: string[];
+  schedule?: unknown;
+  notify?: Record<string, boolean>;
+  limits?: Record<string, number>;
+  /** The engine's own words for the schedule. Never interpreted in the browser. */
+  schedule_describes?: string;
+  schedule_preview?: string[];
 }
 
 export interface Failure {
@@ -90,8 +96,8 @@ export const api = {
   health: () => call<Health>("GET", "/v1/health/detail"),
   tasks: () => call<{ items: Task[] }>("GET", "/v1/tasks").then((r) => r.items),
   task: (id: string) => call<Task>("GET", `/v1/tasks/${id}`),
-  createTask: (name: string, description: string, emoji?: string) =>
-    call<Task>("POST", "/v1/tasks", { name, description, emoji }),
+  createTask: (name: string, description: string, emoji?: string, allowed_domains?: string[]) =>
+    call<Task>("POST", "/v1/tasks", { name, description, emoji, allowed_domains }),
   teach: (id: string) => call<Run>("POST", `/v1/tasks/${id}/teach`),
   run: (id: string, dryRun = false) => call<Run>("POST", `/v1/tasks/${id}/run`, { dry_run: dryRun }),
   pause: (id: string, reason?: string) => call("POST", `/v1/tasks/${id}/pause`, { reason }),
@@ -120,8 +126,29 @@ export const api = {
   channels: () => call<{ channels: ChannelHealth[]; notes: Record<string, string> }>("GET", "/v1/channels"),
   testChannel: (c: string) => call("POST", `/v1/channels/${c}/test`),
   enableChannel: (c: string) => call<ChannelHealth>("POST", `/v1/channels/${c}/enable`),
-  configureChannel: (c: string, secrets: Record<string, string>) =>
-    call("POST", `/v1/channels/${c}/config`, { secrets }),
+  configureChannel: (
+    c: string,
+    secrets: Record<string, string>,
+    settings: Record<string, unknown> = {},
+  ) => call("POST", `/v1/channels/${c}/config`, { secrets, settings }),
+  settings: () => call<Record<string, unknown>>("GET", "/v1/settings"),
+
+  patchTask: (id: string, patch: TaskPatch) => call<PatchResult>("PATCH", `/v1/tasks/${id}`, patch),
+  previewSchedule: (schedule: unknown) =>
+    call<SchedulePreview>("POST", "/v1/schedule/preview", schedule),
+
+  recipients: () => call<{ items: Recipient[] }>("GET", "/v1/recipients").then((r) => r.items),
+  addRecipient: (label: string, channel: string, address: string) =>
+    call<Recipient>("POST", "/v1/recipients", { label, channel, address }),
+  deleteRecipient: (id: string) => call("DELETE", `/v1/recipients/${id}`),
+  taskRecipients: (taskId: string) =>
+    call<{ items: TaskRecipient[] }>("GET", `/v1/tasks/${taskId}/recipients`).then((r) => r.items),
+  linkRecipient: (taskId: string, recipientId: string, onSuccess: boolean, onFailure: boolean) =>
+    call("POST", `/v1/tasks/${taskId}/recipients`, {
+      recipient_id: recipientId, on_success: onSuccess, on_failure: onFailure,
+    }),
+  unlinkRecipient: (taskId: string, recipientId: string) =>
+    call("DELETE", `/v1/tasks/${taskId}/recipients/${recipientId}`),
 
   ai: () => call<AiSetup>("GET", "/v1/ai"),
   aiCatalogue: () => call<{ services: KnownService[] }>("GET", "/v1/ai/catalogue").then((r) => r.services),
@@ -138,6 +165,45 @@ export const api = {
   setLocalOnly: (enabled: boolean) => call("POST", "/v1/ai/local-only", { enabled }),
   saveAnthropicKey: (key: string) => call("POST", "/v1/ai/anthropic-key", { key }),
 };
+
+/** Every field optional: absent means leave it as it was. */
+export interface TaskPatch {
+  name?: string;
+  emoji?: string;
+  description?: string;
+  schedule?: unknown;
+  notify?: unknown;
+  limits?: unknown;
+  allowed_domains?: string[];
+  /** Set after a schedule_change_may_repeat refusal, once the person has read it. */
+  acknowledge_repeat?: boolean;
+}
+
+export interface PatchResult {
+  task: Task;
+  /** Things worth saying but not worth refusing over, e.g. www without the apex. */
+  warnings?: string[];
+}
+
+/** What the engine says a schedule really means. Never computed in the browser. */
+export interface SchedulePreview {
+  valid: boolean;
+  describes: string;
+  preview: string[];
+  problem?: string;
+}
+
+export interface Recipient {
+  id: string;
+  label: string;
+  channel: string;
+  address: string;
+}
+
+export interface TaskRecipient extends Recipient {
+  on_success: boolean;
+  on_failure: boolean;
+}
 
 export interface Provider {
   id: string;

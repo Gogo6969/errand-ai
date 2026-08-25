@@ -1,8 +1,10 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { page } from "$app/state";
-  import { api, statusLabel, when, ApiError, type Task, type Run } from "$lib/api";
+  import { api, statusLabel, when, ApiError, type Task, type Run, type TaskRecipient, type Recipient } from "$lib/api";
   import Hint from "$lib/components/Hint.svelte";
+  import ScheduleEditor from "$lib/components/ScheduleEditor.svelte";
+  import SitesEditor from "$lib/components/SitesEditor.svelte";
 
   const id = page.params.id!;
   let task = $state<Task | null>(null);
@@ -11,15 +13,55 @@
   let problem = $state<string | null>(null);
   let busy = $state(false);
 
+  // Editing state. Nothing is saved until Save is pressed, so a half-typed site
+  // never becomes a rule the agent is bound by.
+  let editingSchedule = $state(false);
+  let draftSchedule = $state<any>(null);
+  let editingSites = $state(false);
+  let draftSites = $state<string[]>([]);
+  let warnings = $state<string[]>([]);
+  let people = $state<TaskRecipient[]>([]);
+  let everyone = $state<Recipient[]>([]);
+
   async function load() {
     try {
       [task, runs, plan] = await Promise.all([api.task(id), api.runs(id), api.playbook(id)]);
+      // Recipients are optional plumbing: a task page must still render when
+      // nobody has set up a way to message anyone.
+      try {
+        [people, everyone] = await Promise.all([api.taskRecipients(id), api.recipients()]);
+      } catch { people = []; everyone = []; }
       problem = null;
     } catch (e) {
       problem = e instanceof ApiError ? e.message : String(e);
     }
   }
   onMount(load);
+
+  async function save(patch: Parameters<typeof api.patchTask>[1]) {
+    busy = true;
+    try {
+      const res = await api.patchTask(id, patch);
+      warnings = res.warnings ?? [];
+      problem = null;
+      await load();
+      return true;
+    } catch (e) {
+      problem = e instanceof ApiError ? e.message : String(e);
+      return false;
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function saveSchedule() {
+    if (await save({ schedule: draftSchedule })) editingSchedule = false;
+  }
+  async function saveSites() {
+    if (await save({ allowed_domains: draftSites })) editingSites = false;
+  }
+
+  const unlinked = $derived(everyone.filter((r) => !people.some((p) => p.id === r.id)));
 
   async function act(fn: () => Promise<unknown>) {
     busy = true;
@@ -94,18 +136,129 @@
     </div>
   {/if}
 
+  <h2>When it runs</h2>
+  <div class="card">
+    {#if editingSchedule}
+      <ScheduleEditor bind:value={draftSchedule} />
+      <div class="row" style="margin-top:12px; gap:6px">
+        <Hint id="task.save_schedule">
+          <button class="primary" disabled={busy} onclick={saveSchedule}>Save the schedule</button>
+        </Hint>
+        <Hint id="task.cancel_edit">
+          <button disabled={busy} onclick={() => (editingSchedule = false)}>Never mind</button>
+        </Hint>
+      </div>
+    {:else}
+      <div class="row spread">
+        <div>
+          <div>{task.schedule_describes ?? "Only when you ask."}</div>
+          {#if task.schedule_preview?.length}
+            <div class="muted" style="margin-top:4px">
+              Next: {task.schedule_preview.map((t) => new Date(t).toLocaleString()).join(" · ")}
+            </div>
+          {/if}
+        </div>
+        <Hint id="task.edit_schedule">
+          <button disabled={busy} onclick={() => { draftSchedule = task!.schedule ?? { kind: "manual" }; editingSchedule = true; }}>
+            Change
+          </button>
+        </Hint>
+      </div>
+    {/if}
+  </div>
+
   <h2>What it is allowed to do</h2>
   <div class="card">
-    <div class="row spread">
-      <Hint id="task.allowed_sites"><span>Sites it may open</span></Hint>
+    <Hint id="task.allowed_sites"><strong>Sites it may open</strong></Hint>
+    {#if editingSites}
+      <div style="margin-top:8px">
+        <SitesEditor bind:sites={draftSites} {warnings} />
+      </div>
+      <div class="row" style="margin-top:12px; gap:6px">
+        <Hint id="task.save_sites">
+          <button class="primary" disabled={busy} onclick={saveSites}>Save the sites</button>
+        </Hint>
+        <Hint id="task.cancel_edit">
+          <button disabled={busy} onclick={() => (editingSites = false)}>Never mind</button>
+        </Hint>
+      </div>
+    {:else}
+      <div class="row spread" style="margin-top:6px">
+        <span class="muted">
+          {task.allowed_domains?.length
+            ? task.allowed_domains.join(", ")
+            : "none yet, so it cannot browse at all"}
+        </span>
+        <Hint id="task.edit_sites">
+          <button disabled={busy} onclick={() => { draftSites = [...(task!.allowed_domains ?? [])]; editingSites = true; }}>
+            Change
+          </button>
+        </Hint>
+      </div>
+    {/if}
+
+    <div class="row spread" style="margin-top:14px">
+      <Hint id="task.limits"><span>Limits on a single run</span></Hint>
       <span class="muted">
-        {task.allowed_domains?.length ? task.allowed_domains.join(", ") : "none yet, so it cannot browse"}
+        {task.limits
+          ? `at most ${task.limits.max_steps} steps, ${task.limits.max_minutes} minutes, $${task.limits.max_usd}, ${task.limits.max_messages} messages`
+          : "stops if it runs too long or spends too much"}
       </span>
     </div>
-    <div class="row spread" style="margin-top:8px">
-      <Hint id="task.limits"><span>Limits on a single run</span></Hint>
-      <span class="muted">stops if it runs too long or spends too much</span>
-    </div>
+  </div>
+
+  <h2>Who it tells when it is done</h2>
+  <div class="card">
+    {#if people.length === 0}
+      <p class="muted" style="margin:0 0 8px">
+        Nobody. You will still get the result yourself on Telegram if you have set that up. Adding
+        someone here is what lets a finished job send them a message.
+      </p>
+    {:else}
+      {#each people as p}
+        <div class="row spread" style="margin-bottom:6px">
+          <div>
+            <strong>{p.label}</strong>
+            <span class="muted"> · {p.channel.replace("_", " ")} · {p.address}</span>
+          </div>
+          <div class="row" style="gap:6px">
+            <Hint id="task.notify_when">
+              <span class="pill {p.on_success ? 'ok' : ''}">{p.on_success ? "when it works" : "not on success"}</span>
+            </Hint>
+            <Hint id="task.notify_when">
+              <span class="pill {p.on_failure ? 'warn' : ''}">{p.on_failure ? "when it fails" : "not on failure"}</span>
+            </Hint>
+            <Hint id="task.unlink_person">
+              <button disabled={busy} onclick={() => act(() => api.unlinkRecipient(id, p.id))}>Remove</button>
+            </Hint>
+          </div>
+        </div>
+      {/each}
+    {/if}
+
+    {#if unlinked.length}
+      <div class="row" style="gap:6px; margin-top:10px; flex-wrap:wrap">
+        <Hint id="task.link_person">
+          <select
+            disabled={busy}
+            onchange={(e) => {
+              const v = (e.currentTarget as HTMLSelectElement).value;
+              if (v) act(() => api.linkRecipient(id, v, true, true));
+              (e.currentTarget as HTMLSelectElement).value = "";
+            }}
+          >
+            <option value="">Tell someone when this finishes…</option>
+            {#each unlinked as r}
+              <option value={r.id}>{r.label} — {r.channel.replace("_", " ")}</option>
+            {/each}
+          </select>
+        </Hint>
+      </div>
+    {:else if everyone.length === 0}
+      <p class="muted" style="margin:8px 0 0">
+        You have not saved anyone yet. Add people in Settings first, then they can be picked here.
+      </p>
+    {/if}
   </div>
 
   <h2>How it does this job</h2>

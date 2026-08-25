@@ -59,6 +59,18 @@ else
 fi
 codesign --verify "$DEST" && echo "  signature ok"
 
+# Stage the same binary where the bundler looks for it, so that a local
+# `cargo tauri build` produces the app CI produces rather than one with no
+# daemon inside it. tauri matches externalBin sources by target triple and
+# strips the suffix again on the way in, which is how it arrives at
+# Contents/MacOS/errandd, the path the LaunchAgent above is written against.
+TRIPLE=$(rustc -vV | sed -n 's/host: //p')
+mkdir -p app/binaries
+rm -f "app/binaries/errandd-$TRIPLE"
+cp "$SRC" "app/binaries/errandd-$TRIPLE"
+chmod 755 "app/binaries/errandd-$TRIPLE"
+echo "Staged app/binaries/errandd-$TRIPLE for cargo tauri build"
+
 echo "Installing LaunchAgent"
 "$DEST" install "$DEST"
 

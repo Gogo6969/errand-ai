@@ -40,20 +40,62 @@ extern "C" {
     fn libc_getuid() -> u32;
 }
 
+/// The variables that point Errand at a different Node, a different sidecar
+/// script or a different browser. The daemon reads all three at launch, so
+/// without them here the documented workaround works when you run the runner
+/// from a terminal and does nothing at all for the process that actually runs
+/// the tasks — which is the only process that matters at 08:00.
+const PASSTHROUGH_ENV: [&str; 3] = ["ERRAND_NODE", "ERRAND_SIDECAR", "ERRAND_BROWSER"];
+
 /// Render the LaunchAgent plist. Separated from writing so it can be tested
 /// without touching the user's LaunchAgents directory.
 pub fn render_plist(exe: &Path, logs_dir: &Path) -> String {
+    // Taken from the environment doing the installing, because that is where
+    // someone who has just been told to set ERRAND_NODE will have set it.
+    let extra: Vec<(String, String)> = PASSTHROUGH_ENV
+        .iter()
+        .filter_map(|k| std::env::var(k).ok().map(|v| ((*k).to_string(), v)))
+        .filter(|(_, v)| !v.trim().is_empty())
+        .collect();
+    render_plist_with(exe, logs_dir, &extra)
+}
+
+/// A path or a browser name can contain `&`, and an unescaped one makes the
+/// whole plist unparseable — which launchd reports as the agent simply not
+/// being there.
+fn xml_escape(s: &str) -> String {
+    s.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+fn render_plist_with(exe: &Path, logs_dir: &Path, extra_env: &[(String, String)]) -> String {
     let label = crate::LAUNCHD_LABEL;
-    let exe = exe.to_string_lossy();
-    let out = logs_dir.join("runner.out.log");
-    let err = logs_dir.join("runner.err.log");
+    let exe = xml_escape(&exe.to_string_lossy());
+    let out = xml_escape(&logs_dir.join("runner.out.log").to_string_lossy());
+    let err = xml_escape(&logs_dir.join("runner.err.log").to_string_lossy());
     let home = dirs::home_dir().unwrap_or_default();
     // The daemon shells out to the claude CLI, so it needs a PATH that contains
     // the usual install locations. launchd gives a bare PATH otherwise.
-    let path = format!(
-        "{}/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
-        home.to_string_lossy()
-    );
+    //
+    // Volta is in here because it is the one version manager with a fixed shim
+    // directory; nvm and fnm keep node under a per-version directory with no
+    // stable name, so they cannot be named in a static PATH and are found by
+    // the runner's own search instead.
+    let path = xml_escape(&format!(
+        "{home}/.local/bin:{home}/.volta/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin",
+        home = home.to_string_lossy()
+    ));
+    let extra = extra_env
+        .iter()
+        .map(|(k, v)| {
+            format!(
+                "        <key>{}</key>\n        <string>{}</string>\n",
+                xml_escape(k),
+                xml_escape(v)
+            )
+        })
+        .collect::<String>();
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -88,12 +130,10 @@ pub fn render_plist(exe: &Path, logs_dir: &Path) -> String {
     <dict>
         <key>PATH</key>
         <string>{path}</string>
-    </dict>
+{extra}    </dict>
 </dict>
 </plist>
-"#,
-        out = out.to_string_lossy(),
-        err = err.to_string_lossy(),
+"#
     )
 }
 
@@ -196,6 +236,63 @@ mod tests {
         assert!(plist.contains("com.errandai.runner"));
         assert!(plist.contains("--launchd"));
         assert!(plist.contains("<string>Aqua</string>"));
+    }
+
+    #[test]
+    fn the_daemon_inherits_the_escape_hatch_variables_that_were_set_when_it_was_installed() {
+        // Someone who has been told "set ERRAND_NODE to your node" has fixed
+        // nothing if the fix stops at their shell.
+        let plist = render_plist_with(
+            Path::new("/Applications/Errand-AI.app/Contents/MacOS/errandd"),
+            Path::new("/Users/USER/Library/Application Support/com.errandai.app/logs"),
+            &[
+                (
+                    "ERRAND_NODE".to_string(),
+                    "/Users/USER/.nvm/versions/node/v22.11.0/bin/node".to_string(),
+                ),
+                (
+                    "ERRAND_BROWSER".to_string(),
+                    "/Applications/Brave Browser.app/Contents/MacOS/Brave Browser".to_string(),
+                ),
+            ],
+        );
+        assert!(plist.contains("<key>ERRAND_NODE</key>"));
+        assert!(plist.contains("<string>/Users/USER/.nvm/versions/node/v22.11.0/bin/node</string>"));
+        assert!(plist.contains("<key>ERRAND_BROWSER</key>"));
+        // Still a well-formed dict: PATH keeps its place alongside them.
+        assert!(plist.contains("<key>PATH</key>"));
+    }
+
+    #[test]
+    fn variables_that_were_not_set_do_not_appear_at_all() {
+        // An empty string here would be worse than absent: it would override
+        // the search with a path that cannot exist.
+        let plist = render_plist_with(
+            Path::new("/Applications/Errand-AI.app/Contents/MacOS/errandd"),
+            Path::new("/Users/USER/Library/Application Support/com.errandai.app/logs"),
+            &[],
+        );
+        assert!(!plist.contains("ERRAND_NODE"));
+        assert!(!plist.contains("ERRAND_SIDECAR"));
+        assert!(!plist.contains("ERRAND_BROWSER"));
+    }
+
+    #[test]
+    fn an_ampersand_in_a_path_does_not_produce_an_unreadable_plist() {
+        // launchd reports a plist it cannot parse as no agent at all, which
+        // looks exactly like never having installed one.
+        let plist = render_plist_with(
+            Path::new("/Applications/Rock & Roll/errandd"),
+            Path::new("/Users/USER/logs"),
+            &[(
+                "ERRAND_SIDECAR".to_string(),
+                "/opt/a&b/main.mjs".to_string(),
+            )],
+        );
+        assert!(plist.contains("/Applications/Rock &amp; Roll/errandd"));
+        assert!(plist.contains("/opt/a&amp;b/main.mjs"));
+        // Every ampersand in the document is part of an entity, not a bare one.
+        assert_eq!(plist.matches('&').count(), plist.matches("&amp;").count());
     }
 
     #[test]

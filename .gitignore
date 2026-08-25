@@ -38,9 +38,11 @@ updater.key
 # public repo pending review (it references private paths).
 SPEC-M1.md
 
-# Sidecar dependencies (installed with npm, not vendored)
+# Sidecar dependencies (installed with npm, not vendored). The lockfile is
+# tracked on purpose: the sidecar is the browser, so CI has to install the exact
+# same playwright-core the shipped app was built and tested against, and npm ci
+# refuses to run without it.
 sidecars/browser-agent/node_modules/
-sidecars/browser-agent/package-lock.json
 
 # TypeScript client build output
 packages/client/dist/
@@ -54,3 +56,7 @@ frontend/.svelte-kit/
 frontend/package-lock.json
 app/gen/
 app/icons/icon.iconset/
+
+# The daemon staged for the bundler. Built from source by scripts/dev-install.sh
+# and by CI, never committed.
+app/binaries/

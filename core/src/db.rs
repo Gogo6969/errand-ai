@@ -6,6 +6,7 @@
 //! out why. The UI goes through the API for everything.
 
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use sqlx::sqlite::{SqliteConnectOptions, SqlitePoolOptions};
 use sqlx::{Row, SqlitePool};
 use std::str::FromStr;
@@ -144,10 +145,14 @@ pub struct NewTask {
 pub async fn create_task(pool: &Pool, t: NewTask) -> Result<crate::models::Task> {
     let id = crate::new_id();
     let now = crate::now_iso();
+    // The floor starts at creation. A task set up today with a cron that has
+    // been notionally due every morning for the past year has no missed runs to
+    // make up: it did not exist for any of them. Without this, its first tick
+    // would replay history.
     sqlx::query(
         "INSERT INTO tasks (id, name, emoji, description_md, status, schedule_json,
-                            created_at, updated_at)
-         VALUES (?, ?, ?, ?, 'draft', ?, ?, ?)",
+                            catch_up_floor_at, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'draft', ?, ?, ?, ?)",
     )
     .bind(&id)
     .bind(&t.name)
@@ -156,11 +161,209 @@ pub async fn create_task(pool: &Pool, t: NewTask) -> Result<crate::models::Task>
     .bind(serde_json::to_string(&t.schedule)?)
     .bind(&now)
     .bind(&now)
+    .bind(&now)
     .execute(pool)
     .await?;
     get_task(pool, &id)
         .await?
         .context("task vanished immediately after insert")
+}
+
+/// What a person may change about a task once it exists.
+///
+/// Every field is optional and absent means unchanged, so a screen that only
+/// edits the schedule cannot blank the description on the way past.
+#[derive(Debug, Clone, Default)]
+pub struct TaskPatch {
+    pub name: Option<String>,
+    pub emoji: Option<String>,
+    pub description: Option<String>,
+    pub schedule: Option<serde_json::Value>,
+    pub notify: Option<serde_json::Value>,
+    pub limits: Option<serde_json::Value>,
+    /// Sites as typed. Normalised here rather than at the edge, so there is no
+    /// route by which an entry the run-time check could never match gets
+    /// written to the database.
+    pub allowed_domains: Option<Vec<String>>,
+}
+
+/// Change a task's settings, in one transaction.
+///
+/// Status, auto_paused, paused_reason, existing runs and existing side effects
+/// are all left alone, deliberately. Editing a schedule must never un-pause a
+/// task that was paused because an irreversible action needs checking: the
+/// person editing the schedule has not necessarily looked at the site.
+pub async fn update_task(pool: &Pool, id: &str, patch: TaskPatch) -> Result<crate::models::Task> {
+    let now = crate::now_iso();
+
+    // Done before the transaction opens, so a rejected site entry costs nothing
+    // and leaves nothing half-written.
+    let domains_json = match &patch.allowed_domains {
+        Some(list) => Some(serde_json::to_string(
+            &crate::domains::normalize_domains(list)?.domains,
+        )?),
+        None => None,
+    };
+    let schedule_json = patch
+        .schedule
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let notify_json = patch
+        .notify
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+    let limits_json = patch
+        .limits
+        .as_ref()
+        .map(serde_json::to_string)
+        .transpose()?;
+
+    // Also read before the transaction opens. A transaction takes a connection
+    // of its own, so reading back through the pool while one is open would have
+    // the caller waiting on itself whenever the pool is small.
+    let previous_floor = task_catch_up_floor(pool, id).await?;
+
+    let mut tx = pool.begin().await?;
+
+    let row = sqlx::query("SELECT status, schedule_json FROM tasks WHERE id = ?")
+        .bind(id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    let Some(row) = row else {
+        anyhow::bail!("There is no task with id {id}, so nothing was changed.");
+    };
+    let status: String = row.try_get("status")?;
+    if status == "archived" {
+        anyhow::bail!(
+            "This task has been archived, so its settings can no longer be changed. Nothing was \
+             altered. Restore it first if you want to edit it."
+        );
+    }
+    let current_schedule: String = row.try_get("schedule_json")?;
+
+    let mut floor_at: Option<String> = None;
+    let mut next_run_at: Option<String> = None;
+    let mut schedule_changing = false;
+
+    if let Some(new_value) = &patch.schedule {
+        let spec = crate::schedule::ScheduleSpec::from_json(new_value)?;
+        spec.validate()?;
+
+        // Compared through the spec rather than as raw text: the same schedule
+        // written out with its defaults spelled in is still the same schedule,
+        // and treating that as a change would move the floor for nothing.
+        let current: serde_json::Value =
+            serde_json::from_str(&current_schedule).unwrap_or(serde_json::Value::Null);
+        schedule_changing = crate::schedule::ScheduleSpec::from_json(&current)
+            .map(|c| c.to_json() != spec.to_json())
+            .unwrap_or(true);
+
+        if schedule_changing {
+            // The last scheduled occurrence this task has already recorded.
+            //
+            // The LIKE is load-bearing. Manual occurrence ids look like
+            // "manual/<uuid>", and 'm' sorts above '2', so a bare MAX() would
+            // hand back a manual id and the floor would be nonsense. Scheduled
+            // ids and now_iso() share the %Y-%m-%dT%H:%M:%SZ format, which is
+            // why they can be compared as text and still mean instants.
+            let last: Option<String> = sqlx::query(
+                "SELECT MAX(occurrence_id) AS last FROM runs
+                 WHERE task_id = ? AND occurrence_id LIKE '____-__-__T__:__:__Z'",
+            )
+            .bind(id)
+            .fetch_one(&mut *tx)
+            .await?
+            .try_get("last")?;
+
+            // The floor only ever moves forward. An earlier edit already closed
+            // those occurrences off, and letting a later edit re-open them
+            // would be the very replay this is here to stop.
+            let mut floor = now.clone();
+            for candidate in [last.as_deref(), previous_floor.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                if candidate > floor.as_str() {
+                    floor = candidate.to_string();
+                }
+            }
+
+            let floor_dt: DateTime<Utc> = floor
+                .parse()
+                .with_context(|| format!("reading the catch-up floor '{floor}'"))?;
+
+            // Counted from the floor, not from now, or the countdown would
+            // promise a run that the floor is about to refuse. Bound to NULL
+            // for a manual schedule or a one-shot whose moment has gone,
+            // because nothing else in the system ever clears this column and a
+            // stale "next run" would sit there forever.
+            next_run_at = spec.next_after(floor_dt)?.map(|occurrence| {
+                // The expression the scheduler uses for the same number, so the
+                // time shown is the time it happens and does not jump every
+                // twenty seconds.
+                (spec.start_at(occurrence)
+                    + crate::schedule::jitter_for(id, occurrence, spec.jitter_s))
+                .to_rfc3339()
+            });
+            floor_at = Some(floor);
+        }
+    }
+
+    sqlx::query(
+        "UPDATE tasks SET
+            name                 = COALESCE(?, name),
+            emoji                = COALESCE(?, emoji),
+            description_md       = COALESCE(?, description_md),
+            schedule_json        = COALESCE(?, schedule_json),
+            notify_json          = COALESCE(?, notify_json),
+            limits_json          = COALESCE(?, limits_json),
+            allowed_domains_json = COALESCE(?, allowed_domains_json),
+            catch_up_floor_at    = CASE WHEN ? = 1 THEN ? ELSE catch_up_floor_at END,
+            next_run_at          = CASE WHEN ? = 1 THEN ? ELSE next_run_at END,
+            updated_at           = ?
+         WHERE id = ?",
+    )
+    .bind(&patch.name)
+    .bind(&patch.emoji)
+    .bind(&patch.description)
+    .bind(&schedule_json)
+    .bind(&notify_json)
+    .bind(&limits_json)
+    .bind(&domains_json)
+    .bind(i64::from(schedule_changing))
+    .bind(&floor_at)
+    .bind(i64::from(schedule_changing))
+    .bind(&next_run_at)
+    .bind(&now)
+    .bind(id)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+
+    get_task(pool, id)
+        .await?
+        .context("task vanished immediately after being changed")
+}
+
+/// The instant below which this task's schedule did not yet exist.
+///
+/// The scheduler must not enqueue any occurrence earlier than this. Its
+/// catch-up cursor is global, so without the floor a task whose schedule
+/// changed a minute ago looks like a task that has been missing runs all week.
+/// `None` means no floor: a task that has been running against its current
+/// schedule all along.
+pub async fn task_catch_up_floor(pool: &Pool, task_id: &str) -> Result<Option<String>> {
+    let row = sqlx::query("SELECT catch_up_floor_at FROM tasks WHERE id = ?")
+        .bind(task_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row
+        .map(|r| r.try_get::<Option<String>, _>("catch_up_floor_at"))
+        .transpose()?
+        .flatten())
 }
 
 /// Pause keeps the computed next run visible but the scheduler never enqueues
@@ -813,6 +1016,203 @@ pub async fn mark_credential_used(pool: &Pool, cred_id: &str) -> Result<()> {
     Ok(())
 }
 
+// -------------------------------------------------------------- recipients --
+
+/// The ways Errand can send a message. Same vocabulary as the outbox and the
+/// database CHECK, checked here so a wrong one is refused in a sentence rather
+/// than as a constraint violation.
+const CHANNELS: &[&str] = &["telegram", "whatsapp", "apple_mail", "imessage"];
+
+/// An address with most of it taken out, for showing to the agent.
+///
+/// The point is recognition, not reach: enough for a person to confirm the
+/// right contact was picked, not enough to write to them. The agent chooses
+/// from a list of recipients the person granted; it never needs the address
+/// itself, and an address it never sees is an address it cannot leak.
+pub fn masked_address(channel: &str, address: &str) -> String {
+    let a = address.trim();
+    if a.is_empty() {
+        return "•••".to_string();
+    }
+    let looks_like_email = a.contains('@') && !a.starts_with('@');
+    match channel {
+        "apple_mail" => mask_email(a),
+        "telegram" if a.starts_with('@') => mask_handle(a),
+        _ if looks_like_email => mask_email(a),
+        _ => mask_number(a),
+    }
+}
+
+fn mask_email(a: &str) -> String {
+    let Some((local, domain)) = a.split_once('@') else {
+        return mask_number(a);
+    };
+    if domain.is_empty() {
+        return "•••".to_string();
+    }
+    match local.chars().next() {
+        Some(first) => format!("{first}•••@{domain}"),
+        None => format!("•••@{domain}"),
+    }
+}
+
+fn mask_handle(a: &str) -> String {
+    match a.trim_start_matches('@').chars().next() {
+        Some(first) => format!("@{first}•••"),
+        None => "@•••".to_string(),
+    }
+}
+
+fn mask_number(a: &str) -> String {
+    let digits: Vec<char> = a.chars().filter(|c| c.is_ascii_digit()).collect();
+    // Too short to hide anything usefully, so hide all of it.
+    if digits.len() < 4 {
+        return "•••".to_string();
+    }
+    let last: String = digits[digits.len() - 2..].iter().collect();
+    if a.starts_with('+') {
+        let country: String = digits[..2].iter().collect();
+        format!("+{country} ••• ••{last}")
+    } else {
+        format!("••• ••{last}")
+    }
+}
+
+fn recipient_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<crate::models::Recipient> {
+    let channel: String = r.try_get("channel")?;
+    let address: String = r.try_get("address")?;
+    Ok(crate::models::Recipient {
+        id: r.try_get("id")?,
+        label: r.try_get("label")?,
+        address_masked: masked_address(&channel, &address),
+        channel,
+        address,
+        created_at: r.try_get("created_at")?,
+    })
+}
+
+/// Add somebody Errand may write to. Global: granting a task access to them is
+/// a separate, deliberate step.
+pub async fn create_recipient(
+    pool: &Pool,
+    label: &str,
+    channel: &str,
+    address: &str,
+) -> Result<String> {
+    if !CHANNELS.contains(&channel) {
+        anyhow::bail!(
+            "'{channel}' is not a way Errand can send messages, so this contact was not saved. \
+             Choose Telegram, WhatsApp, Mail or iMessage."
+        );
+    }
+    if label.trim().is_empty() {
+        anyhow::bail!("Give this contact a name you will recognise later, such as 'Mum'.");
+    }
+    if address.trim().is_empty() {
+        anyhow::bail!(
+            "This contact has no address, so nothing could ever be sent to them. Add the phone \
+             number, email address or handle for the way you picked."
+        );
+    }
+
+    let id = crate::new_id();
+    sqlx::query(
+        "INSERT INTO recipients (id, label, channel, address, created_at)
+         VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind(&id)
+    .bind(label.trim())
+    .bind(channel)
+    .bind(address.trim())
+    .bind(crate::now_iso())
+    .execute(pool)
+    .await?;
+    Ok(id)
+}
+
+pub async fn list_recipients(pool: &Pool) -> Result<Vec<crate::models::Recipient>> {
+    let rows = sqlx::query("SELECT * FROM recipients ORDER BY label")
+        .fetch_all(pool)
+        .await?;
+    rows.iter().map(recipient_from_row).collect()
+}
+
+/// The people this one task may contact, and what it may tell them.
+pub async fn recipients_for_task(
+    pool: &Pool,
+    task_id: &str,
+) -> Result<Vec<crate::models::TaskRecipient>> {
+    let rows = sqlx::query(
+        "SELECT r.id, r.label, r.channel, r.address, tr.on_success, tr.on_failure
+         FROM recipients r
+         JOIN task_recipients tr ON tr.recipient_id = r.id
+         WHERE tr.task_id = ? ORDER BY r.label",
+    )
+    .bind(task_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| {
+            let channel: String = r.try_get("channel")?;
+            let address: String = r.try_get("address")?;
+            Ok(crate::models::TaskRecipient {
+                id: r.try_get("id")?,
+                label: r.try_get("label")?,
+                address_masked: masked_address(&channel, &address),
+                channel,
+                address,
+                on_success: r.try_get::<i64, _>("on_success")? != 0,
+                on_failure: r.try_get::<i64, _>("on_failure")? != 0,
+            })
+        })
+        .collect()
+}
+
+/// Let a task contact somebody. Linking again updates the flags rather than
+/// failing, so the settings screen can just write what the person chose.
+pub async fn link_recipient(
+    pool: &Pool,
+    task_id: &str,
+    recipient_id: &str,
+    on_success: bool,
+    on_failure: bool,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO task_recipients (task_id, recipient_id, on_success, on_failure)
+         VALUES (?, ?, ?, ?)
+         ON CONFLICT(task_id, recipient_id) DO UPDATE
+           SET on_success = excluded.on_success, on_failure = excluded.on_failure",
+    )
+    .bind(task_id)
+    .bind(recipient_id)
+    .bind(i64::from(on_success))
+    .bind(i64::from(on_failure))
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Take the grant away from one task. The contact itself stays, and every other
+/// task that has them keeps them.
+pub async fn unlink_recipient(pool: &Pool, task_id: &str, recipient_id: &str) -> Result<bool> {
+    let res = sqlx::query("DELETE FROM task_recipients WHERE task_id = ? AND recipient_id = ?")
+        .bind(task_id)
+        .bind(recipient_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Remove a contact everywhere. Every task's grant goes with them, by cascade,
+/// so no task is left holding a grant to somebody who no longer exists.
+pub async fn delete_recipient(pool: &Pool, id: &str) -> Result<bool> {
+    let res = sqlx::query("DELETE FROM recipients WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
 /// Revoke every live token with this name. Used by the token recovery path.
 pub async fn revoke_tokens_named(pool: &Pool, name_prefix: &str) -> Result<u64> {
     let res = sqlx::query(
@@ -839,6 +1239,20 @@ pub enum FenceVerdict {
     NeedsVerification { armed_at: String },
 }
 
+/// The fence key.
+///
+/// Scope folds in only when it is non-empty, so every key written before scopes
+/// existed still comes out byte-identical. That is not tidiness: if a committed
+/// booking's key changed shape, the fence would stop recognising it, and the
+/// next attempt would read an already-taken slot as free and book it twice.
+fn fence_key(task_id: &str, occurrence_id: &str, action_kind: &str, scope: &str) -> String {
+    if scope.is_empty() {
+        format!("{task_id}:{occurrence_id}:{action_kind}")
+    } else {
+        format!("{task_id}:{occurrence_id}:{action_kind}:{scope}")
+    }
+}
+
 /// Ask the fence for permission to do something irreversible.
 ///
 /// The key is scoped to the occurrence, never to what the agent chose to do. A
@@ -846,14 +1260,23 @@ pub enum FenceVerdict {
 /// past the guard and double-book, which is the exact failure the fence exists
 /// to prevent. One scheduled slot admits one irreversible action, whatever the
 /// agent decides that action should be.
+///
+/// `scope` is the one exception, and it does not weaken that rule. The warning
+/// above is about outcomes the AGENT picks: key on one of those and a retry
+/// simply picks differently and walks through. A scope is picked by the PERSON,
+/// from a closed set the agent cannot add to — a recipient they chose, say — so
+/// "message this person once for this slot" is a promise the agent has no way
+/// to reinterpret. Pass an empty scope when there is no such set, which is
+/// most of the time.
 pub async fn arm_side_effect(
     pool: &Pool,
     run_id: &str,
     task_id: &str,
     occurrence_id: &str,
     action_kind: &str,
+    scope: &str,
 ) -> Result<FenceVerdict> {
-    let key = format!("{task_id}:{occurrence_id}:{action_kind}");
+    let key = fence_key(task_id, occurrence_id, action_kind, scope);
     let id = crate::new_id();
     let now = crate::now_iso();
 
@@ -867,8 +1290,8 @@ pub async fn arm_side_effect(
     // stands.
     let row = sqlx::query(
         "INSERT INTO side_effects (id, run_id, task_id, occurrence_id, action_kind,
-                                   idempotency_key, state, armed_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'armed', ?)
+                                   scope, idempotency_key, state, armed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'armed', ?)
          ON CONFLICT(idempotency_key) DO UPDATE
            SET state = 'armed', run_id = excluded.run_id, armed_at = excluded.armed_at
            WHERE side_effects.state = 'aborted'
@@ -879,6 +1302,7 @@ pub async fn arm_side_effect(
     .bind(task_id)
     .bind(occurrence_id)
     .bind(action_kind)
+    .bind(scope)
     .bind(&key)
     .bind(&now)
     .fetch_optional(pool)
@@ -1000,21 +1424,27 @@ pub async fn finish_run_skipped(pool: &Pool, run_id: &str, code: &str, human: &s
 /// The per-occurrence fence protects a scheduled slot, but a manual "Run now"
 /// mints a fresh slot every time, so nothing stops someone triggering a booking
 /// task twice in a minute and booking twice. This is what makes that visible.
+///
+/// `scope` narrows it the same way it narrows the fence key: an empty scope
+/// asks about the action kind as a whole, which is what every caller wanted
+/// before scopes existed.
 pub async fn recent_commit(
     pool: &Pool,
     task_id: &str,
     action_kind: &str,
+    scope: &str,
     within_minutes: i64,
 ) -> Result<Option<(String, String, Option<String>)>> {
     let row = sqlx::query(
         "SELECT occurrence_id, committed_at, evidence_json FROM side_effects
-         WHERE task_id = ? AND action_kind = ? AND state = 'committed'
+         WHERE task_id = ? AND action_kind = ? AND scope = ? AND state = 'committed'
            AND committed_at IS NOT NULL
            AND committed_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)
          ORDER BY committed_at DESC LIMIT 1",
     )
     .bind(task_id)
     .bind(action_kind)
+    .bind(scope)
     .bind(format!("-{within_minutes} minutes"))
     .fetch_optional(pool)
     .await?;
@@ -1942,7 +2372,7 @@ mod tests {
         .await
         .unwrap();
 
-        let v = arm_side_effect(&pool, &r.id, &t.id, "2026-08-26T08:00Z", "booking")
+        let v = arm_side_effect(&pool, &r.id, &t.id, "2026-08-26T08:00Z", "booking", "")
             .await
             .unwrap();
         let FenceVerdict::Armed(id) = v else {
@@ -1953,7 +2383,7 @@ mod tests {
             .unwrap();
 
         // The same occurrence asking again gets told it is already done.
-        let again = arm_side_effect(&pool, &r.id, &t.id, "2026-08-26T08:00Z", "booking")
+        let again = arm_side_effect(&pool, &r.id, &t.id, "2026-08-26T08:00Z", "booking", "")
             .await
             .unwrap();
         match again {
@@ -1985,9 +2415,10 @@ mod tests {
             .unwrap();
 
         // First attempt books court 2.
-        let FenceVerdict::Armed(id) = arm_side_effect(&pool, &r1.id, &t.id, "slot-A", "booking")
-            .await
-            .unwrap()
+        let FenceVerdict::Armed(id) =
+            arm_side_effect(&pool, &r1.id, &t.id, "slot-A", "booking", "")
+                .await
+                .unwrap()
         else {
             panic!()
         };
@@ -1997,7 +2428,7 @@ mod tests {
 
         // A retry of the same occurrence decides court 4 instead. Because the
         // key is the occurrence and not the court, it is still refused.
-        let retry = arm_side_effect(&pool, &r1.id, &t.id, "slot-A", "booking")
+        let retry = arm_side_effect(&pool, &r1.id, &t.id, "slot-A", "booking", "")
             .await
             .unwrap();
         assert!(
@@ -2025,12 +2456,12 @@ mod tests {
             .unwrap();
 
         // Armed, then the process died. Nobody knows if it went through.
-        arm_side_effect(&pool, &r.id, &t.id, "slot-B", "booking")
+        arm_side_effect(&pool, &r.id, &t.id, "slot-B", "booking", "")
             .await
             .unwrap();
         assert!(dangling_fences(&pool, &t.id, "slot-B").await.unwrap());
 
-        let after = arm_side_effect(&pool, &r.id, &t.id, "slot-B", "booking")
+        let after = arm_side_effect(&pool, &r.id, &t.id, "slot-B", "booking", "")
             .await
             .unwrap();
         assert!(
@@ -2057,7 +2488,7 @@ mod tests {
             .await
             .unwrap();
 
-        let FenceVerdict::Armed(id) = arm_side_effect(&pool, &r.id, &t.id, "slot-C", "booking")
+        let FenceVerdict::Armed(id) = arm_side_effect(&pool, &r.id, &t.id, "slot-C", "booking", "")
             .await
             .unwrap()
         else {
@@ -2068,7 +2499,7 @@ mod tests {
             .unwrap();
         assert!(!dangling_fences(&pool, &t.id, "slot-C").await.unwrap());
 
-        let again = arm_side_effect(&pool, &r.id, &t.id, "slot-C", "booking")
+        let again = arm_side_effect(&pool, &r.id, &t.id, "slot-C", "booking", "")
             .await
             .unwrap();
         assert!(
@@ -2095,7 +2526,7 @@ mod tests {
             .await
             .unwrap();
 
-        let FenceVerdict::Armed(a) = arm_side_effect(&pool, &r.id, &t.id, "w1", "booking")
+        let FenceVerdict::Armed(a) = arm_side_effect(&pool, &r.id, &t.id, "w1", "booking", "")
             .await
             .unwrap()
         else {
@@ -2105,14 +2536,14 @@ mod tests {
 
         // Next week's slot is a different occurrence.
         assert!(matches!(
-            arm_side_effect(&pool, &r.id, &t.id, "w2", "booking")
+            arm_side_effect(&pool, &r.id, &t.id, "w2", "booking", "")
                 .await
                 .unwrap(),
             FenceVerdict::Armed(_)
         ));
         // Sending a message is a different kind of action.
         assert!(matches!(
-            arm_side_effect(&pool, &r.id, &t.id, "w1", "message")
+            arm_side_effect(&pool, &r.id, &t.id, "w1", "message", "")
                 .await
                 .unwrap(),
             FenceVerdict::Armed(_)
@@ -2139,14 +2570,15 @@ mod tests {
             .await
             .unwrap();
 
-        assert!(recent_commit(&pool, &t.id, "booking", 10)
+        assert!(recent_commit(&pool, &t.id, "booking", "", 10)
             .await
             .unwrap()
             .is_none());
 
-        let FenceVerdict::Armed(id) = arm_side_effect(&pool, &r.id, &t.id, "manual/one", "booking")
-            .await
-            .unwrap()
+        let FenceVerdict::Armed(id) =
+            arm_side_effect(&pool, &r.id, &t.id, "manual/one", "booking", "")
+                .await
+                .unwrap()
         else {
             panic!()
         };
@@ -2159,13 +2591,15 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(
-            arm_side_effect(&pool, &r2.id, &t.id, "manual/two", "booking")
+            arm_side_effect(&pool, &r2.id, &t.id, "manual/two", "booking", "")
                 .await
                 .unwrap(),
             FenceVerdict::Armed(_)
         ));
         // But the repeat is visible, which is what stops it happening silently.
-        let recent = recent_commit(&pool, &t.id, "booking", 10).await.unwrap();
+        let recent = recent_commit(&pool, &t.id, "booking", "", 10)
+            .await
+            .unwrap();
         assert!(
             recent.is_some(),
             "a booking a moment ago must be visible to the next attempt"
@@ -2190,7 +2624,7 @@ mod tests {
         let r = create_run(&pool, &t.id, "old", "manual", "normal", None)
             .await
             .unwrap();
-        let FenceVerdict::Armed(id) = arm_side_effect(&pool, &r.id, &t.id, "old", "booking")
+        let FenceVerdict::Armed(id) = arm_side_effect(&pool, &r.id, &t.id, "old", "booking", "")
             .await
             .unwrap()
         else {
@@ -2204,7 +2638,7 @@ mod tests {
             .unwrap();
 
         // Booking again next week is normal and must not be obstructed.
-        assert!(recent_commit(&pool, &t.id, "booking", 10)
+        assert!(recent_commit(&pool, &t.id, "booking", "", 10)
             .await
             .unwrap()
             .is_none());
@@ -2283,7 +2717,7 @@ mod tests {
             .await
             .unwrap();
         set_run_status(&pool, &r.id, "running").await.unwrap();
-        arm_side_effect(&pool, &r.id, &t.id, "slot", "booking")
+        arm_side_effect(&pool, &r.id, &t.id, "slot", "booking", "")
             .await
             .unwrap();
 
@@ -2351,7 +2785,7 @@ mod tests {
         let r = create_run(&pool, &t.id, "slot", "schedule", "normal", None)
             .await
             .unwrap();
-        arm_side_effect(&pool, &r.id, &t.id, "slot", "booking")
+        arm_side_effect(&pool, &r.id, &t.id, "slot", "booking", "")
             .await
             .unwrap();
         assert!(dangling_fences(&pool, &t.id, "slot").await.unwrap());
@@ -2365,7 +2799,7 @@ mod tests {
         );
         assert!(!dangling_fences(&pool, &t.id, "slot").await.unwrap());
         assert!(matches!(
-            arm_side_effect(&pool, &r.id, &t.id, "slot", "booking")
+            arm_side_effect(&pool, &r.id, &t.id, "slot", "booking", "")
                 .await
                 .unwrap(),
             FenceVerdict::Armed(_)
@@ -2389,7 +2823,7 @@ mod tests {
         let r = create_run(&pool, &t.id, "slot", "schedule", "normal", None)
             .await
             .unwrap();
-        arm_side_effect(&pool, &r.id, &t.id, "slot", "booking")
+        arm_side_effect(&pool, &r.id, &t.id, "slot", "booking", "")
             .await
             .unwrap();
 
@@ -2401,7 +2835,7 @@ mod tests {
             1
         );
         assert!(matches!(
-            arm_side_effect(&pool, &r.id, &t.id, "slot", "booking")
+            arm_side_effect(&pool, &r.id, &t.id, "slot", "booking", "")
                 .await
                 .unwrap(),
             FenceVerdict::AlreadyCommitted { .. }
@@ -2753,6 +3187,537 @@ mod tests {
                 .unwrap(),
             0
         );
+    }
+
+    // -------------------------------------------------- changing a task --
+
+    async fn a_task(pool: &Pool, schedule: serde_json::Value) -> crate::models::Task {
+        create_task(
+            pool,
+            NewTask {
+                name: "Book tennis court".into(),
+                description: "Book court 2 or 4 for Wednesday 19:00.".into(),
+                emoji: Some("🎾".into()),
+                schedule,
+            },
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn changing_the_schedule_does_not_let_past_occurrences_run() {
+        let pool = open_memory().await.unwrap();
+        let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+
+        // Switch to a cron that has notionally been due every morning for
+        // years. Nothing before now may ever be treated as missed.
+        let updated = update_task(
+            &pool,
+            &t.id,
+            TaskPatch {
+                schedule: Some(serde_json::json!({
+                    "kind": "cron", "expr": "0 0 8 * * *", "tz": "UTC"
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let floor = task_catch_up_floor(&pool, &t.id).await.unwrap().unwrap();
+        assert!(
+            floor >= t.created_at,
+            "the floor must not sit before the task existed: {floor}"
+        );
+
+        // The promised next run is genuinely in the future, not this morning's
+        // eight o'clock dressed up as a pending run. Parsed rather than
+        // compared as text: next_run_at is written as an offset and now_iso as
+        // a Z, and two formats compared as strings agree only by luck.
+        let next = updated.next_run_at.expect("a cron task has a next run");
+        let next: DateTime<Utc> = next.parse().unwrap();
+        let floor_dt: DateTime<Utc> = floor.parse().unwrap();
+        assert!(
+            next > floor_dt,
+            "the countdown promised a run at or below the floor: {next}"
+        );
+        assert!(
+            next > Utc::now(),
+            "the countdown promised a run that has already passed: {next}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_occurrence_already_recorded_stays_below_the_floor() {
+        let pool = open_memory().await.unwrap();
+        let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+
+        // A slot this task has already used, and a manual run alongside it.
+        // 'm' sorts above '2', so a bare MAX() would pick the manual id and the
+        // floor would be gibberish.
+        create_run(
+            &pool,
+            &t.id,
+            "2099-01-01T08:00:00Z",
+            "schedule",
+            "normal",
+            None,
+        )
+        .await
+        .unwrap();
+        create_run(
+            &pool,
+            &t.id,
+            &format!("manual/{}", crate::new_id()),
+            "manual",
+            "normal",
+            None,
+        )
+        .await
+        .unwrap();
+
+        update_task(
+            &pool,
+            &t.id,
+            TaskPatch {
+                schedule: Some(serde_json::json!({
+                    "kind": "cron", "expr": "0 0 8 * * *", "tz": "UTC"
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let floor = task_catch_up_floor(&pool, &t.id).await.unwrap().unwrap();
+        assert_eq!(
+            floor, "2099-01-01T08:00:00Z",
+            "the floor must clear the last scheduled slot, and must not be a manual id"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_turned_manual_stops_promising_a_next_run() {
+        let pool = open_memory().await.unwrap();
+        let t = a_task(
+            &pool,
+            serde_json::json!({"kind": "cron", "expr": "0 0 8 * * *", "tz": "UTC"}),
+        )
+        .await;
+
+        let scheduled = update_task(
+            &pool,
+            &t.id,
+            TaskPatch {
+                schedule: Some(serde_json::json!({
+                    "kind": "cron", "expr": "0 0 9 * * *", "tz": "UTC"
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(scheduled.next_run_at.is_some());
+
+        let manual = update_task(
+            &pool,
+            &t.id,
+            TaskPatch {
+                schedule: Some(serde_json::json!({"kind": "manual"})),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            manual.next_run_at.is_none(),
+            "nothing else ever clears this, so a stale next run would show forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_one_shot_whose_moment_has_gone_shows_no_next_run() {
+        let pool = open_memory().await.unwrap();
+        let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+
+        let spent = update_task(
+            &pool,
+            &t.id,
+            TaskPatch {
+                schedule: Some(serde_json::json!({
+                    "kind": "once", "at": "2020-01-01T08:00:00", "tz": "UTC"
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            spent.next_run_at.is_none(),
+            "a moment that has passed must not read as pending"
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_the_schedule_does_not_wake_a_task_paused_for_checking() {
+        let pool = open_memory().await.unwrap();
+        let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        activate_task(&pool, &t.id).await.unwrap();
+        auto_pause_task(&pool, &t.id, "needs_verification")
+            .await
+            .unwrap();
+
+        let after = update_task(
+            &pool,
+            &t.id,
+            TaskPatch {
+                schedule: Some(serde_json::json!({
+                    "kind": "cron", "expr": "0 0 8 * * *", "tz": "UTC"
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(after.status, "paused");
+        assert!(after.auto_paused);
+        assert_eq!(after.paused_reason.as_deref(), Some("needs_verification"));
+    }
+
+    #[tokio::test]
+    async fn editing_one_setting_leaves_the_others_alone() {
+        let pool = open_memory().await.unwrap();
+        let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+
+        let after = update_task(
+            &pool,
+            &t.id,
+            TaskPatch {
+                name: Some("Book badminton court".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(after.name, "Book badminton court");
+        assert_eq!(after.description, t.description, "description was blanked");
+        assert_eq!(after.emoji, t.emoji);
+        assert_eq!(after.schedule, t.schedule);
+    }
+
+    #[tokio::test]
+    async fn the_sites_a_task_may_open_are_tidied_before_they_are_stored() {
+        let pool = open_memory().await.unwrap();
+        let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+
+        let after = update_task(
+            &pool,
+            &t.id,
+            TaskPatch {
+                allowed_domains: Some(vec![
+                    "  HTTPS://Tennis-Club.example/book?day=wed  ".into(),
+                    "tennis-club.example".into(),
+                ]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            after.allowed_domains,
+            serde_json::json!(["tennis-club.example"]),
+            "what is stored must be exactly what the run-time check compares"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_site_that_could_never_match_is_refused_and_nothing_is_saved() {
+        let pool = open_memory().await.unwrap();
+        let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+
+        let err = update_task(
+            &pool,
+            &t.id,
+            TaskPatch {
+                name: Some("Renamed".into()),
+                allowed_domains: Some(vec!["*.tennis-club.example".into()]),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("tennis-club.example"), "unhelpful: {err}");
+
+        let after = get_task(&pool, &t.id).await.unwrap().unwrap();
+        assert_eq!(after.name, t.name, "the rename went through on a failure");
+    }
+
+    #[tokio::test]
+    async fn an_archived_task_cannot_be_changed() {
+        let pool = open_memory().await.unwrap();
+        let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        set_task_status(&pool, &t.id, "archived").await.unwrap();
+
+        let err = update_task(
+            &pool,
+            &t.id,
+            TaskPatch {
+                name: Some("Renamed".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("archived"), "unclear refusal: {err}");
+    }
+
+    // -------------------------------------------------------- fence scope --
+
+    #[tokio::test]
+    async fn an_empty_fence_scope_writes_exactly_the_key_it_always_did() {
+        let pool = open_memory().await.unwrap();
+        let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        let r = create_run(
+            &pool,
+            &t.id,
+            "2026-08-26T08:00:00Z",
+            "schedule",
+            "normal",
+            None,
+        )
+        .await
+        .unwrap();
+
+        arm_side_effect(&pool, &r.id, &t.id, "2026-08-26T08:00:00Z", "booking", "")
+            .await
+            .unwrap();
+
+        let key: String = sqlx::query("SELECT idempotency_key FROM side_effects WHERE task_id = ?")
+            .bind(&t.id)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            .try_get("idempotency_key")
+            .unwrap();
+
+        // Byte-identical to the pre-scope format. A key that changed shape
+        // would stop matching a booking that has already been committed, and
+        // the next attempt would read a taken slot as free.
+        assert_eq!(key, format!("{}:2026-08-26T08:00:00Z:booking", t.id));
+    }
+
+    #[tokio::test]
+    async fn a_scope_the_person_chose_gets_its_own_go_ahead() {
+        let pool = open_memory().await.unwrap();
+        let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        let r = create_run(&pool, &t.id, "slot", "schedule", "normal", None)
+            .await
+            .unwrap();
+
+        // Telling two people about one booking is two separate promises, and
+        // neither is a repeat of the other.
+        let first = arm_side_effect(&pool, &r.id, &t.id, "slot", "message", "recipient-a")
+            .await
+            .unwrap();
+        let second = arm_side_effect(&pool, &r.id, &t.id, "slot", "message", "recipient-b")
+            .await
+            .unwrap();
+        assert!(matches!(first, FenceVerdict::Armed(_)));
+        assert!(matches!(second, FenceVerdict::Armed(_)));
+
+        // Asking twice for the same person is still refused.
+        let FenceVerdict::Armed(id) = first else {
+            unreachable!()
+        };
+        commit_side_effect(&pool, &id, "sent").await.unwrap();
+        let repeat = arm_side_effect(&pool, &r.id, &t.id, "slot", "message", "recipient-a")
+            .await
+            .unwrap();
+        assert!(matches!(repeat, FenceVerdict::AlreadyCommitted { .. }));
+    }
+
+    #[tokio::test]
+    async fn a_repeat_check_for_one_person_ignores_what_was_sent_to_another() {
+        let pool = open_memory().await.unwrap();
+        let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        let r = create_run(&pool, &t.id, "slot", "schedule", "normal", None)
+            .await
+            .unwrap();
+
+        let FenceVerdict::Armed(id) =
+            arm_side_effect(&pool, &r.id, &t.id, "slot", "message", "recipient-a")
+                .await
+                .unwrap()
+        else {
+            unreachable!()
+        };
+        commit_side_effect(&pool, &id, "told Mum").await.unwrap();
+
+        assert!(recent_commit(&pool, &t.id, "message", "recipient-a", 10)
+            .await
+            .unwrap()
+            .is_some());
+        assert!(
+            recent_commit(&pool, &t.id, "message", "recipient-b", 10)
+                .await
+                .unwrap()
+                .is_none(),
+            "one person having been told must not silence the message to another"
+        );
+    }
+
+    // --------------------------------------------------------- recipients --
+
+    #[tokio::test]
+    async fn a_task_may_only_contact_the_people_it_was_given() {
+        let pool = open_memory().await.unwrap();
+        let mum = create_recipient(&pool, "Mum", "whatsapp", "+447700900112")
+            .await
+            .unwrap();
+        let work = create_recipient(&pool, "Work", "apple_mail", "me@example.com")
+            .await
+            .unwrap();
+
+        let tennis = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        let bills = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+
+        link_recipient(&pool, &tennis.id, &mum, true, true)
+            .await
+            .unwrap();
+        link_recipient(&pool, &bills.id, &work, false, true)
+            .await
+            .unwrap();
+
+        let for_tennis = recipients_for_task(&pool, &tennis.id).await.unwrap();
+        assert_eq!(for_tennis.len(), 1);
+        assert_eq!(for_tennis[0].label, "Mum");
+
+        let for_bills = recipients_for_task(&pool, &bills.id).await.unwrap();
+        assert_eq!(for_bills.len(), 1);
+        assert_eq!(for_bills[0].label, "Work");
+        assert!(!for_bills[0].on_success, "the per-task flag was not kept");
+        assert!(for_bills[0].on_failure);
+
+        // Both exist globally; only the grant is per task.
+        assert_eq!(list_recipients(&pool).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn taking_a_contact_off_one_task_leaves_the_others_alone() {
+        let pool = open_memory().await.unwrap();
+        let mum = create_recipient(&pool, "Mum", "whatsapp", "+447700900112")
+            .await
+            .unwrap();
+        let a = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        let b = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        link_recipient(&pool, &a.id, &mum, true, true)
+            .await
+            .unwrap();
+        link_recipient(&pool, &b.id, &mum, true, true)
+            .await
+            .unwrap();
+
+        assert!(unlink_recipient(&pool, &a.id, &mum).await.unwrap());
+        assert!(recipients_for_task(&pool, &a.id).await.unwrap().is_empty());
+        assert_eq!(recipients_for_task(&pool, &b.id).await.unwrap().len(), 1);
+        assert_eq!(
+            list_recipients(&pool).await.unwrap().len(),
+            1,
+            "unlinking must not delete the person"
+        );
+    }
+
+    #[tokio::test]
+    async fn deleting_a_contact_takes_every_task_grant_with_it() {
+        let pool = open_memory().await.unwrap();
+        let mum = create_recipient(&pool, "Mum", "whatsapp", "+447700900112")
+            .await
+            .unwrap();
+        let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        link_recipient(&pool, &t.id, &mum, true, true)
+            .await
+            .unwrap();
+
+        assert!(delete_recipient(&pool, &mum).await.unwrap());
+        assert!(
+            recipients_for_task(&pool, &t.id).await.unwrap().is_empty(),
+            "a task must not be left holding a grant to somebody who is gone"
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_what_a_task_may_tell_someone_replaces_the_old_answer() {
+        let pool = open_memory().await.unwrap();
+        let mum = create_recipient(&pool, "Mum", "whatsapp", "+447700900112")
+            .await
+            .unwrap();
+        let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+
+        link_recipient(&pool, &t.id, &mum, true, true)
+            .await
+            .unwrap();
+        link_recipient(&pool, &t.id, &mum, false, true)
+            .await
+            .unwrap();
+
+        let granted = recipients_for_task(&pool, &t.id).await.unwrap();
+        assert_eq!(granted.len(), 1, "relinking must not add a second row");
+        assert!(!granted[0].on_success);
+    }
+
+    #[tokio::test]
+    async fn a_way_of_sending_errand_does_not_have_is_refused_in_plain_words() {
+        let pool = open_memory().await.unwrap();
+        let err = create_recipient(&pool, "Mum", "carrier_pigeon", "+447700900112")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("Telegram"), "no alternatives offered: {err}");
+        assert!(list_recipients(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_agent_is_shown_who_it_is_writing_to_and_not_how_to_reach_them() {
+        let pool = open_memory().await.unwrap();
+        let mum = create_recipient(&pool, "Mum", "whatsapp", "+447700900112")
+            .await
+            .unwrap();
+        let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        link_recipient(&pool, &t.id, &mum, true, true)
+            .await
+            .unwrap();
+
+        let granted = &recipients_for_task(&pool, &t.id).await.unwrap()[0];
+        assert_eq!(granted.address_masked, "+44 ••• ••12");
+        assert!(
+            !granted.address_masked.contains("7700900"),
+            "the middle of the number survived the mask"
+        );
+    }
+
+    #[test]
+    fn a_masked_address_is_enough_to_recognise_and_not_enough_to_use() {
+        assert_eq!(masked_address("whatsapp", "+447700900112"), "+44 ••• ••12");
+        assert_eq!(masked_address("imessage", "+447700900112"), "+44 ••• ••12");
+        assert_eq!(
+            masked_address("apple_mail", "me@gmail.com"),
+            "m•••@gmail.com"
+        );
+        assert_eq!(
+            masked_address("imessage", "someone@example.com"),
+            "s•••@example.com"
+        );
+        assert_eq!(masked_address("telegram", "@wolf"), "@w•••");
+        assert_eq!(masked_address("telegram", "123456789"), "••• ••89");
+        // Nothing useful to hide behind, so nothing is shown.
+        assert_eq!(masked_address("whatsapp", "12"), "•••");
+        assert_eq!(masked_address("apple_mail", "  "), "•••");
     }
 }
 

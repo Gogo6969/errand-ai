@@ -168,6 +168,20 @@ async fn consider(
     since: DateTime<Utc>,
     slept: bool,
 ) -> anyhow::Result<()> {
+    // Never look back past the moment this task's schedule started being true.
+    //
+    // The sweep cursor is global: one row, shared by every task. So the moment
+    // somebody changes one task's schedule, every occurrence of the NEW
+    // schedule between that shared cursor and now reads as missed. Switching a
+    // task to a daily cron would fire a historical run on the spot and burn
+    // that occurrence id for good, because a burnt id can never run again.
+    //
+    // `occurrences_between` advances with `next_after`, which is strictly
+    // after, so an occurrence landing exactly on the floor second is excluded.
+    // That is the safe direction: the floor is the instant the old schedule
+    // stopped applying, and nothing before it was ever missed.
+    let since = catch_up_floor(state, task, since, now).await?;
+
     // Look slightly into the future as well as the past, because a task with a
     // run window has to START before its occurrence in order to be logged in
     // and waiting when the barrier lifts.
@@ -243,6 +257,33 @@ async fn consider(
     Ok(())
 }
 
+/// The sweep cursor, raised to this task's catch-up floor.
+///
+/// Returns whichever is later. A task with no floor has been running against
+/// its current schedule all along and keeps the shared cursor unchanged.
+async fn catch_up_floor(
+    state: &AppState,
+    task: &errand_core::models::Task,
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+) -> anyhow::Result<DateTime<Utc>> {
+    let Some(stored) = errand_core::db::task_catch_up_floor(state.pool(), &task.id).await? else {
+        return Ok(since);
+    };
+    let Ok(floor) = stored.parse::<DateTime<Utc>>() else {
+        // A floor nobody can read is not a reason to replay a week of history.
+        // Standing still until now means no catch-up for this task on this
+        // sweep; occurrences still to come are unaffected.
+        tracing::warn!(
+            task = %task.id,
+            floor = %stored,
+            "cannot read this task's catch-up floor, so nothing missed will be made up for it"
+        );
+        return Ok(now.max(since));
+    };
+    Ok(since.max(floor))
+}
+
 /// When a run for this occurrence should actually begin: early enough to be
 /// logged in before a window opens, plus this task's stable jitter.
 ///
@@ -287,8 +328,19 @@ async fn fire(
     .await
     {
         Ok(r) => r,
-        // Expected: this slot already ran.
-        Err(errand_core::db::CreateRunError::AlreadyExists) => return Ok(()),
+        // This slot already produced a run, so it must not produce a second.
+        // Correct, but not silent: the decision to fire was made and then
+        // dropped, and a line here is the only trace that the occurrence was
+        // ever considered.
+        Err(errand_core::db::CreateRunError::AlreadyExists) => {
+            tracing::warn!(
+                task = %task.id,
+                name = %task.name,
+                occurrence = %occurrence_id,
+                "this occurrence already has a run, so it was not started again"
+            );
+            return Ok(());
+        }
         // Anything else must surface. Treating a database fault as "already
         // ran" would drop the occurrence with no run, no failure and no record.
         Err(errand_core::db::CreateRunError::Other(e)) => {
@@ -395,4 +447,99 @@ async fn record_skip(
         summary: Some(human),
     });
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::api::testkit::{self, a_ready_manual_task};
+    use serde_json::json;
+
+    /// Three in the morning, every morning. Chosen so that a sweep pretending
+    /// to have missed a week has seven perfectly good occurrences to replay if
+    /// nothing stops it.
+    const EVERY_MORNING: &str = "0 0 3 * * *";
+
+    /// Every minute, for the test that needs occurrences to fall due inside a
+    /// jump of a few minutes rather than waiting for an hour to come round.
+    const EVERY_MINUTE: &str = "0 * * * * *";
+
+    async fn put_on_schedule(api: &testkit::Api, id: &str, expr: &str, catch_up: &str) {
+        let (code, body) = api
+            .patch(
+                &format!("/v1/tasks/{id}"),
+                json!({ "schedule": {
+                    "kind": "cron", "expr": expr, "tz": "UTC", "catch_up": catch_up
+                }}),
+            )
+            .await;
+        assert_eq!(code, 200, "putting it on a schedule failed: {body}");
+    }
+
+    #[tokio::test]
+    async fn putting_a_task_on_a_schedule_does_not_run_it_for_slots_it_never_missed() {
+        // The failure this guards against: the sweep cursor is one row shared
+        // by every task, so the moment a task is moved onto a repeating
+        // schedule, every occurrence of the NEW schedule between that shared
+        // cursor and now looks missed. The task fires on the spot for a morning
+        // that has already gone, and burns that occurrence id for good, because
+        // a slot that has run can never run again.
+        let api = testkit::start().await;
+        let id = a_ready_manual_task(&api).await;
+        put_on_schedule(&api, &id, EVERY_MORNING, "run_once_late").await;
+
+        // A sweep that believes it has not looked since last week, which is
+        // what a laptop that has been shut for a few days looks like.
+        let now = Utc::now();
+        tick(&api.state, now, now - chrono::Duration::days(7), true)
+            .await
+            .expect("the sweep ran");
+
+        let runs = api.get(&format!("/v1/runs?task_id={id}")).await;
+        let items = runs["items"].as_array().expect("a list of runs");
+        assert!(
+            items.is_empty(),
+            "a task moved onto a schedule produced {} run(s) for slots it was never around for: \
+             {runs}",
+            items.len()
+        );
+
+        // And it still promises a next run, so nothing has quietly stopped.
+        let task = api.get(&format!("/v1/tasks/{id}")).await;
+        assert!(
+            task["next_run_at"].is_string(),
+            "the task must still say when it runs next: {task}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_floor_does_not_blind_a_task_to_the_slots_that_come_after_it() {
+        // The other half of the same rule. Without this, "never replay history"
+        // would be indistinguishable from "never notice anything", and a task
+        // that came due while the Mac was asleep would silently never happen
+        // with nothing in its history to say so.
+        let api = testkit::start().await;
+        let id = a_ready_manual_task(&api).await;
+        put_on_schedule(&api, &id, EVERY_MINUTE, "skip").await;
+
+        // Three minutes on. Occurrences above the floor have now come due; this
+        // task is set to skip rather than run late, so each one is recorded as
+        // skipped instead of being run, which is the decision being visible
+        // rather than a gap in the history.
+        let later = Utc::now() + chrono::Duration::minutes(3);
+        tick(&api.state, later, later - chrono::Duration::days(7), true)
+            .await
+            .expect("the sweep ran");
+
+        let runs = api.get(&format!("/v1/runs?task_id={id}")).await;
+        let items = runs["items"].as_array().expect("a list of runs");
+        assert!(
+            !items.is_empty(),
+            "an occurrence after the floor must still be noticed: {runs}"
+        );
+        assert!(
+            items.iter().all(|r| r["status"] == "skipped"),
+            "this task skips what it misses, so nothing should have been run: {runs}"
+        );
+    }
 }

@@ -2,11 +2,13 @@
   import { onMount } from "svelte";
   import { api, statusLabel, when, type Task, ApiError } from "$lib/api";
   import Hint from "$lib/components/Hint.svelte";
+  import SitesEditor from "$lib/components/SitesEditor.svelte";
 
   let tasks = $state<Task[]>([]);
   let loading = $state(true);
   let problem = $state<string | null>(null);
   let creating = $state(false);
+  let newSites = $state<string[]>([]);
   let name = $state("");
   let description = $state("");
 
@@ -24,7 +26,7 @@
 
   async function create() {
     try {
-      const t = await api.createTask(name.trim(), description.trim());
+      const t = await api.createTask(name.trim(), description.trim(), undefined, newSites);
       name = ""; description = ""; creating = false;
       location.href = `/task/${t.id}`;
     } catch (e) {
@@ -58,6 +60,15 @@
     <textarea id="d" rows="4" bind:value={description}
       placeholder="Go to the club website, sign in, and book the Wednesday 19:00 court. Tell me the confirmation number."></textarea>
     <p class="muted">This description is what the agent actually reads, so be as plain as you would be with a person.</p>
+
+    <label for="sites-block">Which websites may it open?</label>
+    <div id="sites-block">
+      <SitesEditor bind:sites={newSites} />
+    </div>
+    <p class="muted">
+      A task with no sites cannot browse at all, so this is worth getting right now rather than
+      after it has tried once. You can change it later.
+    </p>
     <div class="row" style="margin-top:12px">
       <Hint id="task.teach">
         <button class="primary" disabled={!name.trim() || !description.trim()} onclick={create}>Create</button>

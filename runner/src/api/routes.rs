@@ -28,7 +28,8 @@ pub fn router(state: AppState) -> Router {
     let private = Router::new()
         .route("/v1/health/detail", get(health_detail))
         .route("/v1/tasks", get(list_tasks).post(create_task))
-        .route("/v1/tasks/{id}", get(get_task))
+        .route("/v1/tasks/{id}", get(get_task).patch(patch_task))
+        .route("/v1/schedule/preview", post(preview_schedule))
         .route("/v1/tasks/{id}/activate", post(activate_task))
         .route("/v1/tasks/{id}/teach", post(teach_task))
         .route("/v1/tasks/{id}/playbook", get(get_playbook))
@@ -49,6 +50,20 @@ pub fn router(state: AppState) -> Router {
             get(list_credentials).post(create_credential),
         )
         .route("/v1/credentials/{id}", delete(delete_credential))
+        .route(
+            "/v1/recipients",
+            get(list_recipients).post(create_recipient),
+        )
+        .route("/v1/recipients/{id}", delete(delete_recipient))
+        .route(
+            "/v1/tasks/{id}/recipients",
+            get(list_task_recipients).post(grant_recipient),
+        )
+        .route(
+            "/v1/tasks/{id}/recipients/{recipient_id}",
+            delete(revoke_recipient),
+        )
+        .route("/v1/settings", get(get_settings))
         .route("/v1/channels", get(list_channels))
         .route("/v1/channels/{channel}/config", post(configure_channel))
         .route("/v1/channels/{channel}/test", post(test_channel))
@@ -88,6 +103,65 @@ async fn health_detail(State(state): State<AppState>) -> ApiResult<Json<serde_js
 
 // ------------------------------------------------------------------- tasks --
 
+/// How many upcoming runs to show alongside a schedule.
+///
+/// Enough to see the pattern — three mornings in a row, or the same day next
+/// week — without turning a task page into a diary.
+const PREVIEW_COUNT: usize = 3;
+
+/// Said in one place, because two gates enforce this one rule.
+///
+/// `activate` refuses an untaught task that is already on a schedule; `patch`
+/// refuses putting an untaught task onto one. If the two ever explained it
+/// differently, a person meeting the second would think they had hit a
+/// different problem.
+const NOT_TAUGHT: &str =
+    "This task has no approved playbook, so putting it on a schedule would send an unattended \
+     agent at a site with no agreed way of doing the job. Teach it once and approve what it \
+     wrote first.";
+
+/// A task, plus its schedule said in words and the next few times it will run.
+///
+/// The interface must never have to read a cron expression to work out what a
+/// task does; a screen that interprets one for itself is a screen that can
+/// disagree with the engine, and the disagreement only shows up on the morning
+/// nothing happens. Both of these come from the code that will actually fire
+/// the task, so they cannot drift from it.
+fn task_json(task: &errand_core::models::Task) -> serde_json::Value {
+    let mut v = serde_json::to_value(task).unwrap_or_else(|_| json!({}));
+    let (describes, preview) = match errand_core::schedule::ScheduleSpec::from_json(&task.schedule)
+    {
+        Ok(spec) => (
+            spec.describe(),
+            spec.preview(chrono::Utc::now(), PREVIEW_COUNT)
+                .unwrap_or_default()
+                .iter()
+                .map(|d| d.to_rfc3339())
+                .collect::<Vec<_>>(),
+        ),
+        // Saying so beats leaving the field out: a task whose schedule cannot
+        // be read will never run on its own, and nobody would guess that from
+        // a missing line.
+        Err(e) => (
+            format!("Errand cannot read this task's schedule, so it will not run on its own: {e}"),
+            vec![],
+        ),
+    };
+    v["schedule_describes"] = json!(describes);
+    v["schedule_preview"] = json!(preview);
+    v
+}
+
+/// Tidy a list of sites, or refuse it with something to type instead.
+///
+/// Warnings come back alongside: they are not refusals, and the list they
+/// describe has been accepted.
+fn normalize_sites(list: &[String]) -> ApiResult<(Vec<String>, Vec<String>)> {
+    let n = errand_core::domains::normalize_domains(list)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    Ok((n.domains, n.warnings))
+}
+
 #[derive(Deserialize)]
 struct ListTasksQuery {
     #[serde(default)]
@@ -103,19 +177,20 @@ async fn list_tasks(
     let tasks = errand_core::db::list_tasks(state.pool(), q.include_archived)
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(json!({ "items": tasks })))
+    let items: Vec<serde_json::Value> = tasks.iter().map(task_json).collect();
+    Ok(Json(json!({ "items": items })))
 }
 
 async fn get_task(
     State(state): State<AppState>,
     Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
-) -> ApiResult<Json<errand_core::models::Task>> {
+) -> ApiResult<Json<serde_json::Value>> {
     require(&caller, Scope::Read)?;
     errand_core::db::get_task(state.pool(), &id)
         .await
         .map_err(ApiError::from)?
-        .map(Json)
+        .map(|t| Json(task_json(&t)))
         .ok_or_else(|| ApiError::not_found(format!("No task with id {id}.")))
 }
 
@@ -126,13 +201,19 @@ struct CreateTask {
     emoji: Option<String>,
     #[serde(default)]
     schedule: Option<serde_json::Value>,
+    #[serde(default)]
+    notify: Option<serde_json::Value>,
+    #[serde(default)]
+    limits: Option<serde_json::Value>,
+    #[serde(default)]
+    allowed_domains: Option<Vec<String>>,
 }
 
 async fn create_task(
     State(state): State<AppState>,
     Extension(caller): Extension<Caller>,
     Json(body): Json<CreateTask>,
-) -> ApiResult<Json<errand_core::models::Task>> {
+) -> ApiResult<Json<serde_json::Value>> {
     require(&caller, Scope::Manage)?;
     if body.name.trim().is_empty() {
         return Err(ApiError::bad_request("A task needs a name."));
@@ -148,6 +229,16 @@ async fn create_task(
         .and_then(|s| s.validate())
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
 
+    // Checked before anything is written, so a site entry that cannot work
+    // costs nothing and leaves no half-made task behind.
+    let (domains, warnings) = match &body.allowed_domains {
+        Some(list) => {
+            let (d, w) = normalize_sites(list)?;
+            (Some(d), w)
+        }
+        None => (None, vec![]),
+    };
+
     let task = errand_core::db::create_task(
         state.pool(),
         errand_core::db::NewTask {
@@ -160,10 +251,358 @@ async fn create_task(
     .await
     .map_err(ApiError::from)?;
 
+    // The rest goes through the same code that a later edit would use, rather
+    // than a second copy of it here. One implementation of "store these
+    // settings" is one thing to get wrong.
+    let task = if domains.is_some() || body.notify.is_some() || body.limits.is_some() {
+        errand_core::db::update_task(
+            state.pool(),
+            &task.id,
+            errand_core::db::TaskPatch {
+                notify: body.notify,
+                limits: body.limits,
+                allowed_domains: domains,
+                ..Default::default()
+            },
+        )
+        .await
+        .map_err(ApiError::from)?
+    } else {
+        task
+    };
+
     state.emit(Event::TaskUpdated {
         task_id: task.id.clone(),
     });
-    Ok(Json(task))
+    let mut out = task_json(&task);
+    out["warnings"] = json!(warnings);
+    Ok(Json(out))
+}
+
+/// Everything about a task a person may change after it exists.
+///
+/// Every field is optional and absent means unchanged, so a screen that edits
+/// only the sites cannot blank the description on the way past.
+#[derive(Deserialize)]
+struct PatchTask {
+    name: Option<String>,
+    emoji: Option<String>,
+    description: Option<String>,
+    schedule: Option<serde_json::Value>,
+    notify: Option<serde_json::Value>,
+    limits: Option<serde_json::Value>,
+    allowed_domains: Option<Vec<String>>,
+    /// The answer to a `schedule_change_may_repeat` refusal: yes, I have read
+    /// it, change the schedule anyway.
+    #[serde(default)]
+    acknowledge_repeat: bool,
+}
+
+/// Change a task's settings.
+///
+/// Nothing here touches a run that is already going, and nothing here unpauses
+/// a task: somebody editing a schedule has not necessarily looked at the site.
+async fn patch_task(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    headers: axum::http::HeaderMap,
+    Json(raw): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+
+    let body: PatchTask = serde_json::from_value(raw.clone()).map_err(|e| {
+        ApiError::bad_request(format!(
+            "Errand could not read that change, so nothing was altered: {e}"
+        ))
+    })?;
+
+    // A save that is retried after a dropped connection must not be treated as
+    // a second edit. Changing a schedule moves the task's catch-up floor, and
+    // two floors written a moment apart is a task whose history has a hole in
+    // it that nobody asked for.
+    let idem = headers
+        .get("Idempotency-Key")
+        .and_then(|v| v.to_str().ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty() && s.len() <= 128);
+    let request_hash = super::auth::hash_token(&format!("{id}:{raw}"));
+    if let Some(key) = &idem {
+        match errand_core::db::idempotent_replay(state.pool(), key, "patch_task", &request_hash)
+            .await
+            .map_err(ApiError::from)?
+        {
+            Some(Ok(stored)) => {
+                let v: serde_json::Value =
+                    serde_json::from_str(&stored).unwrap_or(serde_json::Value::Null);
+                return Ok(Json(v));
+            }
+            Some(Err(why)) => return Err(ApiError::conflict("idempotency_key_reuse", why)),
+            None => {}
+        }
+    }
+
+    let task = errand_core::db::get_task(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found(format!("No task with id {id}.")))?;
+
+    if task.status == "archived" {
+        return Err(ApiError::conflict(
+            "task_archived",
+            "This task has been archived, so its settings can no longer be changed. Nothing was \
+             altered. Restore it first if you want to edit it.",
+        ));
+    }
+
+    // Present-but-empty is a different thing from absent, and the create route
+    // refuses both of these. Without the same check here, editing would be the
+    // way round it.
+    if body.name.as_ref().is_some_and(|n| n.trim().is_empty()) {
+        return Err(ApiError::bad_request(
+            "A task needs a name, so nothing was changed. Type one, or leave the name out of the \
+             change to keep the one it has.",
+        ));
+    }
+    if body
+        .description
+        .as_ref()
+        .is_some_and(|d| d.trim().is_empty())
+    {
+        return Err(ApiError::bad_request(
+            "A task needs a description — it is what the agent actually reads — so nothing was \
+             changed. Leave the description out of the change to keep the one it has.",
+        ));
+    }
+
+    let mut warnings: Vec<String> = vec![];
+    let domains = match &body.allowed_domains {
+        Some(list) => {
+            let (d, w) = normalize_sites(list)?;
+            warnings.extend(w);
+            Some(d)
+        }
+        None => None,
+    };
+
+    let new_spec = match &body.schedule {
+        Some(v) => Some(
+            errand_core::schedule::ScheduleSpec::from_json(v)
+                .and_then(|s| s.validate().map(|_| s))
+                .map_err(|e| ApiError::bad_request(e.to_string()))?,
+        ),
+        None => None,
+    };
+
+    if let Some(spec) = &new_spec {
+        // The hole this closes: `activate` only asks for a playbook when the
+        // task is ALREADY on a schedule, so a manual task activates happily and
+        // could then be moved onto a cron afterwards. That would put an
+        // unattended agent on a real site with no approved plan, which is the
+        // one thing that gate exists to prevent.
+        if spec.is_scheduled()
+            && matches!(task.status.as_str(), "ready" | "paused")
+            && errand_core::db::active_playbook(state.pool(), &id)
+                .await
+                .map_err(ApiError::from)?
+                .is_none()
+        {
+            return Err(ApiError::conflict("task_not_taught", NOT_TAUGHT));
+        }
+
+        if !body.acknowledge_repeat {
+            if let Some(problem) = repeat_risk(&state, &task, spec).await? {
+                return Err(ApiError::conflict("schedule_change_may_repeat", problem));
+            }
+        }
+    }
+
+    // A run already going is left alone rather than interrupted. It keeps the
+    // slot it started in, so the guard that stops an action happening twice
+    // still recognises its work; a run cut off midway through a booking is the
+    // state nobody can untangle afterwards.
+    if let Some(busy) = errand_core::db::busy_run_for_task(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+    {
+        warnings.push(format!(
+            "This task is running right now (run {busy}). That run carries on to the end under \
+             the settings it started with, and it is not started again. The change takes effect \
+             from the next run onwards."
+        ));
+    }
+
+    let updated = errand_core::db::update_task(
+        state.pool(),
+        &id,
+        errand_core::db::TaskPatch {
+            name: body.name,
+            emoji: body.emoji,
+            description: body.description,
+            schedule: body.schedule,
+            notify: body.notify,
+            limits: body.limits,
+            allowed_domains: domains,
+        },
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    state.emit(Event::TaskUpdated {
+        task_id: id.clone(),
+    });
+
+    let out = json!({ "task": task_json(&updated), "warnings": warnings });
+    if let Some(key) = idem {
+        let _ = errand_core::db::remember_idempotent(
+            state.pool(),
+            &key,
+            "patch_task",
+            &request_hash,
+            200,
+            &out.to_string(),
+        )
+        .await;
+    }
+    Ok(Json(out))
+}
+
+/// The kinds of irreversible action the guard records, as `browser::classify`
+/// names them. Kept in step with that list by hand, because the guard writes
+/// these strings and nothing else ever reads them back.
+const ACTION_KINDS: &[&str] = &["purchase", "deletion", "booking", "message", "form_submit"];
+
+/// How far back to look for finished work when a task has no repeating slot to
+/// measure from. A day: long enough to catch this morning's booking, short
+/// enough not to warn about something from last month.
+const LOOKBACK_WITHOUT_A_SLOT_MIN: i64 = 24 * 60;
+
+/// Would this schedule change make the task do something a second time?
+///
+/// Errand recognises work it has already finished by the exact instant the run
+/// was due. Move a schedule forwards and the next run stands in a slot that has
+/// never been seen before, so a booking made an hour ago counts for nothing and
+/// gets made again. That is a decision for the person rather than something to
+/// paper over, so it is refused once, in words, and can then be confirmed.
+async fn repeat_risk(
+    state: &AppState,
+    task: &errand_core::models::Task,
+    new_spec: &errand_core::schedule::ScheduleSpec,
+) -> ApiResult<Option<String>> {
+    let now = chrono::Utc::now();
+    // An unreadable old schedule was never going to come round on its own, so
+    // treat it as the manual case rather than guessing at it.
+    let old_spec = errand_core::schedule::ScheduleSpec::from_json(&task.schedule)
+        .unwrap_or_else(|_| errand_core::schedule::ScheduleSpec::default());
+
+    let Some(new_first) = new_spec
+        .next_after(now)
+        .map_err(|e| ApiError::bad_request(e.to_string()))?
+    else {
+        return Ok(None);
+    };
+    let sooner = match old_spec.next_after(now).ok().flatten() {
+        Some(old_next) => new_first < old_next,
+        // A task that was never coming round again on its own now is, so
+        // anything the new schedule does is sooner than nothing.
+        None => true,
+    };
+    if !sooner {
+        return Ok(None);
+    }
+
+    // Only work belonging to the slot the task is in now could be repeated:
+    // anything older was already superseded by a later occurrence.
+    let minutes = old_spec
+        .last_occurrence_at_or_before(now)
+        .ok()
+        .flatten()
+        .map(|occ| (now - occ).num_minutes().max(1))
+        .unwrap_or(LOOKBACK_WITHOUT_A_SLOT_MIN);
+
+    for kind in ACTION_KINDS {
+        let Some((_, at, evidence)) =
+            errand_core::db::recent_commit(state.pool(), &task.id, kind, "", minutes)
+                .await
+                .map_err(ApiError::from)?
+        else {
+            continue;
+        };
+        return Ok(Some(format!(
+            "This task already carried out a {kind} at {at}: {}. The new schedule's first run, at \
+             {}, comes round sooner than the old one would have, and Errand knows what it has \
+             already done by the exact time the run was due — so that run would look like fresh \
+             work and could do the {kind} a second time. Nothing has been changed. If that is \
+             what you want, send the same change again with acknowledge_repeat set to true.",
+            evidence.unwrap_or_else(|| "no details were recorded".into()),
+            new_first.to_rfc3339()
+        )));
+    }
+    Ok(None)
+}
+
+/// Say what the engine will really do with a schedule, before it is saved.
+///
+/// A form that builds a cron expression can be wrong in ways nobody notices
+/// until the morning nothing happens. This is the other half of the loop: the
+/// form says what was meant, this says what the engine will do, and the two can
+/// disagree in front of the person instead of at 08:00 next Tuesday.
+///
+/// It never fails. A schedule Errand cannot use comes back as `valid: false`
+/// with the reason in plain words, because a 500 here would tell the form
+/// nothing at all.
+async fn preview_schedule(
+    Extension(caller): Extension<Caller>,
+    Json(body): Json<serde_json::Value>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Read)?;
+
+    let spec = match errand_core::schedule::ScheduleSpec::from_json(&body) {
+        Ok(s) => s,
+        Err(e) => {
+            return Ok(Json(json!({
+                "valid": false,
+                "describes": "",
+                "preview": [],
+                "problem": format!(
+                    "Errand cannot read that as a schedule, so it has not been saved: {e}"
+                ),
+            })))
+        }
+    };
+    if let Err(e) = spec.validate() {
+        return Ok(Json(json!({
+            "valid": false,
+            "describes": spec.describe(),
+            "preview": [],
+            "problem": e.to_string(),
+        })));
+    }
+
+    let (preview, mut problem) = match spec.preview(chrono::Utc::now(), PREVIEW_COUNT) {
+        Ok(list) => (
+            list.iter().map(|d| d.to_rfc3339()).collect::<Vec<_>>(),
+            None,
+        ),
+        Err(e) => (vec![], Some(e.to_string())),
+    };
+    // A schedule that is perfectly legal and has no runs left is the one a
+    // person most needs telling about, because the form looks right and nothing
+    // will ever happen.
+    if problem.is_none() && preview.is_empty() && spec.is_scheduled() {
+        problem = Some(
+            "Errand can read this schedule, but it has no runs left to come: a one-off whose \
+             time has already passed never happens again. Choose a time in the future."
+                .to_string(),
+        );
+    }
+
+    Ok(Json(json!({
+        "valid": problem.is_none(),
+        "describes": spec.describe(),
+        "preview": preview,
+        "problem": problem,
+    })))
 }
 
 /// Move a task from draft to ready so the scheduler will consider it.
@@ -193,12 +632,7 @@ async fn activate_task(
             .map_err(ApiError::from)?
             .is_none()
     {
-        return Err(ApiError::conflict(
-            "task_not_taught",
-            "This task has no approved playbook, so putting it on a schedule would send an \
-             unattended agent at a site with no agreed way of doing the job. Teach it once and \
-             approve what it wrote first.",
-        ));
+        return Err(ApiError::conflict("task_not_taught", NOT_TAUGHT));
     }
 
     if !errand_core::db::activate_task(state.pool(), &id)
@@ -275,19 +709,525 @@ async fn configure_channel(
         stored.push(k);
     }
 
-    for (k, v) in body.settings {
+    // Every setting is checked and tidied before any of them is written, so a
+    // request with one good value and one bad one changes nothing rather than
+    // half of what was asked for.
+    let mut to_write = vec![];
+    let mut notes = vec![];
+    for (k, v) in &body.settings {
+        let (value, note) = check_setting(k, v).map_err(ApiError::bad_request)?;
+        notes.extend(note);
+        to_write.push((k.clone(), value));
+    }
+    let mut settings_written = vec![];
+    for (k, v) in to_write {
         errand_core::db::set_setting(state.pool(), &k, &v)
             .await
             .map_err(ApiError::from)?;
+        settings_written.push(k);
     }
 
     let health = crate::channels::health_all(state.pool()).await;
     Ok(Json(json!({
         "stored": stored,
+        "settings": settings_written,
+        "notes": notes,
         "health": health.iter().find(|h| h.channel == channel),
         "note": "Secrets are in your macOS keychain. Errand can use them; it cannot show them \
                  back to you."
     })))
+}
+
+/// The non-secret settings this route will write, and nothing else.
+///
+/// It used to take any key at all, which meant a key spelled slightly wrong was
+/// stored happily, read by nothing, and the person believed they had changed
+/// something they had not.
+const ALLOWED_SETTINGS: &[&str] = &["messaging.quiet", "messaging.whatsapp.base_url"];
+
+/// The word the outbox actually looks for when deciding whether bad news wakes
+/// you up. See `quiet_hours` in runner/src/outbox.rs: anything else is stored,
+/// read by nobody, and quietly ignored.
+const QUIET_BREAKS_THROUGH: &str = "failure_breaks_through";
+
+/// The same idea spelled the way the settings screen sends and reads it.
+///
+/// The two names disagree today. Rather than pick one and silently drop what
+/// the other side says, this route accepts either on the way in and stores the
+/// one the outbox reads, and `GET /v1/settings` shows both on the way out. The
+/// alternative is a switch that a person turns off and that turns itself back
+/// on when they next open the page.
+const QUIET_BREAKS_THROUGH_ALT: &str = "failures_break_through";
+
+/// Check one setting and hand back the tidied value, plus anything worth saying
+/// about what it will actually do.
+fn check_setting(
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<(serde_json::Value, Option<String>), String> {
+    if key == "messaging.quiet" {
+        check_quiet_hours(value)
+    } else if key == crate::channels::whatsapp::SETTING_BASE_URL {
+        Ok((check_gateway_url(value)?, None))
+    } else {
+        Err(format!(
+            "'{key}' is not a setting Errand keeps, so nothing has been saved. The ones it does \
+             keep are: {}.",
+            ALLOWED_SETTINGS.join(", ")
+        ))
+    }
+}
+
+/// Quiet hours, in the exact shape the outbox reads them in.
+fn check_quiet_hours(v: &serde_json::Value) -> Result<(serde_json::Value, Option<String>), String> {
+    let Some(obj) = v.as_object() else {
+        return Err(
+            "Quiet hours need a from hour, a to hour, and whether failures should still reach \
+             you during them. Nothing has been saved."
+                .into(),
+        );
+    };
+    for k in obj.keys() {
+        if !["from", "to", QUIET_BREAKS_THROUGH, QUIET_BREAKS_THROUGH_ALT].contains(&k.as_str()) {
+            return Err(format!(
+                "'{k}' is not part of quiet hours, so it would have been stored and then read by \
+                 nothing at all. The parts are: from, to, and {QUIET_BREAKS_THROUGH}."
+            ));
+        }
+    }
+
+    let hour = |name: &str| -> Result<u64, String> {
+        let raw = obj.get(name).ok_or_else(|| {
+            format!(
+                "Quiet hours need a '{name}' hour, so nothing has been saved. Give both, as \
+                 whole hours of the day from 0 to 23 — 22 and 7 for an ordinary night."
+            )
+        })?;
+        let n = raw.as_u64().ok_or_else(|| {
+            format!(
+                "The '{name}' hour is {raw}, which is not a whole hour of the day. Hours run \
+                 from 0 to 23, so 22 means ten at night."
+            )
+        })?;
+        if n > 23 {
+            return Err(format!(
+                "The '{name}' hour is {n}, and hours run from 0 to 23, so 22 means ten at night. \
+                 Nothing has been saved."
+            ));
+        }
+        Ok(n)
+    };
+    let from = hour("from")?;
+    let to = hour("to")?;
+
+    let breaks = match (
+        obj.get(QUIET_BREAKS_THROUGH),
+        obj.get(QUIET_BREAKS_THROUGH_ALT),
+    ) {
+        (None, None) => true,
+        (Some(a), Some(b)) if a != b => {
+            return Err(format!(
+                "Quiet hours were given '{QUIET_BREAKS_THROUGH}' as {a} and \
+                 '{QUIET_BREAKS_THROUGH_ALT}' as {b}. Those are two names for the same switch and \
+                 they do not agree, so nothing has been saved rather than Errand choosing for \
+                 you. Send just one of them."
+            ))
+        }
+        (a, b) => match a.or(b) {
+            Some(serde_json::Value::Bool(x)) => *x,
+            Some(other) => {
+                return Err(format!(
+                    "Whether failures break through quiet hours is {other}, which is neither true \
+                     nor false. Set it to true to be told about a failure even at night, or false \
+                     to hear about it in the morning."
+                ))
+            }
+            None => true,
+        },
+    };
+
+    // Equal hours are legal and mean no quiet period at all, which is how you
+    // switch this off. Said out loud, because saving "22 to 22" and getting
+    // messages all night would otherwise look like a fault.
+    let note = (from == to).then(|| {
+        "The quiet period starts and ends at the same hour, which means there is no quiet period: \
+         everything goes out as soon as it is ready."
+            .to_string()
+    });
+
+    Ok((
+        json!({ "from": from, "to": to, QUIET_BREAKS_THROUGH: breaks }),
+        note,
+    ))
+}
+
+/// Where the WhatsApp gateway lives.
+///
+/// The trailing slash is taken off here because the sender builds its addresses
+/// as `{base}/sessions`, and a doubled slash is the sort of thing that fails
+/// only at the moment a message was supposed to go out.
+fn check_gateway_url(v: &serde_json::Value) -> Result<serde_json::Value, String> {
+    let Some(raw) = v.as_str() else {
+        return Err(
+            "The WhatsApp gateway address has to be the address itself, as text. Nothing has \
+             been saved."
+                .into(),
+        );
+    };
+    let trimmed = raw.trim().trim_end_matches('/');
+    if trimmed.is_empty() {
+        return Err(
+            "The WhatsApp gateway address is empty, so Errand would have nowhere to send. Type \
+             the address the gateway prints when it starts, or leave WhatsApp switched off and \
+             use Telegram."
+                .into(),
+        );
+    }
+    let parsed = url::Url::parse(trimmed).map_err(|_| {
+        format!(
+            "'{trimmed}' is not an address Errand can call, so nothing has been saved. It needs \
+             the whole thing, starting with http:// or https://."
+        )
+    })?;
+    if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+        return Err(format!(
+            "'{trimmed}' does not look like a web address Errand can call, so nothing has been \
+             saved. It needs to start with http:// or https:// and name the machine the gateway \
+             is running on."
+        ));
+    }
+    Ok(json!(trimmed))
+}
+
+/// Every setting a person can change, and what it is set to now.
+///
+/// Only the writable ones. Errand's own bookkeeping lives in the same table,
+/// and a screen that showed it would be inviting somebody to change a number
+/// that means nothing to them.
+async fn get_settings(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Read)?;
+    let mut out = serde_json::Map::new();
+    for key in ALLOWED_SETTINGS {
+        let Some(mut value) = errand_core::db::get_setting(state.pool(), key)
+            .await
+            .map_err(ApiError::from)?
+        else {
+            continue;
+        };
+        // Shown under both names, for the reason given at QUIET_BREAKS_THROUGH_ALT.
+        if *key == "messaging.quiet" {
+            if let Some(b) = value.get(QUIET_BREAKS_THROUGH).cloned() {
+                if let Some(obj) = value.as_object_mut() {
+                    obj.insert(QUIET_BREAKS_THROUGH_ALT.to_string(), b);
+                }
+            }
+        }
+        out.insert((*key).to_string(), value);
+    }
+    Ok(Json(serde_json::Value::Object(out)))
+}
+
+// -------------------------------------------------------------- recipients --
+//
+// Two separate decisions, deliberately. Saving somebody's address is
+// housekeeping. Letting one task write to them is a grant, and it is the thing
+// that decides whether a real message reaches a real person, so it needs the
+// same permission as approving a booking rather than the one that edits
+// settings.
+
+async fn list_recipients(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    let items = errand_core::db::list_recipients(state.pool())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "items": items,
+        "note": "This is your own address book, so the addresses are shown in full. A task's \
+                 agent is only ever shown the masked form, because an address it never sees is \
+                 an address it cannot give away."
+    })))
+}
+
+#[derive(Deserialize)]
+struct NewRecipient {
+    label: String,
+    channel: String,
+    address: String,
+}
+
+async fn create_recipient(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Json(body): Json<NewRecipient>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    if crate::channels::ChannelId::parse(&body.channel).is_none() {
+        return Err(ApiError::bad_request(format!(
+            "'{}' is not a way Errand can send messages, so this contact was not saved. Choose \
+             telegram, whatsapp, apple_mail or imessage.",
+            body.channel
+        )));
+    }
+    if body.label.trim().is_empty() {
+        return Err(ApiError::bad_request(
+            "Give this contact a name you will recognise later, such as 'Mum'. It is the name a \
+             task's agent sees when it picks who to write to.",
+        ));
+    }
+    check_address(&body.channel, &body.address).map_err(ApiError::bad_request)?;
+
+    let id = errand_core::db::create_recipient(
+        state.pool(),
+        &body.label,
+        &body.channel,
+        body.address.trim(),
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    Ok(Json(json!({
+        "id": id,
+        "label": body.label.trim(),
+        "channel": body.channel,
+        "address": body.address.trim(),
+        "address_masked": errand_core::db::masked_address(&body.channel, &body.address),
+        "note": "Saved. No task can write to them yet: that is a separate step, done on the task \
+                 itself."
+    })))
+}
+
+async fn delete_recipient(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    let gone = errand_core::db::delete_recipient(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?;
+    if !gone {
+        return Err(ApiError::not_found("No contact with that id."));
+    }
+    Ok(Json(json!({
+        "deleted": id,
+        "note": "Forgotten, and every task that could write to them no longer can. Messages that \
+                 have already been sent are not affected."
+    })))
+}
+
+async fn list_task_recipients(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    if errand_core::db::get_task(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+        .is_none()
+    {
+        return Err(ApiError::not_found(format!("No task with id {id}.")));
+    }
+    let items = errand_core::db::recipients_for_task(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "items": items,
+        "note": "These are the only people this task may write to. It cannot be given an address \
+                 by a web page, or by anything it reads."
+    })))
+}
+
+#[derive(Deserialize)]
+struct GrantRecipient {
+    recipient_id: String,
+    /// Both on by default: somebody added to a task is presumed to want to hear
+    /// how it went either way.
+    #[serde(default = "yes")]
+    on_success: bool,
+    #[serde(default = "yes")]
+    on_failure: bool,
+}
+
+async fn grant_recipient(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(body): Json<GrantRecipient>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Approve rather than manage. Linking a person to a task decides whether a
+    // real message goes to a real third party without anybody watching, which
+    // is the same class of decision as resolving a hold, and a client that can
+    // change settings should not be able to make it.
+    require(&caller, Scope::Approve)?;
+
+    if errand_core::db::get_task(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+        .is_none()
+    {
+        return Err(ApiError::not_found(format!("No task with id {id}.")));
+    }
+    let person = errand_core::db::list_recipients(state.pool())
+        .await
+        .map_err(ApiError::from)?
+        .into_iter()
+        .find(|r| r.id == body.recipient_id)
+        .ok_or_else(|| {
+            ApiError::not_found(
+                "No contact with that id, so nothing was granted. Add them to your address book \
+                 first.",
+            )
+        })?;
+
+    if !body.on_success && !body.on_failure {
+        return Err(ApiError::bad_request(
+            "This would let the task contact them about nothing at all. Choose whether they hear \
+             when it works, when it fails, or both — or remove them from the task instead.",
+        ));
+    }
+
+    errand_core::db::link_recipient(
+        state.pool(),
+        &id,
+        &body.recipient_id,
+        body.on_success,
+        body.on_failure,
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    state.emit(Event::TaskUpdated {
+        task_id: id.clone(),
+    });
+    Ok(Json(json!({
+        "task_id": id,
+        "recipient_id": body.recipient_id,
+        "on_success": body.on_success,
+        "on_failure": body.on_failure,
+        "note": format!(
+            "This task may now write to {} at {}, and to nobody else you have not added. It is \
+             never told the address itself.",
+            person.label, person.address_masked
+        )
+    })))
+}
+
+async fn revoke_recipient(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path((id, recipient_id)): Path<(String, String)>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Manage is enough to take a permission away. Removing one can only ever
+    // mean fewer messages reach fewer people.
+    require(&caller, Scope::Manage)?;
+    let gone = errand_core::db::unlink_recipient(state.pool(), &id, &recipient_id)
+        .await
+        .map_err(ApiError::from)?;
+    if !gone {
+        return Err(ApiError::not_found(
+            "This task was not able to write to that contact anyway, so nothing changed.",
+        ));
+    }
+    state.emit(Event::TaskUpdated {
+        task_id: id.clone(),
+    });
+    Ok(Json(json!({
+        "task_id": id,
+        "recipient_id": recipient_id,
+        "note": "This task can no longer write to them. The contact itself is untouched, and \
+                 every other task that has them keeps them."
+    })))
+}
+
+/// Could this channel actually deliver to this address?
+///
+/// Checked when it is typed rather than when a message is due. A typo found now
+/// costs ten seconds; the same typo found at send time costs the message, and
+/// the person only finds out because the reply never came.
+fn check_address(channel: &str, address: &str) -> Result<(), String> {
+    let a = address.trim();
+    if a.is_empty() {
+        return Err(
+            "This contact has no address, so nothing could ever be sent to them. Add the phone \
+             number, email address or chat id for the way you picked."
+                .into(),
+        );
+    }
+    match channel {
+        "apple_mail" => looks_like_email(a).then_some(()).ok_or_else(|| {
+            format!(
+                "'{a}' does not look like an email address, so Mail would have nowhere to send \
+                 it. Type it the way it appears in your address book, like \
+                 someone@example.com."
+            )
+        }),
+        "whatsapp" | "imessage" => (looks_like_email(a) || looks_like_phone(a))
+            .then_some(())
+            .ok_or_else(|| {
+                format!(
+                    "'{a}' is neither a phone number nor an email address, and {} reaches people \
+                     by one or the other. Type the number with its country code, like \
+                     +1 555 0100.",
+                    if channel == "whatsapp" {
+                        "WhatsApp"
+                    } else {
+                        "Messages"
+                    }
+                )
+            }),
+        "telegram" => looks_like_telegram_chat(a).then_some(()).ok_or_else(|| {
+            format!(
+                "'{a}' is not a Telegram chat id. A chat id is a number, sometimes starting with \
+                 a minus sign for a group, such as 123456789; a channel can also be written as \
+                 @itsname. A phone number will not work, because Telegram does not let a bot \
+                 start a conversation from one — message the bot once and it will tell you the id."
+            )
+        }),
+        other => Err(format!(
+            "'{other}' is not a way Errand can send messages. Choose telegram, whatsapp, \
+             apple_mail or imessage."
+        )),
+    }
+}
+
+fn looks_like_email(a: &str) -> bool {
+    match a.split_once('@') {
+        Some((local, domain)) => {
+            !local.is_empty()
+                && domain.contains('.')
+                && !domain.starts_with('.')
+                && !domain.ends_with('.')
+                && !a.chars().any(char::is_whitespace)
+        }
+        None => false,
+    }
+}
+
+/// A phone number written the way people write them, punctuation and all.
+fn looks_like_phone(a: &str) -> bool {
+    let digits = a.chars().filter(char::is_ascii_digit).count();
+    (7..=15).contains(&digits)
+        && a.chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '+' | ' ' | '-' | '(' | ')' | '.'))
+}
+
+/// A Telegram chat id: a number, negative for a group, or a channel's @name.
+fn looks_like_telegram_chat(a: &str) -> bool {
+    if let Some(handle) = a.strip_prefix('@') {
+        return handle.len() >= 5
+            && handle
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_');
+    }
+    let digits = a.strip_prefix('-').unwrap_or(a);
+    !digits.is_empty() && digits.chars().all(|c| c.is_ascii_digit())
 }
 
 // ------------------------------------------------------------------ tokens --
@@ -1622,4 +2562,662 @@ async fn save_anthropic_key(
         .map_err(ApiError::from)?;
 
     Ok(Json(json!({ "saved": true, "provider_id": provider.id })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::testkit::{self, a_ready_manual_task, a_task};
+    use serde_json::json;
+
+    /// A cron that comes round every minute, so a test never has to wait for a
+    /// particular hour and never depends on what time it is run.
+    const EVERY_MINUTE: &str = "0 * * * * *";
+
+    // ------------------------------------------------------- sites a task may open --
+
+    #[tokio::test]
+    async fn a_site_list_is_stored_the_way_the_browser_will_compare_it() {
+        let api = testkit::start().await;
+        let id = a_task(
+            &api,
+            json!({
+                "name": "Courts",
+                "description": "Book a court.",
+                "allowed_domains": ["HTTPS://Example.COM/basket/", "  tennis-club.example  "]
+            }),
+        )
+        .await;
+
+        let task = api.get(&format!("/v1/tasks/{id}")).await;
+        assert_eq!(
+            task["allowed_domains"],
+            json!(["example.com", "tennis-club.example"]),
+            "a pasted URL must be reduced to the bare host the check compares"
+        );
+
+        let (code, body) = api
+            .patch(
+                &format!("/v1/tasks/{id}"),
+                json!({ "allowed_domains": ["Example.Com.", "https://other.example:8443/x"] }),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(
+            api.get(&format!("/v1/tasks/{id}")).await["allowed_domains"],
+            json!(["example.com", "other.example"]),
+            "an edited list must be tidied the same way a new one is"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_wildcard_site_is_refused_with_something_to_type_instead() {
+        let api = testkit::start().await;
+        let id = a_task(
+            &api,
+            json!({
+                "name": "Courts",
+                "description": "Book a court.",
+                "allowed_domains": ["example.com"]
+            }),
+        )
+        .await;
+
+        let (code, body) = api
+            .patch(
+                &format!("/v1/tasks/{id}"),
+                json!({ "allowed_domains": ["*.example.org"] }),
+            )
+            .await;
+        assert_eq!(code, 400, "{body}");
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("*.example.org"),
+            "the refusal must name the entry that was wrong: {detail}"
+        );
+        assert!(
+            detail.contains("Type example.org instead"),
+            "the refusal must say what to type instead: {detail}"
+        );
+        assert_eq!(
+            api.get(&format!("/v1/tasks/{id}")).await["allowed_domains"],
+            json!(["example.com"]),
+            "one bad entry must leave the saved list exactly as it was"
+        );
+    }
+
+    #[tokio::test]
+    async fn allowing_only_the_www_form_is_saved_but_said_out_loud() {
+        let api = testkit::start().await;
+        let id = a_task(&api, json!({ "name": "N", "description": "d" })).await;
+
+        let (code, body) = api
+            .patch(
+                &format!("/v1/tasks/{id}"),
+                json!({ "allowed_domains": ["www.example.com"] }),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body["task"]["allowed_domains"], json!(["www.example.com"]));
+        let warnings = body["warnings"].as_array().expect("a warnings list");
+        assert!(
+            warnings.iter().any(|w| w
+                .as_str()
+                .unwrap_or_default()
+                .contains("Adding example.com")),
+            "matching runs one way only, so this has to be said: {warnings:?}"
+        );
+    }
+
+    // -------------------------------------------- the gate in front of a schedule --
+
+    #[tokio::test]
+    async fn an_untaught_task_cannot_be_moved_onto_a_schedule() {
+        // The hole this closes: activating checks for a playbook only when the
+        // task is already scheduled, so a manual task activates happily and
+        // could then be edited onto a cron with nothing in the way.
+        let api = testkit::start().await;
+        let id = a_task(
+            &api,
+            json!({ "name": "Untaught", "description": "never taught" }),
+        )
+        .await;
+        let (code, body) = api
+            .post(&format!("/v1/tasks/{id}/activate"), json!({}))
+            .await;
+        assert_eq!(
+            code, 200,
+            "a manual task activates without a playbook: {body}"
+        );
+
+        let (code, body) = api
+            .patch(
+                &format!("/v1/tasks/{id}"),
+                json!({ "schedule": { "kind": "cron", "expr": EVERY_MINUTE, "tz": "UTC" } }),
+            )
+            .await;
+        assert_eq!(code, 409, "{body}");
+        assert_eq!(body["code"], "task_not_taught");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Teach it once"),
+            "the refusal must say what to do about it: {body}"
+        );
+
+        let task = api.get(&format!("/v1/tasks/{id}")).await;
+        assert_eq!(
+            task["schedule"]["kind"], "manual",
+            "a refused change must leave the schedule alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_taught_task_can_be_put_on_a_schedule() {
+        let api = testkit::start().await;
+        let id = a_ready_manual_task(&api).await;
+        let (code, body) = api
+            .patch(
+                &format!("/v1/tasks/{id}"),
+                json!({ "schedule": { "kind": "cron", "expr": EVERY_MINUTE, "tz": "UTC" } }),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body["task"]["schedule"]["kind"], "cron");
+    }
+
+    // ------------------------------------- doing something twice by moving the clock --
+
+    #[tokio::test]
+    async fn moving_a_schedule_over_work_already_done_stops_and_says_why() {
+        let api = testkit::start().await;
+        let id = a_ready_manual_task(&api).await;
+
+        // A run that actually booked something, recorded the way the agent's
+        // own tools record it.
+        let run = errand_core::db::try_create_run(
+            &api.pool,
+            &id,
+            &format!("manual/{}", errand_core::new_id()),
+            "manual",
+            "normal",
+            None,
+        )
+        .await
+        .expect("a run");
+        let armed = errand_core::db::arm_side_effect(
+            &api.pool,
+            &run.id,
+            &id,
+            &run.occurrence_id,
+            "booking",
+            "",
+        )
+        .await
+        .expect("arming the guard");
+        let errand_core::db::FenceVerdict::Armed(fence) = armed else {
+            panic!("a fresh slot must arm");
+        };
+        errand_core::db::commit_side_effect(&api.pool, &fence, "court 2 at 19:00")
+            .await
+            .expect("recording that it happened");
+
+        let change = json!({ "schedule": { "kind": "cron", "expr": EVERY_MINUTE, "tz": "UTC" } });
+        let (code, body) = api.patch(&format!("/v1/tasks/{id}"), change.clone()).await;
+        assert_eq!(code, 409, "{body}");
+        assert_eq!(body["code"], "schedule_change_may_repeat");
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("court 2 at 19:00"),
+            "it must say what was already done: {detail}"
+        );
+        assert_eq!(
+            api.get(&format!("/v1/tasks/{id}")).await["schedule"]["kind"],
+            "manual",
+            "a refusal must change nothing"
+        );
+
+        // And once it has been read, the person can say yes anyway.
+        let mut acknowledged = change;
+        acknowledged["acknowledge_repeat"] = json!(true);
+        let (code, body) = api.patch(&format!("/v1/tasks/{id}"), acknowledged).await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body["task"]["schedule"]["kind"], "cron");
+    }
+
+    // ------------------------------------------------- saying a schedule in words --
+
+    #[tokio::test]
+    async fn a_task_says_its_schedule_in_words_and_when_it_will_next_run() {
+        let api = testkit::start().await;
+        let id = a_task(
+            &api,
+            json!({
+                "name": "Morning",
+                "description": "d",
+                "schedule": { "kind": "cron", "expr": "0 0 8 * * *", "tz": "UTC" }
+            }),
+        )
+        .await;
+
+        let task = api.get(&format!("/v1/tasks/{id}")).await;
+        assert!(
+            task["schedule_describes"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Every day at 08:00"),
+            "no screen should have to read a cron expression: {task}"
+        );
+        assert_eq!(
+            task["schedule_preview"].as_array().map(Vec::len),
+            Some(3),
+            "the next few runs must be shown, not computed in the interface"
+        );
+
+        let listed = api.get("/v1/tasks").await;
+        assert!(
+            listed["items"][0]["schedule_describes"].is_string(),
+            "the list says it too, or the list has to work it out itself"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_schedule_the_engine_cannot_use_is_reported_rather_than_crashed_on() {
+        let api = testkit::start().await;
+        let (code, body) = api
+            .post(
+                "/v1/schedule/preview",
+                json!({ "kind": "cron", "expr": "quarter past banana", "tz": "UTC" }),
+            )
+            .await;
+        assert_eq!(
+            code, 200,
+            "a bad schedule is an answer, not a fault: {body}"
+        );
+        assert_eq!(body["valid"], false);
+        assert!(
+            !body["problem"].as_str().unwrap_or_default().is_empty(),
+            "an invalid schedule must come back with the reason: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_preview_says_what_the_engine_will_do_not_what_the_form_meant() {
+        let api = testkit::start().await;
+        let (code, body) = api
+            .post(
+                "/v1/schedule/preview",
+                json!({ "kind": "cron", "expr": "0 30 6 * * WED", "tz": "UTC" }),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body["valid"], true);
+        assert!(body["describes"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("Every Wednesday at 06:30"));
+        assert_eq!(body["preview"].as_array().map(Vec::len), Some(3));
+    }
+
+    #[tokio::test]
+    async fn a_one_off_whose_time_has_gone_is_not_offered_as_a_working_schedule() {
+        // Valid, readable, and it will never happen. That is the shape a form
+        // gets right and a person finds out about a week later.
+        let api = testkit::start().await;
+        let (_, body) = api
+            .post(
+                "/v1/schedule/preview",
+                json!({ "kind": "once", "at": "2020-01-01T08:00:00", "tz": "UTC" }),
+            )
+            .await;
+        assert_eq!(body["valid"], false);
+        assert!(body["problem"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no runs left to come"));
+    }
+
+    // ----------------------------------------------------- what an edit may not do --
+
+    #[tokio::test]
+    async fn an_edit_cannot_blank_the_name_that_creating_one_insisted_on() {
+        let api = testkit::start().await;
+        let id = a_task(&api, json!({ "name": "Courts", "description": "d" })).await;
+        let (code, body) = api
+            .patch(&format!("/v1/tasks/{id}"), json!({ "name": "   " }))
+            .await;
+        assert_eq!(code, 400, "{body}");
+        assert_eq!(api.get(&format!("/v1/tasks/{id}")).await["name"], "Courts");
+    }
+
+    #[tokio::test]
+    async fn an_archived_task_refuses_an_edit_instead_of_half_applying_it() {
+        let api = testkit::start().await;
+        let id = a_task(&api, json!({ "name": "Old", "description": "d" })).await;
+        // Archiving has no route of its own yet; this is the call the rest of
+        // the daemon uses to move a task's status.
+        errand_core::db::set_task_status(&api.pool, &id, "archived")
+            .await
+            .expect("archiving");
+
+        let (code, body) = api
+            .patch(&format!("/v1/tasks/{id}"), json!({ "name": "New" }))
+            .await;
+        assert_eq!(code, 409, "{body}");
+        assert_eq!(body["code"], "task_archived");
+        assert_eq!(api.get(&format!("/v1/tasks/{id}")).await["name"], "Old");
+    }
+
+    #[tokio::test]
+    async fn a_retried_save_is_the_same_save_rather_than_a_second_one() {
+        let api = testkit::start().await;
+        let id = a_ready_manual_task(&api).await;
+        let change = json!({ "schedule": { "kind": "cron", "expr": EVERY_MINUTE, "tz": "UTC" } });
+
+        let (first_code, first) = api
+            .patch_with_key(&format!("/v1/tasks/{id}"), change.clone(), "save-1")
+            .await;
+        assert_eq!(first_code, 200, "{first}");
+        let (again_code, again) = api
+            .patch_with_key(&format!("/v1/tasks/{id}"), change, "save-1")
+            .await;
+        assert_eq!(again_code, 200, "{again}");
+        assert_eq!(
+            first, again,
+            "a retry after a dropped connection must give back the same answer"
+        );
+
+        // The same key for something else is a client bug, and replaying the
+        // old answer would hide it.
+        let (code, body) = api
+            .patch_with_key(
+                &format!("/v1/tasks/{id}"),
+                json!({ "name": "Other" }),
+                "save-1",
+            )
+            .await;
+        assert_eq!(code, 409, "{body}");
+        assert_eq!(body["code"], "idempotency_key_reuse");
+    }
+
+    // -------------------------------------------------- people a task may message --
+
+    #[tokio::test]
+    async fn an_address_that_could_never_be_delivered_to_is_refused_when_it_is_typed() {
+        let api = testkit::start().await;
+        for (channel, address) in [
+            ("apple_mail", "not-an-email"),
+            ("whatsapp", "ring me at the club"),
+            ("telegram", "+15550100"),
+        ] {
+            let (code, body) = api
+                .post(
+                    "/v1/recipients",
+                    json!({ "label": "Someone", "channel": channel, "address": address }),
+                )
+                .await;
+            assert_eq!(code, 400, "{channel} accepted '{address}': {body}");
+            assert!(
+                body["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains(address),
+                "the refusal must quote what was typed: {body}"
+            );
+        }
+
+        let (code, body) = api
+            .post(
+                "/v1/recipients",
+                json!({ "label": "Mum", "channel": "apple_mail", "address": "mum@example.com" }),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(
+            body["address_masked"], "m•••@example.com",
+            "the agent is shown enough to recognise, never enough to write to"
+        );
+    }
+
+    #[tokio::test]
+    async fn letting_a_task_message_somebody_needs_the_permission_that_approves_things() {
+        let api = testkit::start().await;
+        let id = a_ready_manual_task(&api).await;
+        let (_, person) = api
+            .post(
+                "/v1/recipients",
+                json!({ "label": "Mum", "channel": "apple_mail", "address": "mum@example.com" }),
+            )
+            .await;
+        let person_id = person["id"].as_str().expect("a contact id").to_string();
+
+        // A token that can change settings but not approve anything.
+        let settings_only = testkit::mint(&api.pool, "settings-only", "read,manage").await;
+        let (code, body) = api
+            .as_token(
+                &settings_only,
+                reqwest::Method::POST,
+                &format!("/v1/tasks/{id}/recipients"),
+                Some(json!({ "recipient_id": person_id })),
+                None,
+            )
+            .await;
+        assert_eq!(
+            code, 403,
+            "deciding that a real message reaches a real person is an approval: {body}"
+        );
+
+        let (code, body) = api
+            .post(
+                &format!("/v1/tasks/{id}/recipients"),
+                json!({ "recipient_id": person_id, "on_success": true, "on_failure": false }),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+
+        // Taking it away again is always safe, so managing is enough.
+        let (code, body) = api
+            .as_token(
+                &settings_only,
+                reqwest::Method::DELETE,
+                &format!("/v1/tasks/{id}/recipients/{person_id}"),
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(
+            code, 200,
+            "removing a permission must never be blocked: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_grant_belongs_to_one_task_and_no_other_task_inherits_it() {
+        let api = testkit::start().await;
+        let allowed = a_ready_manual_task(&api).await;
+        let other = a_task(&api, json!({ "name": "Other", "description": "d" })).await;
+        let (_, person) = api
+            .post(
+                "/v1/recipients",
+                json!({ "label": "Mum", "channel": "apple_mail", "address": "mum@example.com" }),
+            )
+            .await;
+        let person_id = person["id"].as_str().expect("a contact id").to_string();
+
+        api.post(
+            &format!("/v1/tasks/{allowed}/recipients"),
+            json!({ "recipient_id": person_id }),
+        )
+        .await;
+
+        let theirs = api.get(&format!("/v1/tasks/{allowed}/recipients")).await;
+        assert_eq!(theirs["items"][0]["id"], json!(person_id));
+        let others = api.get(&format!("/v1/tasks/{other}/recipients")).await;
+        assert!(
+            others["items"].as_array().expect("a list").is_empty(),
+            "a permission given to one task must not appear on another: {others}"
+        );
+
+        // Forgetting the contact takes every task's permission with them.
+        assert_eq!(
+            api.delete(&format!("/v1/recipients/{person_id}")).await.0,
+            200
+        );
+        let theirs = api.get(&format!("/v1/tasks/{allowed}/recipients")).await;
+        assert!(theirs["items"].as_array().expect("a list").is_empty());
+    }
+
+    // ------------------------------------------------------------------ settings --
+
+    #[tokio::test]
+    async fn a_setting_errand_does_not_keep_is_refused_by_name() {
+        let api = testkit::start().await;
+        let (code, body) = api
+            .post(
+                "/v1/channels/telegram/config",
+                json!({ "settings": { "messaging.quiett": { "from": 22, "to": 7 } } }),
+            )
+            .await;
+        assert_eq!(code, 400, "{body}");
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("messaging.quiett"), "{detail}");
+        assert!(
+            detail.contains("messaging.quiet"),
+            "the refusal must name the ones that do exist: {detail}"
+        );
+    }
+
+    #[tokio::test]
+    async fn quiet_hours_are_stored_in_the_shape_the_outbox_actually_reads() {
+        let api = testkit::start().await;
+        let (code, body) = api
+            .post(
+                "/v1/channels/telegram/config",
+                json!({
+                    "settings": {
+                        "messaging.quiet": { "from": 22, "to": 7, "failures_break_through": false }
+                    }
+                }),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+
+        // Read back through the same key the outbox uses. Anything else is a
+        // setting the person changed and nothing acts on.
+        let stored = errand_core::db::get_setting(&api.pool, "messaging.quiet")
+            .await
+            .expect("reading it back")
+            .expect("it was saved");
+        assert_eq!(stored["from"], 22);
+        assert_eq!(stored["to"], 7);
+        assert_eq!(
+            stored[super::QUIET_BREAKS_THROUGH],
+            false,
+            "the outbox looks for this exact word; anything else is ignored"
+        );
+
+        // And the settings screen, which asks by the other name, sees the same.
+        let shown = api.get("/v1/settings").await;
+        assert_eq!(
+            shown["messaging.quiet"][super::QUIET_BREAKS_THROUGH_ALT],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn an_hour_that_is_not_an_hour_is_refused() {
+        let api = testkit::start().await;
+        for bad in [
+            json!({ "from": 99, "to": 6 }),
+            json!({ "from": "ten", "to": 6 }),
+        ] {
+            let (code, body) = api
+                .post(
+                    "/v1/channels/telegram/config",
+                    json!({ "settings": { "messaging.quiet": bad } }),
+                )
+                .await;
+            assert_eq!(code, 400, "{body}");
+            assert!(
+                body["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("0 to 23"),
+                "say what an hour looks like: {body}"
+            );
+        }
+        assert!(
+            errand_core::db::get_setting(&api.pool, "messaging.quiet")
+                .await
+                .expect("reading it back")
+                .is_none(),
+            "a refused setting must not be half-written"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_gateway_address_that_is_not_an_address_is_refused() {
+        let api = testkit::start().await;
+        let (code, body) = api
+            .post(
+                "/v1/channels/whatsapp/config",
+                json!({ "settings": { "messaging.whatsapp.base_url": "my gateway" } }),
+            )
+            .await;
+        assert_eq!(code, 400, "{body}");
+
+        // A real one is kept without its trailing slash, because the sender
+        // builds addresses as {base}/sessions.
+        let (code, body) = api
+            .post(
+                "/v1/channels/whatsapp/config",
+                json!({ "settings": { "messaging.whatsapp.base_url": "http://localhost:3000/" } }),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(
+            api.get("/v1/settings").await["messaging.whatsapp.base_url"],
+            "http://localhost:3000"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_can_be_given_its_notify_and_limits_when_it_is_created() {
+        let api = testkit::start().await;
+        let id = a_task(
+            &api,
+            json!({
+                "name": "Quiet one",
+                "description": "d",
+                "notify": { "on_success": false, "on_failure": true },
+                "limits": { "max_steps": 10, "max_minutes": 5, "max_usd": 0.10,
+                            "max_heal_cycles": 1, "max_messages": 1 }
+            }),
+        )
+        .await;
+        let task = api.get(&format!("/v1/tasks/{id}")).await;
+        assert_eq!(task["notify"]["on_success"], false);
+        assert_eq!(task["limits"]["max_steps"], 10);
+    }
+
+    #[tokio::test]
+    async fn a_task_with_nothing_filled_in_still_says_what_its_schedule_means() {
+        // The dullest possible check, and the one that catches a page that
+        // cannot render a task somebody has only just started.
+        let api = testkit::start().await;
+        let id = a_task(&api, json!({ "name": "Bare", "description": "d" })).await;
+        let task = api.get(&format!("/v1/tasks/{id}")).await;
+        assert_eq!(task["id"], json!(id));
+        assert!(
+            task["schedule_describes"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("will not run on its own"),
+            "a brand new task must say plainly that nothing will happen yet: {task}"
+        );
+        assert!(task["schedule_preview"]
+            .as_array()
+            .expect("a preview list")
+            .is_empty());
+    }
 }

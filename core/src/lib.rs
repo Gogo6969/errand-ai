@@ -5,6 +5,7 @@
 //! vocabulary so the two binaries cannot drift apart.
 
 pub mod db;
+pub mod domains;
 pub mod keychain;
 pub mod launchd;
 pub mod limits;

@@ -186,12 +186,126 @@ export const hints = {
       "Errand stores only a scrambled copy, so it cannot show you this again. Give each program " +
       "its own, with only the permissions it needs.",
   },
+  "settings.save_quiet": {
+    short: "Save when messages should wait.",
+  },
+  "settings.save_telegram": {
+    short: "Save the bot details. They go to your keychain and are never shown again.",
+    long:
+      "Until this is set, Errand has nowhere to send results and simply says nothing, which looks " +
+      "like a task that never ran.",
+  },
+  "settings.save_whatsapp": {
+    short: "Where the WhatsApp gateway is running.",
+    long:
+      "WhatsApp has no official way for a personal account to send messages, so this points at a " +
+      "gateway you run yourself. Results always go to Telegram as well, so this is never the only " +
+      "way you find out.",
+  },
+  "settings.add_person": {
+    short: "Save someone a task may message when it finishes.",
+    long:
+      "Saving a person here does not let anything message them yet. You pick which tasks may, one " +
+      "task at a time, which is what keeps a job from telling someone about work they never asked " +
+      "to hear about.",
+  },
+  "settings.forget_person": {
+    short: "Forget this person. Any task set to tell them stops doing so.",
+  },
   "settings.daemon": {
     short: "The part that does the work, running in the background.",
     long:
       "It runs whether or not this window is open, which is what lets a task fire at eight in the " +
       "morning while you are asleep.",
   },
+  // ------------------------------------------------------------- schedule --
+  "sched.every": {
+    short: "How often this should run.",
+    long:
+      "Errand writes the actual schedule for you and then shows you, underneath, what it will " +
+      "really do and the next few times it will happen. If those two ever disagree, believe the " +
+      "one underneath: it comes from the part that does the running.",
+  },
+  "sched.expr": {
+    short: "A schedule expression, for something the choices above cannot say.",
+    long:
+      "Six fields: seconds, minutes, hours, day of month, month, day of week. An expression " +
+      "copied from elsewhere usually has five and will mean something quite different here, so " +
+      "check the sentence underneath before you save.",
+  },
+  "sched.tz": {
+    short: "The clock this schedule follows.",
+    long:
+      "Runs happen at this local time whatever the date, so eight in the morning stays eight in " +
+      "the morning across the clock change rather than drifting by an hour.",
+  },
+  "sched.more": {
+    short: "What happens when a run is missed, and whether to start exactly on time.",
+  },
+  "sched.catch_up": {
+    short: "What to do about a run that was missed because your Mac was off.",
+    long:
+      "Running late is right for most things. Skipping is right for anything time-sensitive: " +
+      "nobody wants a court booked for a slot that has already passed. Making up every missed " +
+      "run only suits tasks where each run does distinct work.",
+  },
+  "sched.jitter": {
+    short: "Spread the start time slightly, instead of firing on the exact second.",
+    long:
+      "Useful when a booking opens at a fixed moment and every bot in the country arrives at " +
+      "once. It also makes Errand look less like a machine.",
+  },
+
+  // ------------------------------------------------------------ task sites --
+  "task.add_site": {
+    short: "Allow this task to open one more website.",
+    long:
+      "Enter the plain site, such as example.com. Subdomains are included automatically, and " +
+      "there are no wildcards: a * looks reasonable, saves happily, and then matches nothing.",
+  },
+  "task.remove_site": {
+    short: "Stop this task from opening that site.",
+  },
+  "task.edit_schedule": {
+    short: "Change when this runs on its own.",
+    long:
+      "Changing a schedule never replays the past. Errand will not go back and run the slots your " +
+      "new schedule would have had earlier today; it starts from now.",
+  },
+  "task.save_schedule": {
+    short: "Save it. The first run under the new schedule is the next one, not a missed one.",
+  },
+  "task.edit_sites": {
+    short: "Change which websites this task may open.",
+  },
+  "task.save_sites": {
+    short: "Save the list. It takes effect on the next run.",
+  },
+  "task.cancel_edit": {
+    short: "Leave it as it was. Nothing you typed is saved.",
+  },
+  "task.link_person": {
+    short: "Have this task message someone when it finishes.",
+    long:
+      "The agent can only ever message people on this list, and it cannot type an address. That " +
+      "is what stops a web page from talking it into messaging someone else.",
+  },
+  "task.unlink_person": {
+    short: "Stop telling this person about this task.",
+  },
+  "task.notify_when": {
+    short: "Whether this person hears about runs that worked, that failed, or both.",
+    long:
+      "Messages to other people wait until your quiet hours are over. Your own failure alerts do " +
+      "not, because hearing at nine that the eight o'clock booking failed is hearing too late.",
+  },
+  "task.first_site": {
+    short: "The main site decides which saved logins this task uses.",
+    long:
+      "Errand keeps a separate browser profile per site, so a task stays signed in between runs. " +
+      "The first site in the list picks the profile; changing it means signing in again.",
+  },
+
   // ------------------------------------------------------------------- ai --
   "ai.role": {
     short: "One of the four jobs Errand needs a model for.",

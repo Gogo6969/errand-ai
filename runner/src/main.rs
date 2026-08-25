@@ -458,6 +458,11 @@ async fn doctor() -> Result<u32> {
         }
     }
 
+    // Browsing: the sidecar script, the Node that runs it, and the browser it
+    // would drive. Three separate things, each of which fails on its own and
+    // each of which used to surface as the same shrug at 08:00.
+    problems += browsing_checks().await;
+
     // API reachable
     let port = errand_core::DEFAULT_API_PORT;
     let reachable = tokio::net::TcpStream::connect(("127.0.0.1", port))
@@ -475,6 +480,119 @@ async fn doctor() -> Result<u32> {
         println!("{problems} problem(s) above need attention.");
     }
     Ok(problems)
+}
+
+/// The three things that all have to be true before a task can open a web
+/// page, checked separately because they fail separately. Returns the number
+/// that are not true.
+async fn browsing_checks() -> u32 {
+    let mut problems = 0;
+
+    let script = browser::sidecar_script();
+    match &script {
+        Ok(p) => println!("  {}  browser helper: {}", tick(true), p.display()),
+        Err(e) => {
+            problems += 1;
+            println!("  x  browser helper: not found");
+            print_fix(&e.to_string());
+        }
+    }
+
+    let node = browser::which_node();
+    match &node {
+        Some(p) => {
+            let version = std::process::Command::new(p)
+                .arg("--version")
+                .output()
+                .ok()
+                .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+                .unwrap_or_default();
+            // Playwright will not run on an old one, and the failure it gives
+            // is a syntax error from deep inside a library. Decided before the
+            // line is printed, so the line does not say ok about a node that
+            // is about to be told off underneath it.
+            let too_old = node_major(&version).is_some_and(|m| m < 20);
+            println!("  {}  node: {} {}", tick(!too_old), p.display(), version);
+            if too_old {
+                problems += 1;
+                print_fix(&format!(
+                    "This is {version}, and the browser needs Node 20 or newer. Upgrade it, or \
+                     set ERRAND_NODE to the full path of a newer copy. Until then web pages will \
+                     not open; everything else runs as normal."
+                ));
+            }
+        }
+        None => {
+            problems += 1;
+            println!("  x  node: not found");
+            print_fix(browser::NODE_MISSING_HELP);
+        }
+    }
+
+    // Which browser would actually be driven. Worth asking only when there is
+    // something to ask with, and the answer comes from the sidecar because it
+    // is the layer that knows where it looks.
+    match (&script, &node) {
+        (Ok(script), Some(node)) => match browser::probe_browser(node, script).await {
+            Ok(p) if p.found => println!(
+                "  {}  browser to drive: {}",
+                tick(true),
+                p.name.as_deref().unwrap_or("a Chrome-family browser")
+            ),
+            Ok(p) => {
+                problems += 1;
+                println!("  x  browser to drive: none installed");
+                print_fix(p.message.as_deref().unwrap_or(
+                    "The browser helper found no Chrome-family browser on this Mac. Install \
+                     Google Chrome from https://www.google.com/chrome and run this again.",
+                ));
+            }
+            Err(e) => {
+                problems += 1;
+                println!("  x  browser to drive: could not be asked");
+                print_fix(&format!(
+                    "Errand started the browser helper to ask which browser it would use, and it \
+                     did not answer: {e}. Nothing was opened. This usually means the helper's own \
+                     installation is incomplete, so reinstalling Errand is the fix."
+                ));
+            }
+        },
+        _ => println!("  -  browser to drive: not checked, because of the problem above"),
+    }
+
+    problems
+}
+
+/// The major version out of something like `v22.11.0`.
+fn node_major(version: &str) -> Option<u32> {
+    version
+        .trim()
+        .trim_start_matches('v')
+        .split('.')
+        .next()?
+        .parse()
+        .ok()
+}
+
+/// Print the fix under a failing line, wrapped to the width the rest of doctor
+/// is hand-wrapped to. Every failure gets one of these: a status on its own
+/// tells a worried person nothing they can act on.
+fn print_fix(text: &str) {
+    const WIDTH: usize = 72;
+    let mut line = String::new();
+    for word in text.split_whitespace() {
+        if !line.is_empty() && line.chars().count() + 1 + word.chars().count() > WIDTH {
+            println!("      {line}");
+            line.clear();
+        }
+        if !line.is_empty() {
+            line.push(' ');
+        }
+        line.push_str(word);
+    }
+    if !line.is_empty() {
+        println!("      {line}");
+    }
 }
 
 fn tick(ok: bool) -> &'static str {

@@ -11,7 +11,9 @@
 // path, because the single most likely way a password escapes is an exception
 // object that happened to carry the arguments that caused it.
 
-import { chromium } from 'playwright-core';
+import { existsSync } from 'node:fs';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { SNAPSHOT_FN, SECURE_BOXES_FN } from './snapshot.js';
 
 let context = null;
@@ -30,11 +32,74 @@ function emit(event, params) {
   send({ event, params });
 }
 
+/** Something we wrote ourselves, for a person to read. */
+class UserFacingError extends Error {
+  constructor(message) {
+    super(message);
+    this.name = 'UserFacingError';
+    this.userFacing = true;
+  }
+}
+
 /** Never let a thrown value carry a secret out of this process. */
 function safeError(e) {
   const msg = (e && e.message) || String(e);
+  // Our own sentences are already the length they need to be, and have no call
+  // log to strip. The clipping below is for Playwright's messages.
+  if (e && e.userFacing) return msg;
   // Playwright puts the full call, including arguments, in its log section.
   return msg.split('\nCall log:')[0].slice(0, 400);
+}
+
+// A sidecar that dies on its first breath is indistinguishable, from the Rust
+// side, from a slow one: the caller waits out its whole timeout and then says
+// the browser took too long, with the real reason nowhere. So every way this
+// process can end early says so first.
+//
+// Both pipes, deliberately. The NDJSON line is the shape a caller can act on,
+// but the reader in runner/src/browser.rs logs an event's name and drops its
+// params, so on stdout alone the sentence would vanish. Sidecar stderr is
+// logged whole, scrubbed, which is what actually puts the reason in front of
+// whoever is reading the log.
+function reportFatal(kind, message) {
+  try {
+    send({ event: 'fatal', params: { kind, message } });
+  } catch {
+    // stdout has gone; stderr may still be there.
+  }
+  try {
+    process.stderr.write(`fatal (${kind}): ${message}\n`);
+  } catch {
+    // Both pipes are gone. Nothing left to report with.
+  }
+}
+
+process.on('uncaughtException', (e) => {
+  reportFatal('uncaught_exception', safeError(e));
+  process.exit(1);
+});
+
+process.on('unhandledRejection', (e) => {
+  reportFatal('unhandled_rejection', safeError(e));
+  process.exit(1);
+});
+
+// playwright-core is installed with npm rather than vendored, so it is exactly
+// the piece a mispackaged build leaves out. A plain top-level import would fail
+// during module resolution, before any line of this file ran, and the process
+// would disappear without a word. Loading it by hand keeps the reason sayable.
+let chromium;
+try {
+  ({ chromium } = await import('playwright-core'));
+} catch (e) {
+  reportFatal(
+    'startup',
+    'Errand could not start its browser helper, so no web page can be opened. The helper is ' +
+      'missing part of its installation. Reinstalling Errand should put it back. Nothing was ' +
+      'opened and nothing about your tasks was changed. The underlying error was: ' +
+      String((e && e.message) || e).split('\n')[0]
+  );
+  process.exit(1);
 }
 
 function apexOf(hostname) {
@@ -47,10 +112,24 @@ function apexOf(hostname) {
   return twoLevelTlds.includes(lastTwo) ? parts.slice(-3).join('.') : lastTwo;
 }
 
+/**
+ * Entries arrive from a database row a person typed into, so " EXAMPLE.COM "
+ * and "example.com" are the same site. Rust normalises the same way before it
+ * compares; when only one of the two layers did, an allowed site was waved
+ * through by Rust and then refused here, which looks to the user like the site
+ * being broken.
+ */
+function normaliseDomains(list) {
+  return (list || []).map((d) => String(d).trim().toLowerCase()).filter(Boolean);
+}
+
 function domainAllowed(url) {
-  if (!allowedDomains.length) return true;
+  // An empty list permits nothing, which is what the Rust layer does too. A
+  // task that has not said where it may go has not been taught yet, and
+  // reading that as "anywhere" is the wrong direction to fail.
+  if (!allowedDomains.length) return false;
   try {
-    const h = new URL(url).hostname;
+    const h = new URL(url).hostname.toLowerCase();
     const apex = apexOf(h);
     return allowedDomains.some((d) => apex === d || h === d || h.endsWith('.' + d));
   } catch {
@@ -82,18 +161,99 @@ async function resolveRef(ref) {
   return el;
 }
 
+// ----------------------------------------------------------------- browser --
+//
+// playwright-core deliberately ships no browser of its own. Left to itself it
+// looks for one under ~/Library/Caches/ms-playwright, and on a Mac that has
+// never run Playwright it fails with a path into a directory that does not
+// exist and an instruction to run npx. Nobody who installed a scheduling app
+// is going to do that, so instead we drive a Chrome-family browser the person
+// already has, always in a profile of Errand's own.
+//
+// Where Playwright knows a browser by name we hand it the channel rather than a
+// path, because the channel carries that flavour's launch quirks. Its channel
+// lookup only ever consults /Applications, so a copy kept in a home folder has
+// to be named by path instead.
+
+const CHROME_FAMILY = [
+  {
+    name: 'Google Chrome',
+    rel: 'Google Chrome.app/Contents/MacOS/Google Chrome',
+    channel: 'chrome',
+  },
+  {
+    name: 'Microsoft Edge',
+    rel: 'Microsoft Edge.app/Contents/MacOS/Microsoft Edge',
+    channel: 'msedge',
+  },
+  { name: 'Chromium', rel: 'Chromium.app/Contents/MacOS/Chromium', channel: null },
+  { name: 'Brave', rel: 'Brave Browser.app/Contents/MacOS/Brave Browser', channel: null },
+];
+
+const NO_BROWSER_MESSAGE =
+  'Errand needs a Chrome-family browser to open web pages, and this Mac does not have one. It ' +
+  'looked for Google Chrome, Microsoft Edge, Brave and Chromium in /Applications and ' +
+  '~/Applications. Install Google Chrome from https://www.google.com/chrome and run this task ' +
+  'again. Errand drives it in a separate profile of its own, so your windows, tabs, history and ' +
+  'saved logins are never touched. If your browser is somewhere unusual, set ERRAND_BROWSER to ' +
+  'the executable inside it, for example /Applications/Google Chrome.app/Contents/MacOS/Google ' +
+  'Chrome.';
+
+/**
+ * The first Chrome-family browser on this machine, or null.
+ * Returns the name to report and the launch options to merge in.
+ */
+function findBrowser() {
+  const override = process.env.ERRAND_BROWSER;
+  if (override && existsSync(override)) {
+    return { name: override, launch: { executablePath: override } };
+  }
+
+  for (const b of CHROME_FAMILY) {
+    const path = join('/Applications', b.rel);
+    if (!existsSync(path)) continue;
+    return b.channel
+      ? { name: b.name, launch: { channel: b.channel } }
+      : { name: b.name, launch: { executablePath: path } };
+  }
+
+  for (const b of CHROME_FAMILY) {
+    const path = join(homedir(), 'Applications', b.rel);
+    if (existsSync(path)) return { name: b.name, launch: { executablePath: path } };
+  }
+
+  // Last resort: a Chromium some other tool asked Playwright to download. Go
+  // through the channel rather than launching the default, because a default
+  // headless launch wants chromium_headless_shell, which is a different
+  // directory from the one just checked and is often not there.
+  try {
+    const path = chromium.executablePath();
+    if (path && existsSync(path)) {
+      return { name: 'Chromium (Playwright)', launch: { channel: 'chromium' } };
+    }
+  } catch {
+    // Nothing registered, which is the ordinary case. Fall through.
+  }
+
+  return null;
+}
+
 // ----------------------------------------------------------------- methods --
 
 const methods = {
   async 'session.open'({ profile_dir, headless = true, allowed_domains = [], strict_network = false }) {
     if (context) await methods['session.close']({ save_state: true });
-    allowedDomains = allowed_domains || [];
+    allowedDomains = normaliseDomains(allowed_domains);
     strictNetwork = !!strict_network;
+
+    const browser = findBrowser();
+    if (!browser) throw new UserFacingError(NO_BROWSER_MESSAGE);
 
     context = await chromium.launchPersistentContext(profile_dir, {
       headless,
       viewport: { width: 1280, height: 900 },
       args: ['--disable-blink-features=AutomationControlled'],
+      ...browser.launch,
     });
     page = context.pages()[0] || (await context.newPage());
 
@@ -123,7 +283,18 @@ const methods = {
       d.cancel().catch(() => {});
     });
 
-    return { ok: true, url: page.url() };
+    // Which browser this was, so that the day a Chrome update changes something
+    // the run log says what was actually driven rather than leaving it a
+    // mystery.
+    return { ok: true, url: page.url(), browser: browser.name };
+  },
+
+  // The same ladder, without launching anything, so a health check can say
+  // whether this Mac can browse at all before a task depends on it.
+  async 'browser.probe'() {
+    const browser = findBrowser();
+    if (!browser) return { found: false, message: NO_BROWSER_MESSAGE };
+    return { found: true, name: browser.name };
   },
 
   async 'session.close'({ save_state = true } = {}) {

@@ -386,6 +386,38 @@ pub struct CredentialMeta {
     pub created_at: String,
 }
 
+/// Somebody a task may contact.
+///
+/// `address_masked` exists so the agent can be told who it is writing to
+/// without being told how to reach them. It has no use for the real address —
+/// the outbox does the sending — and an address sitting in a model's context is
+/// an address that can leave in an answer.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Recipient {
+    pub id: String,
+    pub label: String,
+    pub channel: String,
+    pub address: String,
+    pub address_masked: String,
+    pub created_at: String,
+}
+
+/// A recipient as granted to one task, with what that task may tell them.
+///
+/// The grant is per task rather than global, because "this task may contact
+/// these people" is exactly the boundary somebody would want to reason about
+/// before letting a task run unattended.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRecipient {
+    pub id: String,
+    pub label: String,
+    pub channel: String,
+    pub address: String,
+    pub address_masked: String,
+    pub on_success: bool,
+    pub on_failure: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Health {
     pub status: String,

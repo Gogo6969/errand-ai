@@ -22,6 +22,7 @@ mod lock;
 mod mcp;
 mod models;
 mod outbox;
+mod planner;
 mod redact;
 mod scheduler;
 mod secrets;

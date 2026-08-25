@@ -137,22 +137,16 @@ impl Role {
     /// happen. Until that is separated out, offering a model for it would be a
     /// setting people change and then wonder why nothing differs.
     pub fn is_wired(&self) -> bool {
-        match self {
-            Self::Executor | Self::Fixer | Self::Narrator => true,
-            Self::Planner => false,
-        }
+        true
     }
 
     /// Why a role is not in use, for the interface to say out loud.
+    ///
+    /// Every role is consulted now. Kept, rather than deleted, because the rule
+    /// it enforces is the valuable part: a role that stops being used owes the
+    /// interface a reason, instead of leaving a setting that changes nothing.
     pub fn not_wired_reason(&self) -> Option<&'static str> {
-        match self {
-            Self::Planner => Some(
-                "Errand does not use a separate model for this yet: the plan is written by the \
-                 agent at the end of a run, because it is the only thing that saw the run happen. \
-                 Choosing something here would not change anything, so it is not offered.",
-            ),
-            _ => None,
-        }
+        None
     }
 
     /// Said in the interface, so nobody has to guess what a role is for.
@@ -163,8 +157,9 @@ impl Role {
                  Needs a model that can use tools over many turns, so this must be Claude for now."
             }
             Self::Planner => {
-                "Turns a finished run into the written plan you approve. A single question, so any \
-                 capable model can do it, including one on your own machine."
+                "Writes the plan you approve when a run finishes without leaving one. Normally the \
+                 agent writes its own, because it is the only thing that watched the run; this is \
+                 the fallback, worked out from the record of what happened."
             }
             Self::Fixer => {
                 "Reads a failed run and suggests what to try instead. One question, one answer."
@@ -922,12 +917,11 @@ mod tests {
                 r.as_str()
             );
         }
-        assert!(
-            !Role::Planner.is_wired(),
-            "the plan is still written by the agent"
-        );
-        assert!(Role::Fixer.is_wired());
-        assert!(Role::Narrator.is_wired());
+        // Every role is consulted now, the planner included: it writes the plan
+        // when a run finishes without leaving one of its own.
+        for r in Role::ALL {
+            assert!(r.is_wired(), "{} is offered but never asked", r.as_str());
+        }
     }
 
     #[test]

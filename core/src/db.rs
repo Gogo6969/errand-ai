@@ -1691,6 +1691,18 @@ pub struct PlaybookVersion {
 
 /// Store a new playbook version. Unapproved by default: nothing the agent
 /// wrote about a site takes effect until a person has read it.
+/// Did this run write a plan of its own?
+///
+/// Asked before distilling one from the journal, so the agent's own account of
+/// what it was trying to do always wins over anything inferred afterwards.
+pub async fn playbook_written_by_run(pool: &Pool, run_id: &str) -> Result<bool> {
+    let row = sqlx::query("SELECT 1 FROM playbook_versions WHERE created_by_run_id = ? LIMIT 1")
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.is_some())
+}
+
 pub async fn add_playbook_version(
     pool: &Pool,
     task_id: &str,

@@ -564,6 +564,10 @@ pub async fn run_to_completion(state: AppState, run_id: String) {
         match outcome {
             Ok(crate::mcp::Outcome::Finished { summary }) => {
                 let _ = errand_core::db::finish_run_ok(state.pool(), &run_id, &summary).await;
+                // A run that worked and wrote down nothing leaves a task that
+                // can never be armed, so the plan is written from the journal
+                // instead. Unapproved either way: a person still reads it.
+                crate::planner::distil_if_missing(&state, &run_id).await;
                 state.emit(Event::RunFinished {
                     run_id: run_id.clone(),
                     task_id: task_id.clone(),

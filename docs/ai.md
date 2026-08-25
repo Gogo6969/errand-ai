@@ -11,7 +11,7 @@ whether your task text leaves the machine.
 | Doing the task | Opens the browser, signs in, decides what to click | Claude |
 | Working out why something failed | Reads a failed run, suggests what to try | Any model |
 | Writing the message you get | Turns an outcome into a sentence | Any model |
-| Writing down what it learned | Produces the plan you approve | *not separate yet* |
+| Writing down what it learned | Writes the plan when a run leaves none | Any model |
 
 Only the first needs a model that can drive a browser over many turns and call
 tools. That is the Claude command line tool, which brings its own agent loop.
@@ -23,9 +23,15 @@ The other jobs are one question with one answer, so any competent model can do
 them — including one on your own machine, where your run history never leaves
 the house.
 
-The plan is still written by the agent itself at the end of a run, because it is
-the only thing that watched the run happen. The app says so in place rather than
-offering a setting that would change nothing.
+The plan is normally written by the agent itself at the end of a run, because it
+is the only thing that watched the run happen — it knows *why* it clicked what
+it clicked, which is the difference between an intent and a hint.
+
+The fourth job is the fallback for when it does not. An agent that simply forgets
+used to leave nothing at all, and a task with no plan can never be armed, so the
+only remedy was to teach it again and hope. Now the plan is worked out from the
+record of the run instead, by whichever model you choose. It is labelled as
+inferred, and it arrives unapproved like any other — you still read it first.
 
 ## Services
 

@@ -124,7 +124,7 @@ impl ScheduleSpec {
             Kind::Manual => Ok(None),
 
             Kind::Once { at } => {
-                let instant = parse_local(at, tz)?;
+                let instant = whole_second(parse_local(at, tz)?);
                 Ok(if instant > after { Some(instant) } else { None })
             }
 
@@ -135,7 +135,7 @@ impl ScheduleSpec {
                 let next = cron
                     .find_next_occurrence(&local_after, false)
                     .map_err(|e| anyhow!("could not work out the next run of '{expr}': {e}"))?;
-                Ok(Some(next.with_timezone(&Utc)))
+                Ok(Some(whole_second(next.with_timezone(&Utc))))
             }
         }
     }
@@ -400,7 +400,7 @@ impl ScheduleSpec {
         match &self.kind {
             Kind::Manual => Ok(None),
             Kind::Once { at } => {
-                let i = parse_local(at, self.timezone()?)?;
+                let i = whole_second(parse_local(at, self.timezone()?)?);
                 Ok(if i <= instant { Some(i) } else { None })
             }
             Kind::Cron { expr } => {
@@ -409,12 +409,29 @@ impl ScheduleSpec {
                 let tz = self.timezone()?;
                 let local = instant.with_timezone(&tz);
                 match cron.find_previous_occurrence(&local, true) {
-                    Ok(prev) => Ok(Some(prev.with_timezone(&Utc))),
+                    Ok(prev) => Ok(Some(whole_second(prev.with_timezone(&Utc)))),
                     Err(_) => Ok(None),
                 }
             }
         }
     }
+}
+
+/// Drop anything finer than a second from an occurrence instant.
+///
+/// An occurrence is only ever identified to the second — `occurrence_id`
+/// formats `%Y-%m-%dT%H:%M:%SZ` — but the cron library carries the fractional
+/// seconds of whatever cursor it was handed straight through, so asking for the
+/// next 08:00 while holding a clock reading 03:34:00.752066 hands back
+/// 08:00:00.752066. The ids still match, which is exactly what makes it
+/// dangerous: two values that mean the same occurrence stop comparing equal, so
+/// the scheduler's "is this one of the occurrences I planned" test fails and
+/// every due occurrence is written off as missed while the Mac was asleep.
+/// Truncating here, where the instants are produced, keeps every later
+/// comparison — and the time stored as the next run — honest.
+fn whole_second(d: DateTime<Utc>) -> DateTime<Utc> {
+    use chrono::Timelike;
+    d.with_nanosecond(0).unwrap_or(d)
 }
 
 /// Turn a local wall-clock string into an instant, handling the two days a year
@@ -608,6 +625,41 @@ mod tests {
         let winter = s.next_after(utc("2026-12-01T00:00:00Z")).unwrap().unwrap();
         assert_eq!(summer.format("%H:%M").to_string(), "06:00");
         assert_eq!(winter.format("%H:%M").to_string(), "07:00");
+    }
+
+    #[test]
+    fn a_run_that_is_due_now_is_recognised_as_one_that_was_planned_rather_than_one_that_was_missed()
+    {
+        // The daemon's clock reads 03:36:00.113, not 03:36:00, and the cron
+        // library used to carry those fractions into the occurrences it handed
+        // back. Two values standing for the same 03:36 then compared as
+        // different, so a task holding a run that was due this second was told
+        // it had slept through it.
+        let s = cron("0 * * * * *", "UTC");
+        let (planned, _) = s
+            .occurrences_between(
+                utc("2026-08-24T03:34:00.752066Z"),
+                utc("2026-08-24T03:36:00.113004Z"),
+                20,
+            )
+            .unwrap();
+        let due = s
+            .last_occurrence_at_or_before(utc("2026-08-24T03:36:00.113004Z"))
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(due.to_rfc3339(), "2026-08-24T03:36:00+00:00");
+        assert!(
+            planned.contains(&due),
+            "the occurrence that is due now must be one of {planned:?}"
+        );
+        for occ in planned {
+            assert_eq!(
+                occ.timestamp_subsec_nanos(),
+                0,
+                "{occ} carries a fraction of a second that no occurrence id can express"
+            );
+        }
     }
 
     #[test]

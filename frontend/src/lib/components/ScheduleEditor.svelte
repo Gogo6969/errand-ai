@@ -63,6 +63,20 @@
     return { ...out, every: "advanced" };
   }
 
+  // Captured before the $effect below replaces `value` with what this form can
+  // express. A booking window and a catch-up grace can be set through the API
+  // and this form has no controls for them, so without carrying them across,
+  // opening the editor and pressing Save with no change at all would quietly
+  // delete a task's arm-early window — the one thing that has it logged in and
+  // waiting when a booking opens.
+  const carried = {
+    ...(value?.window ? { window: value.window } : {}),
+    ...(value?.catch_up_grace_min !== undefined
+      ? { catch_up_grace_min: value.catch_up_grace_min }
+      : {}),
+  };
+  const hasCarried = Object.keys(carried).length > 0;
+
   const initial = readBack(value);
   let every = $state<Every>(initial.every);
   let time = $state(initial.time);
@@ -81,7 +95,7 @@
   function build(): any {
     const [h, m] = time.split(":");
     const hh = Number(h) || 0, mm = Number(m) || 0;
-    const common = { tz, catch_up: catchUp, jitter_s: Number(jitter) || 0 };
+    const common = { tz, catch_up: catchUp, jitter_s: Number(jitter) || 0, ...carried };
     switch (every) {
       case "manual": return { kind: "manual", ...common };
       case "once": return { kind: "once", at, ...common };
@@ -187,6 +201,12 @@
     </div>
   {/if}
 
+  {#if hasCarried}
+    <div class="muted carried">
+      This task also has settings made outside this form, which are being kept as they are.
+    </div>
+  {/if}
+
   {#if every !== "manual"}
     <Hint id="sched.more">
       <button type="button" class="linky" onclick={() => (showAdvanced = !showAdvanced)}>
@@ -232,6 +252,7 @@
   }
   .answer.bad { background: var(--bad-bg); color: var(--bad); }
   .next { margin-top: 4px; opacity: 0.85; }
+  .carried { max-width: 520px; }
   .linky {
     background: none; border: none; padding: 0; color: var(--accent);
     cursor: pointer; font-size: 12.5px; text-align: left;

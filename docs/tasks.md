@@ -81,7 +81,10 @@ which ceiling it hit — so you can tell a genuinely slow website from an agent
 that is stuck.
 
 The message limit is the one worth setting deliberately: it is the maximum
-number of messages a single run may send to other people.
+number of messages a single run may send to other people, and the report sent
+when the task finishes counts against it too. A task linked to more people than
+its limit allows will tell the first few and say in the timeline who it did not
+tell.
 
 ## Teaching it
 

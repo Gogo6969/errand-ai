@@ -124,15 +124,35 @@ pub fn normalize_domain(input: &str) -> Result<String> {
         );
     }
 
-    // `url::Url` reads a bare number as an IPv4 address: "1" becomes 0.0.0.1
-    // and "2130706433" becomes 127.0.0.1. Left alone, a slip of the keyboard
-    // would be saved as a perfectly valid-looking entry pointing at a machine
-    // nobody meant to allow.
-    if !typed.contains('.') && host.contains('.') {
-        bail!(
-            "'{typed}' is read as the machine address {host}, which is almost certainly not the \
-             site you meant. Nothing has been saved. Type the site's name, like example.com."
-        );
+    // `url::Url` reads far more than a dotted quad as an IPv4 address: "1"
+    // becomes 0.0.0.1, and "2130706433", "0x7f000001" and "127.1" all become
+    // 127.0.0.1. Left alone, a slip of the keyboard would be saved as a
+    // perfectly valid-looking entry pointing at a machine nobody meant to allow.
+    //
+    // Ask the parser what it produced rather than inferring it from the shape of
+    // what was typed. Inferring is what let "127.1" through — it has a dot in
+    // it, so a dot-counting test read it as an ordinary address — while
+    // refusing "example。com", whose ideographic full stop the parser turns into
+    // the perfectly ordinary domain example.com.
+    if let Some(url::Host::Ipv4(_)) = parsed.host() {
+        // The same input again, under a scheme whose host the URL rules leave
+        // exactly as written. It is the only way to recover the address as it
+        // was typed: for http and https the parser hands back the canonical
+        // form, so comparing that against itself could never differ.
+        let as_typed = as_url
+            .split_once("://")
+            .and_then(|(_, authority)| url::Url::parse(&format!("errand://{authority}")).ok())
+            .and_then(|u| {
+                u.host_str()
+                    .map(|h| h.trim_end_matches('.').to_ascii_lowercase())
+            });
+        if as_typed.as_deref() != Some(host.as_str()) {
+            bail!(
+                "'{typed}' is read as the machine address {host}, which is almost certainly not \
+                 the site you meant. Nothing has been saved. Type the site's name, like \
+                 example.com."
+            );
+        }
     }
 
     // A task against something running on this Mac is a fair thing to want, and
@@ -330,6 +350,33 @@ mod tests {
     }
 
     #[test]
+    fn a_shorthand_for_a_machine_address_is_refused_rather_than_quietly_expanded() {
+        // Each of these is read as an IP address the person never typed, and
+        // each has a dot in it, which is why counting dots did not notice.
+        for typo in ["127.1", "0x7f.1", "1.2", "0300.0250.0.1"] {
+            let e = normalize_domain(typo).unwrap_err().to_string();
+            assert!(
+                e.contains("machine address"),
+                "{typo} was accepted or unexplained: {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_address_typed_with_a_full_stop_from_another_keyboard_is_tidied_not_refused() {
+        // A Japanese or Chinese keyboard produces these full stops, and the
+        // parser turns each of them into an ordinary dot. Refusing them told
+        // somebody their own address was a machine address.
+        for typed in ["example。com", "example．com", "example｡com"] {
+            assert_eq!(
+                normalize_domain(typed).unwrap(),
+                "example.com",
+                "{typed} should tidy to example.com"
+            );
+        }
+    }
+
+    #[test]
     fn a_task_against_something_on_this_machine_is_still_allowed() {
         assert_eq!(normalize_domain("localhost").unwrap(), "localhost");
         assert_eq!(normalize_domain("127.0.0.1").unwrap(), "127.0.0.1");
@@ -337,6 +384,12 @@ mod tests {
         assert_eq!(
             normalize_domain("http://localhost:3000/health").unwrap(),
             "localhost"
+        );
+        // Pasted out of the address bar, port and path and all. An address
+        // somebody really did type must survive the check above.
+        assert_eq!(
+            normalize_domain("http://127.0.0.1:8443/health").unwrap(),
+            "127.0.0.1"
         );
     }
 

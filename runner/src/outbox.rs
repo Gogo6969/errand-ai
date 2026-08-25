@@ -69,12 +69,14 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
                 .to_string()
                 .parse()
                 .unwrap_or(12);
-            let quiet = quiet_hours(state).await;
-            if let Some((from, to, breaks)) = quiet {
-                if channels::deferred_until(hour, from, to, row.is_failure, breaks) {
-                    errand_core::db::defer_outbox(state.pool(), &row.id, next_hour_utc(to)).await?;
-                    continue;
-                }
+            // Unconditional. There is always a quiet period, because a fresh
+            // install has nobody's saved preference in it and a run finishing at
+            // 03:00 would otherwise wake a third party who never asked Errand
+            // for anything.
+            let (from, to, breaks) = quiet_hours(state).await;
+            if channels::deferred_until(hour, from, to, row.is_failure, breaks) {
+                errand_core::db::defer_outbox(state.pool(), &row.id, next_hour_utc(to)).await?;
+                continue;
             }
         }
 
@@ -151,11 +153,47 @@ async fn tick(state: &AppState) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn quiet_hours(state: &AppState) -> Option<(u32, u32, bool)> {
-    let v = errand_core::db::get_setting(state.pool(), "messaging.quiet")
+/// The row the settings screen writes, and the only one read here.
+pub const QUIET_SETTING: &str = "messaging.quiet";
+
+/// The night, as it stands before anybody has chosen one: 22:00 to 07:00, with
+/// a failure you asked to hear about still reaching you during it.
+///
+/// Absent is not the same as "no quiet hours". Nobody installs Errand meaning
+/// "message my mother at three in the morning", so an install where the setting
+/// has never been touched gets an ordinary night rather than none.
+const DEFAULT_QUIET: (u32, u32, bool) = (22, 7, true);
+
+/// The default written in the exact shape the settings table stores, so
+/// `GET /v1/settings` can hand back the period that is genuinely in force when
+/// no row exists.
+///
+/// This exists so there is one set of numbers rather than two. A screen showing
+/// 22 and 7 while the outbox defers nothing is worse than a blank screen: it
+/// tells a worried person their evenings are protected when they are not.
+pub fn default_quiet_hours() -> serde_json::Value {
+    let (from, to, breaks) = DEFAULT_QUIET;
+    serde_json::json!({ "from": from, "to": to, "failure_breaks_through": breaks })
+}
+
+/// The quiet period in force, whether or not anybody has saved one.
+async fn quiet_hours(state: &AppState) -> (u32, u32, bool) {
+    let stored = errand_core::db::get_setting(state.pool(), QUIET_SETTING)
         .await
         .ok()
-        .flatten()?;
+        .flatten();
+    // Falls back to the same JSON the settings screen is given, not to a second
+    // copy of the numbers, so the two cannot drift apart.
+    let v = stored.unwrap_or_else(default_quiet_hours);
+    parse_quiet(&v).unwrap_or(DEFAULT_QUIET)
+}
+
+/// Read a stored quiet period, or nothing if it is not the shape this reads.
+///
+/// A half-written row is treated as no row at all rather than as half a night:
+/// a missing "to" hour must not become an open-ended quiet period, and it must
+/// not become an absent one either.
+fn parse_quiet(v: &serde_json::Value) -> Option<(u32, u32, bool)> {
     let from = v.get("from")?.as_u64()? as u32;
     let to = v.get("to")?.as_u64()? as u32;
     let breaks = v
@@ -304,6 +342,14 @@ async fn notify_recipients(
         }
     };
 
+    // The ceiling the agent's own message_person enforces, applied here too and
+    // counted from the same journal, so the agent's sends and this report share
+    // one budget. Without it a task allowed one message sends one during the run
+    // and another twenty from here, one to every person it happens to be linked
+    // to, and the number on the task page means nothing.
+    let limits = errand_core::limits::Limits::from_json(&task.limits);
+    let mut sent = crate::mcp::messages_this_run(state, &run.id).await;
+
     for person in people {
         // Whose news this is. Somebody added for failures only does not want to
         // hear that the shopping arrived.
@@ -313,6 +359,27 @@ async fn notify_recipients(
             person.on_failure
         };
         if !wanted {
+            continue;
+        }
+
+        // Checked before the fence, never after. Arming first would spend this
+        // occurrence's one message to somebody who is then never told, and the
+        // next run would be refused for a message that never happened.
+        if limits.max_messages > 0 && sent >= limits.max_messages {
+            // Written down rather than only logged, and deliberately not as a
+            // step of kind "message": the count above is made of those, so
+            // recording a refusal as one would spend budget on refusing. Somebody
+            // who set the ceiling below the number of people they linked would
+            // otherwise never find out that their sister was not told.
+            let line = format!(
+                "Did not tell {}: this run has already sent {sent} message{}, which is all this \
+                 task allows.",
+                person.label,
+                if sent == 1 { "" } else { "s" }
+            );
+            let _ =
+                errand_core::db::append_step(state.pool(), &run.id, "decide", &line, false, None)
+                    .await;
             continue;
         }
 
@@ -328,7 +395,66 @@ async fn notify_recipients(
         )
         .await
         {
-            Ok(errand_core::db::FenceVerdict::Armed(id)) => id,
+            Ok(errand_core::db::FenceVerdict::Armed(id)) => {
+                // The same follow-up check message_person makes, asked here
+                // before the narrator is paid to write a word. The fence guards a
+                // scheduled slot, but pressing Run now twice mints a fresh slot
+                // each time, so without this the same person hears the same news
+                // twice in a minute.
+                match crate::mcp::messaged_moments_ago(
+                    state,
+                    &run.task_id,
+                    &person.id,
+                    &run.occurrence_id,
+                )
+                .await
+                {
+                    Ok(None) => id,
+                    Ok(Some((at, _))) => {
+                        let _ = errand_core::db::abort_side_effect(
+                            state.pool(),
+                            &id,
+                            "this person had just been messaged",
+                        )
+                        .await;
+                        let line = format!(
+                            "Did not tell {} again: they were written to at {at}, only minutes \
+                             ago.",
+                            person.label
+                        );
+                        let _ = errand_core::db::append_step(
+                            state.pool(),
+                            &run.id,
+                            "decide",
+                            &line,
+                            false,
+                            None,
+                        )
+                        .await;
+                        tracing::info!(
+                            run = %run.id,
+                            "{} was messaged at {at}, only minutes ago, so nothing was sent again",
+                            person.label
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        let _ = errand_core::db::abort_side_effect(
+                            state.pool(),
+                            &id,
+                            "the record of what had already been sent could not be read",
+                        )
+                        .await;
+                        tracing::warn!(
+                            run = %run.id,
+                            "could not check whether {} had just been written to, so nothing was \
+                             sent: {e}",
+                            person.label
+                        );
+                        continue;
+                    }
+                }
+            }
             Ok(errand_core::db::FenceVerdict::AlreadyCommitted { .. }) => {
                 // Already told, most likely by the agent itself during the run.
                 tracing::info!(
@@ -407,6 +533,9 @@ async fn notify_recipients(
             let _ =
                 errand_core::db::append_step(state.pool(), &run.id, "message", &line, true, None)
                     .await;
+            // Counted here, against the step just written, so the running total
+            // and the journal the ceiling is read from can never disagree.
+            sent += 1;
         }
 
         let evidence = serde_json::json!({
@@ -565,6 +694,91 @@ mod tests {
         let iso = next_hour_utc(8);
         assert!(chrono::DateTime::parse_from_rfc3339(&iso).is_ok());
         assert!(chrono::DateTime::parse_from_rfc3339(&iso).unwrap() > chrono::Utc::now());
+    }
+
+    // ----------------------------------------------- the night nobody set up --
+
+    #[tokio::test]
+    async fn a_brand_new_install_already_has_a_quiet_period_nobody_had_to_switch_on() {
+        let api = testkit::start().await;
+        assert!(
+            errand_core::db::get_setting(&api.pool, QUIET_SETTING)
+                .await
+                .expect("reading the settings")
+                .is_none(),
+            "this test is only meaningful while nothing has been saved, which is the state \
+             every new install is in"
+        );
+
+        let (from, to, breaks) = quiet_hours(&api.state).await;
+        assert_eq!(
+            (from, to),
+            (22, 7),
+            "with no quiet period a run finishing at three in the morning writes to somebody's \
+             mother there and then"
+        );
+        assert!(
+            breaks,
+            "a failure you asked to hear about should still reach you during the night"
+        );
+        assert!(
+            channels::deferred_until(3, from, to, false, breaks),
+            "good news at 03:00 has to wait until morning"
+        );
+        assert!(
+            !channels::deferred_until(14, from, to, false, breaks),
+            "the afternoon is not the middle of the night"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_quiet_hours_the_settings_screen_is_shown_are_the_ones_the_outbox_applies() {
+        // The screen reads GET /v1/settings, which is handed
+        // `default_quiet_hours()`. The outbox reads `quiet_hours`. Written out
+        // twice, the two would drift, and a person would be shown 22 and 7 on a
+        // screen while nothing whatever was being held back.
+        let api = testkit::start().await;
+        errand_core::db::set_setting(&api.pool, QUIET_SETTING, &default_quiet_hours())
+            .await
+            .expect("saving the default the screen shows");
+        assert_eq!(
+            quiet_hours(&api.state).await,
+            (22, 7, true),
+            "the shape the screen is given must be the shape the outbox reads back"
+        );
+    }
+
+    #[tokio::test]
+    async fn quiet_hours_saved_with_a_piece_missing_still_leave_a_night_in_place() {
+        let api = testkit::start().await;
+        errand_core::db::set_setting(&api.pool, QUIET_SETTING, &json!({ "from": 23 }))
+            .await
+            .expect("saving a half-written row");
+        assert_eq!(
+            quiet_hours(&api.state).await,
+            (22, 7, true),
+            "half a setting must not become half a night, and must not become no night at all"
+        );
+    }
+
+    #[tokio::test]
+    async fn somebody_who_deliberately_turned_quiet_hours_off_still_has_them_off() {
+        // The default fills a gap. It must never overrule a decision somebody
+        // actually made, or the switch on the settings screen does nothing.
+        let api = testkit::start().await;
+        errand_core::db::set_setting(
+            &api.pool,
+            QUIET_SETTING,
+            &json!({ "from": 0, "to": 0, "failure_breaks_through": false }),
+        )
+        .await
+        .expect("saving the choice");
+        let (from, to, breaks) = quiet_hours(&api.state).await;
+        assert_eq!((from, to, breaks), (0, 0, false));
+        assert!(
+            !channels::deferred_until(3, from, to, false, breaks),
+            "somebody who switched the night off was given one back"
+        );
     }
 
     // ------------------------------------------- telling somebody else how it went --
@@ -747,6 +961,234 @@ mod tests {
             to_other_people(&api).await.len(),
             1,
             "the same person was written to twice about one run"
+        );
+    }
+
+    // -------------------------------- the ceiling, and telling somebody twice --
+
+    const DADS_NUMBER: &str = "+447700900124";
+    const SISTERS_NUMBER: &str = "+447700900125";
+
+    /// A task with a stated message budget and a list of people to tell, all set
+    /// up through the calls the app itself makes.
+    async fn a_task_that_tells(
+        api: &testkit::Api,
+        max_messages: i64,
+        people: &[(&str, &str)],
+    ) -> String {
+        let task_id = testkit::a_task(
+            api,
+            json!({
+                "name": "Order the shopping",
+                "description": "Put the usual order in.",
+                "limits": { "max_messages": max_messages }
+            }),
+        )
+        .await;
+        for (label, address) in people {
+            let (code, person) = api
+                .post(
+                    "/v1/recipients",
+                    json!({ "label": label, "channel": "whatsapp", "address": address }),
+                )
+                .await;
+            assert_eq!(code, 200, "saving the contact failed: {person}");
+            let (code, body) = api
+                .post(
+                    &format!("/v1/tasks/{task_id}/recipients"),
+                    json!({
+                        "recipient_id": person["id"].as_str().expect("a contact id"),
+                        "on_success": true,
+                        "on_failure": true
+                    }),
+                )
+                .await;
+            assert_eq!(code, 200, "granting the task access failed: {body}");
+        }
+        task_id
+    }
+
+    /// One press of Run now. Each press is its own occurrence, which is the
+    /// whole reason the follow-up check below has to exist.
+    async fn a_press_of_run_now(api: &testkit::Api, task_id: &str) -> errand_core::models::Run {
+        errand_core::db::try_create_run(
+            &api.pool,
+            task_id,
+            &format!("manual/{}", errand_core::new_id()),
+            "manual",
+            "normal",
+            None,
+        )
+        .await
+        .expect("a run")
+    }
+
+    /// Everything written into this run's timeline.
+    async fn timeline(api: &testkit::Api, run_id: &str) -> Vec<errand_core::models::Step> {
+        errand_core::db::list_steps(&api.pool, run_id)
+            .await
+            .expect("the timeline")
+    }
+
+    #[tokio::test]
+    async fn a_task_allowed_one_message_does_not_write_to_three_people_when_the_run_ends() {
+        let api = testkit::start().await;
+        let task_id = a_task_that_tells(
+            &api,
+            1,
+            &[
+                ("Mum", MUMS_NUMBER),
+                ("Dad", DADS_NUMBER),
+                ("Sister", SISTERS_NUMBER),
+            ],
+        )
+        .await;
+        let run = a_press_of_run_now(&api, &task_id).await;
+        errand_core::db::finish_run_ok(&api.pool, &run.id, "The usual order is booked for Friday.")
+            .await
+            .expect("finishing the run");
+
+        notify_run(&api.state, &run.id)
+            .await
+            .expect("queueing the reports");
+
+        let sent = to_other_people(&api).await;
+        assert_eq!(
+            sent.len(),
+            1,
+            "the task says one message and {} went out. A ceiling the automatic report ignores \
+             is not a ceiling: {sent:?}",
+            sent.len()
+        );
+
+        // Whoever was left out is named, so somebody who set the number lower
+        // than the number of people they linked finds out.
+        let steps = timeline(&api, &run.id).await;
+        let skipped: Vec<&str> = steps
+            .iter()
+            .filter(|s| s.title.starts_with("Did not tell"))
+            .map(|s| s.title.as_str())
+            .collect();
+        assert_eq!(
+            skipped.len(),
+            2,
+            "the two people who were not told are not mentioned anywhere: {steps:?}"
+        );
+        assert!(
+            skipped
+                .iter()
+                .all(|t| t.contains("which is all this task allows")),
+            "the timeline has to say why, not just that: {skipped:?}"
+        );
+        assert!(
+            !steps
+                .iter()
+                .any(|s| s.kind == "message" && s.title.starts_with("Did not tell")),
+            "a refusal recorded as a message would be counted as one, and refusing would spend \
+             the very budget it is enforcing"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_messages_the_agent_sent_itself_count_against_the_report_at_the_end() {
+        // One budget, not two. If the agent spends the task's only message
+        // during the run, there is none left for the automatic report.
+        let api = testkit::start().await;
+        let task_id = a_task_that_tells(&api, 1, &[("Mum", MUMS_NUMBER)]).await;
+        let run = a_press_of_run_now(&api, &task_id).await;
+        errand_core::db::append_step(
+            &api.pool,
+            &run.id,
+            "message",
+            "Messaged Mum on WhatsApp: the order is in.",
+            true,
+            None,
+        )
+        .await
+        .expect("the agent's own message");
+        errand_core::db::finish_run_ok(&api.pool, &run.id, "Ordered.")
+            .await
+            .expect("finishing the run");
+
+        notify_run(&api.state, &run.id)
+            .await
+            .expect("queueing the reports");
+
+        assert!(
+            to_other_people(&api).await.is_empty(),
+            "the run had already used the task's one message, and it sent another anyway"
+        );
+    }
+
+    #[tokio::test]
+    async fn pressing_run_now_twice_does_not_tell_the_same_person_twice_over() {
+        let api = testkit::start().await;
+        let task_id = a_task_that_tells(&api, 3, &[("Mum", MUMS_NUMBER)]).await;
+
+        let first = a_press_of_run_now(&api, &task_id).await;
+        errand_core::db::finish_run_ok(&api.pool, &first.id, "The usual order is booked.")
+            .await
+            .expect("finishing the first run");
+        notify_run(&api.state, &first.id)
+            .await
+            .expect("first report");
+
+        // A second press mints a fresh occurrence, so the fence on its own does
+        // not cover it. The outcome differs deliberately, so the words differ
+        // too and the outbox's ten-minute duplicate check cannot be what saves
+        // her from hearing it again.
+        let second = a_press_of_run_now(&api, &task_id).await;
+        errand_core::db::finish_run_failed(
+            &api.pool,
+            &second.id,
+            "target_unavailable",
+            "The shop's site was down.",
+            None,
+        )
+        .await
+        .expect("finishing the second run");
+        notify_run(&api.state, &second.id)
+            .await
+            .expect("second report");
+
+        let sent = to_other_people(&api).await;
+        assert_eq!(
+            sent.len(),
+            1,
+            "Mum was written to twice within minutes about the same task: {sent:?}"
+        );
+        assert!(
+            timeline(&api, &second.id)
+                .await
+                .iter()
+                .any(|s| s.title.contains("Did not tell Mum again")),
+            "the second run has to say it held the message back, and that it was the follow-up \
+             check that did it"
+        );
+    }
+
+    #[tokio::test]
+    async fn two_different_people_are_both_told_about_the_same_run() {
+        // The follow-up check is asked about one person at a time. If it were
+        // not, writing to Mum would silence Dad, and somebody who asked to be
+        // kept informed would simply never hear anything.
+        let api = testkit::start().await;
+        let task_id =
+            a_task_that_tells(&api, 3, &[("Mum", MUMS_NUMBER), ("Dad", DADS_NUMBER)]).await;
+        let run = a_press_of_run_now(&api, &task_id).await;
+        errand_core::db::finish_run_ok(&api.pool, &run.id, "The usual order is booked.")
+            .await
+            .expect("finishing the run");
+
+        notify_run(&api.state, &run.id)
+            .await
+            .expect("queueing the reports");
+
+        let sent = to_other_people(&api).await;
+        assert_eq!(
+            sent.len(),
+            2,
+            "one of the two people this task was told to write to heard nothing: {sent:?}"
         );
     }
 

@@ -178,13 +178,47 @@ pub struct TaskPatch {
     pub name: Option<String>,
     pub emoji: Option<String>,
     pub description: Option<String>,
+    /// Replaces the stored schedule outright, unlike the two below. That is
+    /// deliberate: a schedule is one shape rather than a bag of settings, and
+    /// wholesale replacement is what lets a run window be taken off a task
+    /// again. Merging here would make a window impossible to remove.
     pub schedule: Option<serde_json::Value>,
+    /// Merged over what is stored, key by key.
     pub notify: Option<serde_json::Value>,
+    /// Merged over what is stored, key by key, so raising one ceiling cannot
+    /// silently reset the four the caller did not mention.
     pub limits: Option<serde_json::Value>,
     /// Sites as typed. Normalised here rather than at the edge, so there is no
     /// route by which an entry the run-time check could never match gets
     /// written to the database.
     pub allowed_domains: Option<Vec<String>>,
+}
+
+/// Lay a patch over a stored settings object, one key at a time.
+///
+/// `None` means the caller did not mention this setting at all, so the column
+/// is left alone. An object is merged rather than substituted, because the
+/// callers upstream send only what changed: a body naming `max_usd` alone must
+/// not take `max_messages` with it. Anything that is not an object — a null, a
+/// list, a stored value that is not readable as JSON — replaces what is there,
+/// since there is nothing to merge into.
+fn merge_settings(stored: &str, patch: Option<&serde_json::Value>) -> Result<Option<String>> {
+    let Some(patch) = patch else {
+        return Ok(None);
+    };
+    let merged = match (
+        serde_json::from_str::<serde_json::Value>(stored),
+        patch.as_object(),
+    ) {
+        (Ok(serde_json::Value::Object(mut base)), Some(over)) => {
+            for (key, value) in over {
+                base.insert(key.clone(), value.clone());
+            }
+            serde_json::Value::Object(base)
+        }
+        _ => patch.clone(),
+    };
+    Ok(Some(serde_json::to_string(&merged)?))
 }
 
 /// Change a task's settings, in one transaction.
@@ -209,16 +243,6 @@ pub async fn update_task(pool: &Pool, id: &str, patch: TaskPatch) -> Result<crat
         .as_ref()
         .map(serde_json::to_string)
         .transpose()?;
-    let notify_json = patch
-        .notify
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()?;
-    let limits_json = patch
-        .limits
-        .as_ref()
-        .map(serde_json::to_string)
-        .transpose()?;
 
     // Also read before the transaction opens. A transaction takes a connection
     // of its own, so reading back through the pool while one is open would have
@@ -227,10 +251,12 @@ pub async fn update_task(pool: &Pool, id: &str, patch: TaskPatch) -> Result<crat
 
     let mut tx = pool.begin().await?;
 
-    let row = sqlx::query("SELECT status, schedule_json FROM tasks WHERE id = ?")
-        .bind(id)
-        .fetch_optional(&mut *tx)
-        .await?;
+    let row = sqlx::query(
+        "SELECT status, schedule_json, notify_json, limits_json FROM tasks WHERE id = ?",
+    )
+    .bind(id)
+    .fetch_optional(&mut *tx)
+    .await?;
     let Some(row) = row else {
         anyhow::bail!("There is no task with id {id}, so nothing was changed.");
     };
@@ -242,6 +268,22 @@ pub async fn update_task(pool: &Pool, id: &str, patch: TaskPatch) -> Result<crat
         );
     }
     let current_schedule: String = row.try_get("schedule_json")?;
+
+    // Limits and notify preferences are merged key by key over what is stored,
+    // read inside the transaction so nothing can change underneath the merge.
+    // A screen that edits one number sends one number, and replacing the whole
+    // object with it would quietly drop the other four: a task whose owner set
+    // a ceiling of one message would fall back to the default of three because
+    // somebody adjusted its spending limit. A schedule is deliberately not
+    // treated this way — see the field's own note.
+    let notify_json = merge_settings(
+        &row.try_get::<String, _>("notify_json")?,
+        patch.notify.as_ref(),
+    )?;
+    let limits_json = merge_settings(
+        &row.try_get::<String, _>("limits_json")?,
+        patch.limits.as_ref(),
+    )?;
 
     let mut floor_at: Option<String> = None;
     let mut next_run_at: Option<String> = None;
@@ -1393,7 +1435,15 @@ pub async fn dangling_fences(pool: &Pool, task_id: &str, occurrence_id: &str) ->
     Ok(row.try_get::<i64, _>("n")? > 0)
 }
 
-pub async fn set_next_run_at(pool: &Pool, task_id: &str, iso: &str) -> Result<()> {
+/// Record when this task next comes round, or that it does not come round again.
+///
+/// `None` is a real answer and writes NULL. Without it "there is no next run"
+/// could not be recorded at all, so a one-off that has been and gone kept the
+/// time it ran at sitting in its next-run field, and the task page went on
+/// promising a run in the past for as long as the task existed. Callers should
+/// pass whatever they computed and let it be written either way, rather than
+/// skipping the write when there is nothing to say.
+pub async fn set_next_run_at(pool: &Pool, task_id: &str, iso: Option<&str>) -> Result<()> {
     sqlx::query("UPDATE tasks SET next_run_at = ? WHERE id = ?")
         .bind(iso)
         .bind(task_id)
@@ -1425,9 +1475,11 @@ pub async fn finish_run_skipped(pool: &Pool, run_id: &str, code: &str, human: &s
 /// mints a fresh slot every time, so nothing stops someone triggering a booking
 /// task twice in a minute and booking twice. This is what makes that visible.
 ///
-/// `scope` narrows it the same way it narrows the fence key: an empty scope
-/// asks about the action kind as a whole, which is what every caller wanted
-/// before scopes existed.
+/// `scope` narrows it to one recipient, the same way it narrows the fence key.
+/// An empty scope is not a wildcard: it matches only the rows written with no
+/// scope at all. Ask this when the question really is about one person — "has
+/// Mum already been told" — and `recent_commit_of_any_scope` when it is about
+/// the task as a whole.
 pub async fn recent_commit(
     pool: &Pool,
     task_id: &str,
@@ -1453,6 +1505,50 @@ pub async fn recent_commit(
             r.try_get("occurrence_id")?,
             r.try_get("committed_at")?,
             r.try_get("evidence_json")?,
+        ))),
+        None => Ok(None),
+    }
+}
+
+/// The most recent committed action of this kind for this task, whoever or
+/// whatever it was aimed at.
+///
+/// The sibling of `recent_commit`, and both exist because the two questions are
+/// genuinely different. "Has Mum already been told about this?" is scoped to
+/// Mum, and answering it across every recipient would silence a message to
+/// somebody else. "Has this task done anything irreversible of this kind
+/// lately?" is not scoped to anybody, and answering it with an empty scope
+/// finds nothing at all: every message is armed with the recipient's id, so the
+/// empty scope matches none of them. That is how a guard on schedule changes
+/// came to look at the one column that could never match, and waved through
+/// exactly the repeats it existed to catch.
+///
+/// Returns the scope alongside the rest, so a caller that wants to name the
+/// person in what it says can look them up.
+pub async fn recent_commit_of_any_scope(
+    pool: &Pool,
+    task_id: &str,
+    action_kind: &str,
+    within_minutes: i64,
+) -> Result<Option<(String, String, Option<String>, String)>> {
+    let row = sqlx::query(
+        "SELECT occurrence_id, committed_at, evidence_json, scope FROM side_effects
+         WHERE task_id = ? AND action_kind = ? AND state = 'committed'
+           AND committed_at IS NOT NULL
+           AND committed_at > strftime('%Y-%m-%dT%H:%M:%SZ', 'now', ?)
+         ORDER BY committed_at DESC LIMIT 1",
+    )
+    .bind(task_id)
+    .bind(action_kind)
+    .bind(format!("-{within_minutes} minutes"))
+    .fetch_optional(pool)
+    .await?;
+    match row {
+        Some(r) => Ok(Some((
+            r.try_get("occurrence_id")?,
+            r.try_get("committed_at")?,
+            r.try_get("evidence_json")?,
+            r.try_get("scope")?,
         ))),
         None => Ok(None),
     }
@@ -1790,10 +1886,14 @@ pub async fn enqueue_message(pool: &Pool, m: NewMessage) -> Result<Option<String
     }
 
     let id = crate::new_id();
+    // is_failure is carried on the row because it decides whether this is the
+    // news that breaks through quiet hours. It has a column of its own so that
+    // a delivery error, written later to last_error, cannot overwrite it and
+    // turn bad news into ordinary news held until morning.
     sqlx::query(
         "INSERT INTO msg_outbox (id, run_id, task_id, class, channel, recipient, recipient_label,
-                                 subject, body, body_hash, state, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
+                                 subject, body, body_hash, state, is_failure, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)",
     )
     .bind(&id)
     .bind(&m.run_id)
@@ -1805,23 +1905,16 @@ pub async fn enqueue_message(pool: &Pool, m: NewMessage) -> Result<Option<String
     .bind(&m.subject)
     .bind(&m.body)
     .bind(&hash)
+    .bind(i64::from(m.is_failure))
     .bind(crate::now_iso())
     .execute(pool)
     .await?;
-    // Carried on the row so the outbox knows whether this is the news that
-    // breaks through quiet hours.
-    if m.is_failure {
-        sqlx::query("UPDATE msg_outbox SET last_error = 'failure-notice' WHERE id = ?")
-            .bind(&id)
-            .execute(pool)
-            .await?;
-    }
     Ok(Some(id))
 }
 
 pub async fn due_outbox(pool: &Pool, limit: i64) -> Result<Vec<OutboxRow>> {
     let rows = sqlx::query(
-        "SELECT id, channel, class, recipient, subject, body, attempts, last_error
+        "SELECT id, channel, class, recipient, subject, body, attempts, is_failure, last_error
          FROM msg_outbox
          WHERE state IN ('queued','retry_wait','deferred_quiet')
            AND (next_attempt_at IS NULL OR next_attempt_at <= ?)
@@ -1833,7 +1926,12 @@ pub async fn due_outbox(pool: &Pool, limit: i64) -> Result<Vec<OutboxRow>> {
     .await?;
     rows.into_iter()
         .map(|r| {
+            // The sentinel is still read as well as the column. Anything an
+            // older daemon queued says so in last_error and nowhere else, and a
+            // message already waiting must not change meaning because Errand
+            // was updated while it sat there.
             let le: Option<String> = r.try_get("last_error")?;
+            let legacy_failure = le.as_deref() == Some("failure-notice");
             Ok(OutboxRow {
                 id: r.try_get("id")?,
                 channel: r.try_get("channel")?,
@@ -1842,7 +1940,7 @@ pub async fn due_outbox(pool: &Pool, limit: i64) -> Result<Vec<OutboxRow>> {
                 subject: r.try_get("subject")?,
                 body: r.try_get("body")?,
                 attempts: r.try_get("attempts")?,
-                is_failure: le.as_deref() == Some("failure-notice"),
+                is_failure: r.try_get::<i64, _>("is_failure")? != 0 || legacy_failure,
             })
         })
         .collect()
@@ -3069,6 +3167,87 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn news_that_a_task_failed_is_still_urgent_after_the_first_attempt_to_send_it_fails() {
+        let pool = open_memory().await.unwrap();
+        let id = enqueue_message(
+            &pool,
+            NewMessage {
+                run_id: None,
+                task_id: None,
+                class: "notify".into(),
+                channel: "telegram".into(),
+                recipient: "123".into(),
+                recipient_label: None,
+                subject: None,
+                body: "Your tennis booking did not go through.".into(),
+                is_failure: true,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        begin_send(&pool, &id).await.unwrap();
+        // Telegram was down. The real error goes where errors go.
+        fail_outbox(
+            &pool,
+            &id,
+            "retry_wait",
+            "telegram answered 502",
+            Some("2020-01-01T00:00:00Z".into()),
+        )
+        .await
+        .unwrap();
+
+        let due = due_outbox(&pool, 10).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert!(
+            due[0].is_failure,
+            "bad news must still be bad news on the second attempt, or quiet hours hold the one \
+             message a person wanted waking up for"
+        );
+    }
+
+    #[tokio::test]
+    async fn bad_news_queued_by_an_older_version_is_still_recognised_after_an_update() {
+        let pool = open_memory().await.unwrap();
+        let id = enqueue_message(
+            &pool,
+            NewMessage {
+                run_id: None,
+                task_id: None,
+                class: "notify".into(),
+                channel: "telegram".into(),
+                recipient: "123".into(),
+                recipient_label: None,
+                subject: None,
+                body: "Your tennis booking did not go through.".into(),
+                is_failure: false,
+            },
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        // Exactly how an older daemon wrote it: the flag smuggled through the
+        // error column and no flag of its own.
+        sqlx::query(
+            "UPDATE msg_outbox SET is_failure = 0, last_error = 'failure-notice' WHERE id = ?",
+        )
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let due = due_outbox(&pool, 10).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert!(
+            due[0].is_failure,
+            "a message already waiting must not change meaning because Errand was updated \
+             while it sat there"
+        );
+    }
+
     #[test]
     fn a_webhook_may_only_point_at_your_own_machine_or_network() {
         // Errand fetches these on a schedule, so a public URL would make it a
@@ -3409,6 +3588,150 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn changing_one_limit_leaves_the_ceilings_nobody_mentioned_where_they_were() {
+        let pool = open_memory().await.unwrap();
+        let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+
+        // A task deliberately held to a single message and a long run.
+        let set = update_task(
+            &pool,
+            &t.id,
+            TaskPatch {
+                limits: Some(serde_json::json!({
+                    "max_steps": 200, "max_minutes": 45, "max_usd": 5.0,
+                    "max_heal_cycles": 1, "max_messages": 1
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(set.limits["max_messages"], 1);
+
+        // Later, somebody edits only what a run may cost.
+        let after = update_task(
+            &pool,
+            &t.id,
+            TaskPatch {
+                limits: Some(serde_json::json!({"max_usd": 2.0})),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(after.limits["max_usd"], 2.0);
+        assert_eq!(
+            after.limits["max_messages"], 1,
+            "a task held to one message must not be let back up to three because somebody \
+             adjusted its spending"
+        );
+        assert_eq!(after.limits["max_steps"], 200);
+        assert_eq!(after.limits["max_minutes"], 45);
+        assert_eq!(after.limits["max_heal_cycles"], 1);
+    }
+
+    #[tokio::test]
+    async fn changing_one_notify_preference_leaves_the_rest_of_them_alone() {
+        let pool = open_memory().await.unwrap();
+        let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+
+        let set = update_task(
+            &pool,
+            &t.id,
+            TaskPatch {
+                notify: Some(serde_json::json!({"on_success": false, "on_failure": true})),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(set.notify["on_failure"], true);
+
+        let after = update_task(
+            &pool,
+            &t.id,
+            TaskPatch {
+                notify: Some(serde_json::json!({"on_success": true})),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(after.notify["on_success"], true);
+        assert_eq!(
+            after.notify["on_failure"], true,
+            "asking to hear about successes must not stop the task telling anyone it failed"
+        );
+    }
+
+    #[tokio::test]
+    async fn taking_the_window_off_a_schedule_really_does_remove_it() {
+        let pool = open_memory().await.unwrap();
+        let t = a_task(
+            &pool,
+            serde_json::json!({
+                "kind": "cron", "expr": "0 0 8 * * *", "tz": "UTC",
+                "window": {"not_before": "08:00", "not_after": "09:00", "arm_early_s": 300}
+            }),
+        )
+        .await;
+        assert!(t.schedule.get("window").is_some());
+
+        // Settings are merged; a schedule is not, and this is why. Somebody who
+        // no longer wants their task confined to an hour of the morning has no
+        // other way to say so.
+        let after = update_task(
+            &pool,
+            &t.id,
+            TaskPatch {
+                schedule: Some(serde_json::json!({
+                    "kind": "cron", "expr": "0 0 8 * * *", "tz": "UTC"
+                })),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(
+            after.schedule.get("window").is_none_or(|w| w.is_null()),
+            "the window is still there: {}",
+            after.schedule
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_that_is_not_coming_round_again_stops_showing_a_time_it_will_run() {
+        let pool = open_memory().await.unwrap();
+        let t = a_task(
+            &pool,
+            serde_json::json!({"kind": "once", "at": "2030-01-01T08:00:00", "tz": "UTC"}),
+        )
+        .await;
+
+        set_next_run_at(&pool, &t.id, Some("2030-01-01T08:00:00+00:00"))
+            .await
+            .unwrap();
+        assert!(get_task(&pool, &t.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .next_run_at
+            .is_some());
+
+        // Its moment has been and gone. "Nothing next" has to be sayable, or
+        // the task page goes on promising a run that already happened.
+        set_next_run_at(&pool, &t.id, None).await.unwrap();
+        assert_eq!(
+            get_task(&pool, &t.id).await.unwrap().unwrap().next_run_at,
+            None,
+            "a one-off that has already run must not go on showing a run in the past"
+        );
+    }
+
+    #[tokio::test]
     async fn the_sites_a_task_may_open_are_tidied_before_they_are_stored() {
         let pool = open_memory().await.unwrap();
         let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
@@ -3570,6 +3893,56 @@ mod tests {
                 .is_none(),
             "one person having been told must not silence the message to another"
         );
+    }
+
+    #[tokio::test]
+    async fn a_message_to_one_person_still_counts_as_something_this_task_has_just_done() {
+        let pool = open_memory().await.unwrap();
+        let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        let r = create_run(&pool, &t.id, "slot", "schedule", "normal", None)
+            .await
+            .unwrap();
+
+        let FenceVerdict::Armed(id) =
+            arm_side_effect(&pool, &r.id, &t.id, "slot", "message", "recipient-mum")
+                .await
+                .unwrap()
+        else {
+            unreachable!()
+        };
+        commit_side_effect(&pool, &id, "told Mum the court was booked")
+            .await
+            .unwrap();
+
+        // Every message is armed against the person it is for, so asking with
+        // no scope finds nothing — which is how a guard meant to catch repeats
+        // came to wave them all through.
+        assert!(recent_commit(&pool, &t.id, "message", "", 10)
+            .await
+            .unwrap()
+            .is_none());
+
+        let (_, _, evidence, scope) = recent_commit_of_any_scope(&pool, &t.id, "message", 10)
+            .await
+            .unwrap()
+            .expect("a message sent a moment ago is something this task has already done");
+        assert_eq!(scope, "recipient-mum", "so the warning can name the person");
+        assert_eq!(
+            evidence.as_deref(),
+            Some("told Mum the court was booked"),
+            "the warning has to be able to say what was already done"
+        );
+
+        // Last week's message is not a repeat of anything.
+        sqlx::query("UPDATE side_effects SET committed_at = '2020-01-01T00:00:00Z' WHERE id = ?")
+            .bind(&id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(recent_commit_of_any_scope(&pool, &t.id, "message", 10)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     // --------------------------------------------------------- recipients --

@@ -61,6 +61,14 @@ These are properties the code is built to hold, not aspirations:
 - **The API is the app's own transport.** The interface is a client of the same API a third party
   would use, which is the only reliable way to keep an integration API honest.
 
+## Documentation
+
+[docs/](docs/) — [getting started](docs/getting-started.md) ·
+[writing a task](docs/tasks.md) · [which AI does what](docs/ai.md) ·
+[messaging people](docs/messaging.md) · [how it is built](docs/architecture.md) ·
+[what stops it going wrong](docs/safety.md) · [the API](docs/api.md) ·
+[when something is wrong](docs/troubleshooting.md)
+
 ## Architecture
 
 Two processes, one owner of the database.

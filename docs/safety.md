@@ -56,9 +56,14 @@ rules, that text it reads is information and never instruction — but the rule 
 the second line of defence, not the first. The first is that the capability does
 not exist.
 
-Messages to other people are also capped per run, wait until quiet hours are
-over, must contain no links to sites outside the task's allowlist, and appear in
-full in the run timeline.
+Messages to other people are also capped per run — a cap the automatic
+end-of-run report shares with the agent's own sends — wait until quiet hours are
+over, and appear in full in the run timeline. They may contain no link to a site
+outside the task's allowlist, including the bare kind a phone or a mail client
+would quietly make tappable.
+
+Quiet hours are in force from the moment Errand is installed rather than from
+the moment somebody thinks to set them.
 
 ## What this does not protect against
 

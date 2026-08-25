@@ -136,7 +136,11 @@ fn task_json(task: &errand_core::models::Task) -> serde_json::Value {
             spec.preview(chrono::Utc::now(), PREVIEW_COUNT)
                 .unwrap_or_default()
                 .iter()
-                .map(|d| d.to_rfc3339())
+                // The moment each run begins, the same expression the countdown
+                // and the sweep use. Listing the bare occurrences instead would
+                // put two different times for the same run on one screen as soon
+                // as a task had any jitter or a window it arms early for.
+                .map(|d| crate::scheduler::start_instant(task, &spec, *d).to_rfc3339())
                 .collect::<Vec<_>>(),
         ),
         // Saying so beats leaving the field out: a task whose schedule cannot
@@ -521,24 +525,51 @@ async fn repeat_risk(
         .unwrap_or(LOOKBACK_WITHOUT_A_SLOT_MIN);
 
     for kind in ACTION_KINDS {
-        let Some((_, at, evidence)) =
-            errand_core::db::recent_commit(state.pool(), &task.id, kind, "", minutes)
+        // Whoever it was aimed at. Asking the scoped question here would be
+        // asking the wrong one: every message is recorded against the person it
+        // went to, so a guard that looked for an empty scope found nothing at
+        // all and waved through exactly the repeats it exists to catch.
+        let Some((_, at, evidence, scope)) =
+            errand_core::db::recent_commit_of_any_scope(state.pool(), &task.id, kind, minutes)
                 .await
                 .map_err(ApiError::from)?
         else {
             continue;
         };
+        // Name the person when the scope is one, because "already messaged Mum"
+        // is a fact somebody can check and "already sent a message" is not.
+        let what = match named_scope(state, &task.id, &scope).await {
+            Some(label) => format!("{kind} to {label}"),
+            None => (*kind).to_string(),
+        };
         return Ok(Some(format!(
-            "This task already carried out a {kind} at {at}: {}. The new schedule's first run, at \
+            "This task already carried out a {what} at {at}: {}. The new schedule's first run, at \
              {}, comes round sooner than the old one would have, and Errand knows what it has \
              already done by the exact time the run was due — so that run would look like fresh \
-             work and could do the {kind} a second time. Nothing has been changed. If that is \
-             what you want, send the same change again with acknowledge_repeat set to true.",
+             work and could do the {kind} a second time. Nothing has been changed. Check the site \
+             first if that would matter, then confirm if you still want the change.",
             evidence.unwrap_or_else(|| "no details were recorded".into()),
             new_first.to_rfc3339()
         )));
     }
     Ok(None)
+}
+
+/// The person a recorded action was aimed at, if the scope names one.
+///
+/// A scope is only ever a recipient id or nothing, and a stranger's id in a
+/// sentence helps nobody, so anything that does not resolve to somebody this
+/// task may write to comes back as `None` and is left out.
+async fn named_scope(state: &AppState, task_id: &str, scope: &str) -> Option<String> {
+    if scope.is_empty() {
+        return None;
+    }
+    errand_core::db::recipients_for_task(state.pool(), task_id)
+        .await
+        .ok()?
+        .into_iter()
+        .find(|r| r.id == scope)
+        .map(|r| r.label)
 }
 
 /// Say what the engine will really do with a schedule, before it is saved.
@@ -622,9 +653,14 @@ async fn activate_task(
     let spec = errand_core::schedule::ScheduleSpec::from_json(&task.schedule)
         .and_then(|s| s.validate().map(|_| s))
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
+    // The moment the run would actually begin, not the bare occurrence. The
+    // sweep stores the started instant, so storing the occurrence here made the
+    // countdown jump the first time the scheduler ticked — by up to the whole
+    // jitter, on a screen whose entire job is to say when this will happen.
     let next = spec
         .next_after(chrono::Utc::now())
-        .map_err(|e| ApiError::bad_request(e.to_string()))?;
+        .map_err(|e| ApiError::bad_request(e.to_string()))?
+        .map(|occurrence| crate::scheduler::start_instant(&task, &spec, occurrence));
 
     if spec.is_scheduled()
         && errand_core::db::active_playbook(state.pool(), &id)
@@ -645,9 +681,16 @@ async fn activate_task(
         ));
     }
 
-    if let Some(n) = next {
-        let _ = errand_core::db::set_next_run_at(state.pool(), &id, &n.to_rfc3339()).await;
-    }
+    // Written either way. A one-off whose moment has gone has no next run, and
+    // saying so clears the time it ran at; skipping the write would put the old
+    // value back after the sweep had just cleared it, and the task page would go
+    // on counting down to a moment in the past.
+    let _ = errand_core::db::set_next_run_at(
+        state.pool(),
+        &id,
+        next.map(|n| n.to_rfc3339()).as_deref(),
+    )
+    .await;
     state.emit(Event::TaskUpdated { task_id: id });
     Ok(Json(json!({
         "status": "ready",
@@ -911,10 +954,16 @@ async fn get_settings(
     require(&caller, Scope::Read)?;
     let mut out = serde_json::Map::new();
     for key in ALLOWED_SETTINGS {
-        let Some(mut value) = errand_core::db::get_setting(state.pool(), key)
+        let stored = errand_core::db::get_setting(state.pool(), key)
             .await
-            .map_err(ApiError::from)?
-        else {
+            .map_err(ApiError::from)?;
+        let Some(mut value) = stored.or_else(|| {
+            // Quiet hours are in force from the moment of install, whether or
+            // not anyone has saved them. A screen that showed nothing here
+            // would have a person believe messages can go out at three in the
+            // morning, when the outbox is in fact already holding them.
+            (*key == "messaging.quiet").then(crate::outbox::default_quiet_hours)
+        }) else {
             continue;
         };
         // Shown under both names, for the reason given at QUIET_BREAKS_THROUGH_ALT.
@@ -2783,6 +2832,85 @@ mod tests {
         let (code, body) = api.patch(&format!("/v1/tasks/{id}"), acknowledged).await;
         assert_eq!(code, 200, "{body}");
         assert_eq!(body["task"]["schedule"]["kind"], "cron");
+    }
+
+    #[tokio::test]
+    async fn moving_a_schedule_over_a_message_already_sent_stops_and_names_the_person() {
+        // The failure this guards against: the guard asked whether this task had
+        // recently done something with no recipient attached, and every message
+        // is recorded against the person it went to. So it looked at the one
+        // column that could never match and let the change through, and Mum was
+        // written to twice about the same thing.
+        let api = testkit::start().await;
+        let id = a_ready_manual_task(&api).await;
+
+        let (code, person) = api
+            .post(
+                "/v1/recipients",
+                json!({ "label": "Mum", "channel": "apple_mail", "address": "mum@example.com" }),
+            )
+            .await;
+        assert_eq!(code, 200, "saving the person failed: {person}");
+        let rid = person["id"].as_str().expect("a recipient id").to_string();
+        let (code, granted) = api
+            .post(
+                &format!("/v1/tasks/{id}/recipients"),
+                json!({ "recipient_id": rid, "on_success": true, "on_failure": true }),
+            )
+            .await;
+        assert_eq!(code, 200, "granting the task permission failed: {granted}");
+
+        // A run that really did write to her, recorded exactly the way the
+        // outbox and the agent's own tool record it: against her id.
+        let run = errand_core::db::try_create_run(
+            &api.pool,
+            &id,
+            &format!("manual/{}", errand_core::new_id()),
+            "manual",
+            "normal",
+            None,
+        )
+        .await
+        .expect("a run");
+        let armed = errand_core::db::arm_side_effect(
+            &api.pool,
+            &run.id,
+            &id,
+            &run.occurrence_id,
+            "message",
+            &rid,
+        )
+        .await
+        .expect("arming the guard");
+        let errand_core::db::FenceVerdict::Armed(fence) = armed else {
+            panic!("a fresh slot must arm");
+        };
+        errand_core::db::commit_side_effect(&api.pool, &fence, "told her the court was booked")
+            .await
+            .expect("recording that it happened");
+
+        let (code, body) = api
+            .patch(
+                &format!("/v1/tasks/{id}"),
+                json!({ "schedule": { "kind": "cron", "expr": EVERY_MINUTE, "tz": "UTC" } }),
+            )
+            .await;
+        assert_eq!(code, 409, "{body}");
+        assert_eq!(body["code"], "schedule_change_may_repeat");
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(
+            detail.contains("Mum"),
+            "it must name the person who would hear it all over again: {detail}"
+        );
+        assert!(
+            detail.contains("told her the court was booked"),
+            "it must say what was already done: {detail}"
+        );
+        assert_eq!(
+            api.get(&format!("/v1/tasks/{id}")).await["schedule"]["kind"],
+            "manual",
+            "a refusal must change nothing"
+        );
     }
 
     // ------------------------------------------------- saying a schedule in words --

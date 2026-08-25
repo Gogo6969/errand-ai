@@ -20,6 +20,10 @@
   let editingSites = $state(false);
   let draftSites = $state<string[]>([]);
   let warnings = $state<string[]>([]);
+  // A refusal the person can answer. The daemon refuses a schedule change that
+  // might repeat something irreversible and says to send it again with an
+  // acknowledgement — so there has to be something to press.
+  let mustConfirm = $state<{ detail: string; patch: any } | null>(null);
   let people = $state<TaskRecipient[]>([]);
   let everyone = $state<Recipient[]>([]);
 
@@ -44,14 +48,28 @@
       const res = await api.patchTask(id, patch);
       warnings = res.warnings ?? [];
       problem = null;
+      mustConfirm = null;
       await load();
       return true;
     } catch (e) {
-      problem = e instanceof ApiError ? e.message : String(e);
+      if (e instanceof ApiError && e.code === "schedule_change_may_repeat") {
+        // Not an error to read and give up on: a question with two answers.
+        mustConfirm = { detail: e.message, patch };
+        problem = null;
+      } else {
+        problem = e instanceof ApiError ? e.message : String(e);
+      }
       return false;
     } finally {
       busy = false;
     }
+  }
+
+  async function confirmRepeat() {
+    const pending = mustConfirm;
+    if (!pending) return;
+    mustConfirm = null;
+    if (await save({ ...pending.patch, acknowledge_repeat: true })) editingSchedule = false;
   }
 
   async function saveSchedule() {
@@ -73,6 +91,30 @@
 
 {#if problem}
   <div class="err"><h3>Errand could not do that</h3><div>{problem}</div></div>
+{/if}
+
+{#if mustConfirm}
+  <div class="err">
+    <h3>This could happen twice</h3>
+    <div>{mustConfirm.detail}</div>
+    <div class="row" style="margin-top:10px; gap:6px">
+      <Hint id="task.confirm_repeat">
+        <button disabled={busy} onclick={confirmRepeat}>Change it anyway</button>
+      </Hint>
+      <Hint id="task.cancel_edit">
+        <button disabled={busy} onclick={() => (mustConfirm = null)}>Leave it alone</button>
+      </Hint>
+    </div>
+  </div>
+{/if}
+
+<!-- Warnings outlive the editor they came from: a site list that will not work
+     is worth seeing every time the task is opened, not only in the two seconds
+     after saving it. -->
+{#if warnings.length}
+  <div class="warnbox">
+    {#each warnings as w}<div>{w}</div>{/each}
+  </div>
 {/if}
 
 {#if task}
@@ -172,7 +214,7 @@
     <Hint id="task.allowed_sites"><strong>Sites it may open</strong></Hint>
     {#if editingSites}
       <div style="margin-top:8px">
-        <SitesEditor bind:sites={draftSites} {warnings} />
+        <SitesEditor bind:sites={draftSites} />
       </div>
       <div class="row" style="margin-top:12px; gap:6px">
         <Hint id="task.save_sites">
@@ -315,3 +357,12 @@
 {:else if !problem}
   <p class="muted">Loading…</p>
 {/if}
+
+<style>
+  /* This page had no styles of its own; app.css covers the rest. */
+  .warnbox {
+    background: var(--warn-bg); color: var(--warn);
+    padding: 9px 11px; border-radius: 6px; font-size: 12.5px;
+    display: flex; flex-direction: column; gap: 4px; margin: 12px 0;
+  }
+</style>

@@ -26,10 +26,20 @@ const SLEEP_DETECT: i64 = 90;
 
 /// Never replay more than this many missed occurrences at once, however long
 /// the outage was.
+///
+/// This is a cap on the PAST. The lookahead below is counted separately, and
+/// must stay that way: when both shared one budget, a schedule that comes round
+/// every few seconds filled the whole allowance with occurrences that had not
+/// happened yet, evicted every missed one, and so ran nothing at all.
 const MAX_CATCH_UP: usize = 20;
 
 /// How far ahead to look for occurrences whose run has to start early.
-const MAX_ARM_EARLY_S: i64 = 15 * 60;
+///
+/// The same hour a window's `arm_early_s` is allowed to reach, because a task
+/// told to be logged in an hour beforehand would otherwise never be looked at
+/// until fifteen minutes before, and would arrive after the barrier lifted
+/// instead of waiting behind it.
+const MAX_ARM_EARLY_S: i64 = 60 * 60;
 
 // An ordinary tick must never be mistaken for a wake from sleep, or every tick
 // would take the catch-up path.
@@ -138,8 +148,14 @@ async fn tick(
 
     for task in tasks {
         // Paused keeps its computed next run visible but never enqueues, and
-        // unpausing does not replay what it missed.
+        // unpausing does not replay what it missed. That promise is why any
+        // half-drained catch-up is forgotten here: a task paused with make-up
+        // runs still owed must come back to life facing forwards, not with a
+        // queue of mornings that have already gone.
         if task.status != "ready" {
+            if let Err(e) = forget_backlog(state, &task.id).await {
+                tracing::warn!(task = %task.id, "could not clear the catch-up backlog: {e}");
+            }
             continue;
         }
         let spec = match ScheduleSpec::from_json(&task.schedule) {
@@ -180,13 +196,44 @@ async fn consider(
     // after, so an occurrence landing exactly on the floor second is excluded.
     // That is the safe direction: the floor is the instant the old schedule
     // stopped applying, and nothing before it was ever missed.
-    let since = catch_up_floor(state, task, since, now).await?;
+    let floor = occurrence_floor(state, task, now).await?;
 
-    // Look slightly into the future as well as the past, because a task with a
-    // run window has to START before its occurrence in order to be logged in
-    // and waiting when the barrier lifts.
-    let horizon = now + chrono::Duration::seconds(MAX_ARM_EARLY_S);
-    let (due, dropped) = spec.occurrences_between(since, horizon, MAX_CATCH_UP)?;
+    // A make-up run that could not start last sweep is still owed. The shared
+    // cursor always moves on, so without this the rest of a catch-up backlog
+    // would fall behind it and never be looked at again.
+    let owed_from = backlog_cursor(state, &task.id).await?;
+
+    // Two bounds, in two different spaces, and they are not interchangeable.
+    //
+    // `scan_from` bounds OCCURRENCES, because that is what `occurrences_between`
+    // walks. It reaches back past the cursor by the largest jitter this task can
+    // add, since an occurrence from just before the last sweep may only now have
+    // reached its jittered start.
+    //
+    // `lower` bounds START INSTANTS, because that is what the decision to fire
+    // actually turns on. Firing is `lower < start <= now`: half-open, so an
+    // instant belongs to exactly one sweep and cannot be both fired and skipped.
+    let widen = chrono::Duration::seconds(spec.jitter_s.max(0));
+    let mut scan_from = since - widen;
+    let mut lower = since;
+    if let Some(owed) = owed_from {
+        scan_from = scan_from.min(owed);
+        lower = lower.min(spec.start_at(owed));
+    }
+    if let Some(f) = floor {
+        // The floor is a floor on the occurrence, never on the shifted bound,
+        // or jitter would let an occurrence from before a schedule change back
+        // in through the widening.
+        scan_from = scan_from.max(f);
+        // An occurrence just above a fresh floor can have a start instant
+        // behind the cursor, because a window arms early. Nothing above the
+        // floor has ever been considered, so the start bound gives way to it.
+        if f > lower {
+            lower = spec.start_at(f);
+        }
+    }
+
+    let (mut due, dropped) = spec.occurrences_between(scan_from, now, MAX_CATCH_UP)?;
 
     if dropped > 0 {
         // Never let a truncated list look like a complete one.
@@ -197,16 +244,50 @@ async fn consider(
         );
     }
 
-    // Anything whose start moment has not arrived yet waits for a later tick.
-    let ready: Vec<DateTime<Utc>> = due
+    // Look slightly into the future as well as the past, because a task with a
+    // run window has to START before its occurrence in order to be logged in
+    // and waiting when the barrier lifts. One occurrence is enough: a later one
+    // starts a whole period further on, so if this one's moment to begin has
+    // not arrived, neither has any other's. Counted outside MAX_CATCH_UP on
+    // purpose — the cap is there to bound a replay of the past, and sharing it
+    // with the lookahead is what let the future crowd the past out entirely.
+    if let Some(next) = spec.next_after(now)? {
+        if next <= now + chrono::Duration::seconds(MAX_ARM_EARLY_S) {
+            due.push(next);
+        }
+    }
+
+    // Select on the moment the run would begin, not on the occurrence. A task
+    // with jitter starts after its occurrence, so choosing by occurrence let a
+    // run whose jittered start landed past the end of the sweep fall between two
+    // sweeps and never happen at all.
+    let started: Vec<DateTime<Utc>> = due
         .iter()
         .copied()
-        .filter(|occ| now >= start_instant(task, spec, *occ))
+        .filter(|occ| {
+            let s = start_instant(task, spec, *occ);
+            s > lower && now >= s
+        })
         .collect();
 
-    let to_run: Vec<DateTime<Utc>> = if ready.is_empty() {
+    // An occurrence still ahead of us, whose run merely has to begin early, is
+    // not a late one. Keeping the two apart matters: the catch-up policy decides
+    // what to do about lateness, and an early start judged by it would be
+    // written off as missed while the computer was asleep.
+    let (ready, early): (Vec<DateTime<Utc>>, Vec<DateTime<Utc>>) =
+        started.into_iter().partition(|occ| *occ <= now);
+
+    // Whether these occurrences are being made up for rather than simply coming
+    // round. It decides both what the catch-up policy is asked and, further
+    // down, what happens when one of them meets a run already in progress.
+    let late = slept || ready.len() > 1 || owed_from.is_some();
+    let replaying = late && spec.catch_up == CatchUp::RunAll;
+
+    // Carried alongside each occurrence, because the lookahead entries appended
+    // afterwards are early rather than late and must not be treated as make-ups.
+    let mut to_run: Vec<(DateTime<Utc>, bool)> = if ready.is_empty() {
         vec![]
-    } else if slept || ready.len() > 1 {
+    } else if late {
         // Work out lateness from the single most recent occurrence rather than
         // from a possibly truncated list, so a long outage is judged correctly.
         let plan = match spec.catch_up {
@@ -227,12 +308,17 @@ async fn consider(
                 record_skip(state, task, spec, *missed, "missed_while_asleep").await?;
             }
         }
-        plan
+        plan.into_iter().map(|occ| (occ, true)).collect()
     } else {
-        ready
+        ready.into_iter().map(|occ| (occ, false)).collect()
     };
 
-    for occurrence in to_run {
+    to_run.extend(early.into_iter().map(|occ| (occ, false)));
+
+    // The first occurrence this sweep could not get to, if any.
+    let mut owed: Option<DateTime<Utc>> = None;
+    let queued = to_run.len();
+    for (position, (occurrence, making_up)) in to_run.into_iter().enumerate() {
         if spec.window_missed(occurrence, now)? {
             record_skip(state, task, spec, occurrence, "missed_window").await?;
             continue;
@@ -241,55 +327,132 @@ async fn consider(
         // interval would otherwise pile up agents on the same site, each with
         // its own browser and its own idea of what has been done.
         if let Some(busy) = errand_core::db::busy_run_for_task(state.pool(), &task.id).await? {
+            if replaying && making_up {
+                // A run that is being made up for has not had its turn yet, so
+                // it must not be written off as skipped. Recording a skip would
+                // spend the occurrence id, and a spent id can never run: asking
+                // for every missed run to be made up would deliver the first and
+                // silently destroy the rest. It waits instead, and the sweep
+                // that finds the task free picks up where this one stopped.
+                tracing::info!(
+                    task = %task.id,
+                    %busy,
+                    occurrence = %spec.occurrence_id(occurrence),
+                    waiting = queued - position,
+                    "a run being made up for is waiting for the one in progress; it keeps its place"
+                );
+                owed = Some(occurrence);
+                break;
+            }
             tracing::info!(task = %task.id, %busy, "still running; skipping this occurrence");
-            record_skip(state, task, spec, occurrence, "still_running").await?;
+            // A make-up that cannot be queued is not the task over-running, and
+            // must not be described as though it were: during the outage it did
+            // not run at all.
+            let code = if making_up {
+                "catch_up_collision"
+            } else {
+                "still_running"
+            };
+            record_skip(state, task, spec, occurrence, code).await?;
             continue;
         }
         fire(state, task, spec, occurrence).await?;
     }
 
-    // The countdown must show the moment the run will actually begin, which is
-    // the same expression the firing decision uses.
-    if let Some(next) = spec.next_after(now)? {
-        let shown = start_instant(task, spec, next);
-        errand_core::db::set_next_run_at(state.pool(), &task.id, &shown.to_rfc3339()).await?;
+    // Remember an unfinished replay, and forget one that has been drained. A
+    // second before the occurrence, because the scan that re-derives it starts
+    // strictly after this instant and the occurrence itself must survive it.
+    let backlog = owed.map(|o| o - chrono::Duration::seconds(1));
+    if backlog != owed_from {
+        set_backlog_cursor(state, &task.id, backlog).await?;
     }
+
+    // The countdown must show the moment the run will actually begin, which is
+    // the same expression the firing decision uses. Written every sweep, even
+    // when there is nothing left to come: a one-off that has been and gone has
+    // to clear its promise, or the task page goes on counting down to a moment
+    // in the past for as long as the task exists.
+    let shown = spec
+        .next_after(now)?
+        .map(|next| start_instant(task, spec, next).to_rfc3339());
+    errand_core::db::set_next_run_at(state.pool(), &task.id, shown.as_deref()).await?;
     Ok(())
 }
 
-/// The sweep cursor, raised to this task's catch-up floor.
+/// The earliest occurrence this task may still act on.
 ///
-/// Returns whichever is later. A task with no floor has been running against
-/// its current schedule all along and keeps the shared cursor unchanged.
-async fn catch_up_floor(
+/// `None` means no floor: the task has been running against its current
+/// schedule all along, so the shared sweep cursor is the only bound.
+async fn occurrence_floor(
     state: &AppState,
     task: &errand_core::models::Task,
-    since: DateTime<Utc>,
     now: DateTime<Utc>,
-) -> anyhow::Result<DateTime<Utc>> {
+) -> anyhow::Result<Option<DateTime<Utc>>> {
     let Some(stored) = errand_core::db::task_catch_up_floor(state.pool(), &task.id).await? else {
-        return Ok(since);
+        return Ok(None);
     };
     let Ok(floor) = stored.parse::<DateTime<Utc>>() else {
         // A floor nobody can read is not a reason to replay a week of history.
-        // Standing still until now means no catch-up for this task on this
-        // sweep; occurrences still to come are unaffected.
+        // Standing still at now means no catch-up for this task on this sweep;
+        // occurrences still to come are unaffected.
         tracing::warn!(
             task = %task.id,
             floor = %stored,
             "cannot read this task's catch-up floor, so nothing missed will be made up for it"
         );
-        return Ok(now.max(since));
+        return Ok(Some(now));
     };
-    Ok(since.max(floor))
+    Ok(Some(floor))
+}
+
+/// The settings row holding one task's unfinished catch-up.
+fn backlog_key(task_id: &str) -> String {
+    format!("scheduler.backlog.{task_id}")
+}
+
+/// The instant a catch-up replay for this task stopped at, if one is unfinished.
+///
+/// Occurrences after it are still owed. It exists because the sweep cursor is
+/// shared by every task and always moves on, so a make-up run that had to wait
+/// for the run in progress would otherwise be left behind it, unspent and
+/// unreachable — a run promised, never made, and never explained.
+async fn backlog_cursor(state: &AppState, task_id: &str) -> anyhow::Result<Option<DateTime<Utc>>> {
+    let Some(v) = errand_core::db::get_setting(state.pool(), &backlog_key(task_id)).await? else {
+        return Ok(None);
+    };
+    Ok(v.as_str()
+        .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+        .map(|d| d.with_timezone(&Utc)))
+}
+
+async fn set_backlog_cursor(
+    state: &AppState,
+    task_id: &str,
+    at: Option<DateTime<Utc>>,
+) -> anyhow::Result<()> {
+    let value = match at {
+        Some(d) => serde_json::Value::String(d.to_rfc3339()),
+        None => serde_json::Value::Null,
+    };
+    errand_core::db::set_setting(state.pool(), &backlog_key(task_id), &value).await
+}
+
+/// Drop any unfinished catch-up for this task, writing only if there was one.
+async fn forget_backlog(state: &AppState, task_id: &str) -> anyhow::Result<()> {
+    if backlog_cursor(state, task_id).await?.is_some() {
+        set_backlog_cursor(state, task_id, None).await?;
+    }
+    Ok(())
 }
 
 /// When a run for this occurrence should actually begin: early enough to be
 /// logged in before a window opens, plus this task's stable jitter.
 ///
-/// One expression, used both to decide when to fire and to display the
-/// countdown, so the time shown is the time it happens.
-fn start_instant(
+/// One expression, used by every writer of the time a task will next run — the
+/// sweep, the activate route, and `update_task` in core — so the time shown is
+/// the time it happens. Three separate versions of it is how the countdown came
+/// to jump the moment the scheduler first ticked.
+pub(crate) fn start_instant(
     task: &errand_core::models::Task,
     spec: &ScheduleSpec,
     occurrence: DateTime<Utc>,
@@ -393,7 +556,20 @@ async fn record_skip(
     .await
     {
         Ok(r) => r,
-        Err(errand_core::db::CreateRunError::AlreadyExists) => return Ok(()),
+        // The slot already has a run, so its history is not a blank — but the
+        // reason this sweep wanted to skip it is about to be thrown away, and
+        // that reason is the only thing that could explain a decision nobody
+        // else recorded. It goes to the log rather than nowhere.
+        Err(errand_core::db::CreateRunError::AlreadyExists) => {
+            tracing::info!(
+                task = %task.id,
+                name = %task.name,
+                occurrence = %occurrence_id,
+                reason = code,
+                "this occurrence already has a run, so the reason it was skipped was not recorded"
+            );
+            return Ok(());
+        }
         // A fault here would turn a skip that was meant to leave a record into
         // exactly the silent gap this function exists to prevent.
         Err(errand_core::db::CreateRunError::Other(e)) => {
@@ -414,6 +590,13 @@ async fn record_skip(
             "at once would each act without knowing what the other had done, so this one was not ",
             "started. If this keeps happening, the task is taking longer than the gap between its ",
             "runs."
+        )
+        .to_string(),
+        "catch_up_collision" => concat!(
+            "This one was missed while the computer was asleep or Errand was not running, and by ",
+            "the time it could have been made up for, another run of the same task was already ",
+            "going. Two at once would each act without knowing what the other had done, so this ",
+            "one was not started. Nothing about it went wrong; it simply lost its turn."
         )
         .to_string(),
         "missed_window" => format!(
@@ -464,16 +647,82 @@ mod tests {
     /// jump of a few minutes rather than waiting for an hour to come round.
     const EVERY_MINUTE: &str = "0 * * * * *";
 
+    /// Twice a minute: fast enough that a quarter of an hour of lookahead holds
+    /// far more occurrences than the catch-up cap, which is what used to leave
+    /// this schedule running nothing at all.
+    const EVERY_HALF_MINUTE: &str = "*/30 * * * * *";
+
     async fn put_on_schedule(api: &testkit::Api, id: &str, expr: &str, catch_up: &str) {
+        put_on_schedule_with(
+            api,
+            id,
+            json!({
+                "kind": "cron", "expr": expr, "tz": "UTC", "catch_up": catch_up
+            }),
+        )
+        .await;
+    }
+
+    async fn put_on_schedule_with(api: &testkit::Api, id: &str, schedule: serde_json::Value) {
         let (code, body) = api
-            .patch(
-                &format!("/v1/tasks/{id}"),
-                json!({ "schedule": {
-                    "kind": "cron", "expr": expr, "tz": "UTC", "catch_up": catch_up
-                }}),
-            )
+            .patch(&format!("/v1/tasks/{id}"), json!({ "schedule": schedule }))
             .await;
         assert_eq!(code, 200, "putting it on a schedule failed: {body}");
+    }
+
+    /// A run already under way, the way pressing "Run now" leaves one.
+    ///
+    /// Every test below keeps one of these in flight while it sweeps, so an
+    /// occurrence that is noticed leaves a record instead of starting a real
+    /// agent on the machine running the suite.
+    async fn a_run_in_flight(api: &testkit::Api, task_id: &str) -> String {
+        errand_core::db::try_create_run(
+            &api.pool,
+            task_id,
+            &format!("manual/{}", errand_core::new_id()),
+            "manual",
+            "normal",
+            None,
+        )
+        .await
+        .expect("a run")
+        .id
+    }
+
+    /// The occurrences this task has a row for, scheduled ones only.
+    async fn slots_recorded(api: &testkit::Api, task_id: &str) -> Vec<String> {
+        let runs = api.get(&format!("/v1/runs?task_id={task_id}")).await;
+        runs["items"]
+            .as_array()
+            .expect("a list of runs")
+            .iter()
+            .filter_map(|r| r["occurrence_id"].as_str())
+            .filter(|o| !o.starts_with("manual/"))
+            .map(|o| o.to_string())
+            .collect()
+    }
+
+    /// Keep a real agent out of the test suite.
+    ///
+    /// A sweep that fires spawns the executor, and the executor prefers
+    /// CLAUDE_BIN over anything installed. Pointing it at a script that does
+    /// nothing means a test can let a run actually start — which is the only way
+    /// to check that a missed run eventually happens — without launching an
+    /// agent on somebody's machine.
+    fn no_real_agent() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let stub =
+                std::env::temp_dir().join(format!("errand-no-agent-{}", errand_core::new_id()));
+            std::fs::write(&stub, "#!/bin/sh\nexit 0\n").expect("writing the stand-in agent");
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&stub, std::fs::Permissions::from_mode(0o755))
+                    .expect("making the stand-in agent runnable");
+            }
+            std::env::set_var("CLAUDE_BIN", &stub);
+        });
     }
 
     #[tokio::test]
@@ -540,6 +789,195 @@ mod tests {
         assert!(
             items.iter().all(|r| r["status"] == "skipped"),
             "this task skips what it misses, so nothing should have been run: {runs}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_that_comes_round_every_half_minute_is_not_ignored_for_ever() {
+        // The failure this guards against: the sweep looked back at what was
+        // missed and forward at what has to start early using ONE budget of
+        // twenty occurrences, and kept the newest twenty. A schedule this fast
+        // filled that budget entirely with occurrences that had not happened
+        // yet, so every slot that had come due was thrown out of the list before
+        // anything looked at it. The task sat there for ever, doing nothing,
+        // with nothing in its history to show for it.
+        let api = testkit::start().await;
+        let id = a_ready_manual_task(&api).await;
+        put_on_schedule(&api, &id, EVERY_HALF_MINUTE, "run_once_late").await;
+        let _busy = a_run_in_flight(&api, &id).await;
+
+        let later = Utc::now() + chrono::Duration::seconds(90);
+        tick(
+            &api.state,
+            later,
+            later - chrono::Duration::seconds(60),
+            false,
+        )
+        .await
+        .expect("the sweep ran");
+
+        assert!(
+            !slots_recorded(&api, &id).await.is_empty(),
+            "a slot that has come round must be acted on or explained, never ignored: {}",
+            api.get(&format!("/v1/runs?task_id={id}")).await
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_delayed_by_a_few_random_minutes_still_happens() {
+        // The failure this guards against: a task set to run "give or take" a
+        // few minutes was chosen by the moment it came due but started at the
+        // moment plus the delay, so any slot whose delayed start landed after
+        // the sweep that considered it fell between two sweeps. It never ran,
+        // was never skipped, and left nothing behind at all.
+        let api = testkit::start().await;
+        let id = a_ready_manual_task(&api).await;
+        put_on_schedule_with(
+            &api,
+            &id,
+            json!({
+                "kind": "cron", "expr": EVERY_MINUTE, "tz": "UTC",
+                "catch_up": "run_once_late", "jitter_s": 300
+            }),
+        )
+        .await;
+        let _busy = a_run_in_flight(&api, &id).await;
+
+        // Ten minutes of sweeps, twenty seconds apart, exactly as the daemon
+        // does them.
+        let start = Utc::now();
+        let mut previous = start;
+        for step in 1..=30 {
+            let now = start + chrono::Duration::seconds(20 * step);
+            tick(&api.state, now, previous, false)
+                .await
+                .expect("the sweep ran");
+            previous = now;
+        }
+
+        // Every slot in the first five minutes has had its latest possible
+        // start pass inside that stretch, so every one of them must have left a
+        // record.
+        let recorded = slots_recorded(&api, &id).await;
+        assert!(
+            recorded.len() >= 5,
+            "only {} of the first five slots left any trace; a delayed run must still happen or \
+             say why not: {:?}",
+            recorded.len(),
+            recorded
+        );
+    }
+
+    #[tokio::test]
+    async fn a_run_being_made_up_for_waits_its_turn_instead_of_being_thrown_away() {
+        // The failure this guards against: a task set to make up every missed
+        // run fired the first one and then met its own busy check on the
+        // second, which wrote each remaining slot off as skipped. A slot that
+        // has been written off can never run, so asking for all of them back
+        // delivered exactly one and destroyed the rest, quietly.
+        no_real_agent();
+        let api = testkit::start().await;
+        let id = a_ready_manual_task(&api).await;
+        put_on_schedule(&api, &id, EVERY_MINUTE, "run_all").await;
+        let busy = a_run_in_flight(&api, &id).await;
+
+        // Five minutes asleep, with a run already going when the machine wakes.
+        let later = Utc::now() + chrono::Duration::minutes(5);
+        tick(
+            &api.state,
+            later,
+            later - chrono::Duration::minutes(6),
+            true,
+        )
+        .await
+        .expect("the sweep ran");
+
+        let runs = api.get(&format!("/v1/runs?task_id={id}")).await;
+        assert!(
+            runs["items"]
+                .as_array()
+                .expect("a list of runs")
+                .iter()
+                .all(|r| r["status"] != "skipped"),
+            "a run waiting to be made up for must not be written off because another was still \
+             going: {runs}"
+        );
+
+        // The run that was in the way finishes, and the queue starts moving.
+        errand_core::db::finish_run_ok(&api.pool, &busy, "done")
+            .await
+            .expect("closing the run");
+        tick(
+            &api.state,
+            later + chrono::Duration::seconds(20),
+            later,
+            false,
+        )
+        .await
+        .expect("the second sweep ran");
+
+        let recorded = slots_recorded(&api, &id).await;
+        assert_eq!(
+            recorded.len(),
+            1,
+            "one missed run at a time, so the second cannot start before the first has finished: \
+             {recorded:?}"
+        );
+        // Oldest first: the slot that ran is from the start of the outage, not
+        // the end of it.
+        let spec = ScheduleSpec::from_json(&api.get(&format!("/v1/tasks/{id}")).await["schedule"])
+            .expect("a readable schedule");
+        assert!(
+            recorded[0] < spec.occurrence_id(later - chrono::Duration::minutes(3)),
+            "missed runs are made up for in the order they were missed, oldest first: {recorded:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_time_a_task_promises_to_run_does_not_move_when_the_sweep_looks_at_it() {
+        // The failure this guards against: putting a task on a schedule stored
+        // the moment it comes due, while the sweep stored the moment it really
+        // begins — the same moment plus this task's own small delay. The
+        // countdown on the task page therefore jumped the first time the
+        // scheduler ticked, by up to a quarter of an hour, with nothing having
+        // changed.
+        let api = testkit::start().await;
+        let id = a_ready_manual_task(&api).await;
+        put_on_schedule_with(
+            &api,
+            &id,
+            json!({
+                "kind": "cron", "expr": EVERY_MORNING, "tz": "UTC", "jitter_s": 900
+            }),
+        )
+        .await;
+
+        let (code, activated) = api
+            .post(&format!("/v1/tasks/{id}/activate"), json!({}))
+            .await;
+        assert_eq!(code, 200, "activating the task failed: {activated}");
+        let task = api.get(&format!("/v1/tasks/{id}")).await;
+        let promised = task["next_run_at"].clone();
+        assert_eq!(
+            activated["next_run_at"], promised,
+            "the answer to putting a task on a schedule must be the time it stores"
+        );
+        assert_eq!(
+            task["schedule_preview"][0], promised,
+            "the times a task lists must agree with the one it counts down to, or the same run is \
+             shown twice at two different times: {task}"
+        );
+
+        let now = Utc::now();
+        tick(&api.state, now, now - chrono::Duration::seconds(20), false)
+            .await
+            .expect("the sweep ran");
+
+        assert_eq!(
+            api.get(&format!("/v1/tasks/{id}")).await["next_run_at"],
+            promised,
+            "the time shown must be the time it happens, and must not move because the scheduler \
+             looked at it"
         );
     }
 }

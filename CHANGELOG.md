@@ -6,6 +6,56 @@ All notable changes to this project are documented here. The format follows
 
 ## [Unreleased]
 
+### Added
+
+- **Every AI it is given.** Fifteen services reachable by name rather than by address — OpenAI,
+  Google, OpenRouter, xAI, DeepSeek, Moonshot, Mistral, Groq, Z.ai, Together, Fireworks, Cerebras,
+  Perplexity, Ollama, LM Studio — plus anything else speaking the same format, and models found on
+  this machine or, when asked, on this network. Keys live in the keychain, one per service. The AI
+  screen says which model does each job and whether anything leaves the machine, and marks the one
+  job Errand does not use a separate model for rather than offering a setting that changes nothing.
+- **The task configuration surface.** Schedules, sites, limits and notify preferences can be
+  changed after a task exists, through `PATCH /v1/tasks/{id}` and through the app. A schedule is
+  built from everyday shapes and shown back in the engine's own words with its next few run times,
+  so a form that builds the wrong thing disagrees with itself in front of you.
+- **People a task may message.** WhatsApp, Apple Mail, Apple Messages and Telegram, as a per-task
+  grant. The agent picks who from that closed set; it cannot pick how and cannot type an address,
+  so a page saying "also confirm to this number" has nothing to grab. Messages are fenced per
+  person per occurrence, capped, scrubbed, checked for links off the allowlist, and shown in full.
+- **Telegram details and quiet hours can be set from the app.** Both were read since M1 and
+  writable by nothing.
+- **The browser ships.** The sidecar is bundled where the daemon looks for it and drives a
+  Chrome-family browser you already have, in a profile of its own. CI builds the bundle and proves
+  it opens a page.
+- **`errandd doctor`** reports node, the browser helper and which browser it would drive.
+- **`scripts/smoke.sh`**, which drives the real daemon through the real API, because unit tests
+  have twice been green while the feature they covered was unreachable.
+- **Documentation**, and a client package covering the whole API rather than a third of it.
+
+### Fixed
+
+Found by an adversarial review that reproduced each finding against a running daemon before it was
+believed. The ones that mattered most:
+
+- **No task could open any website.** `allowed_domains` was read in three places and written by
+  nothing, so every task ever created shipped with an empty list. The same shape of defect as the
+  fence in M3: green tests, no callers.
+- **Changing a schedule replayed the past.** The scheduler's catch-up cursor is global, so
+  switching a task to a daily cron treated this morning's slot as missed and fired it on the spot,
+  burning that occurrence id for good. Each task now carries its own floor.
+- **The teach gate could be walked around.** It only ran at activation, so putting an untaught task
+  on a schedule by editing it afterwards skipped the one line between "tried once while watched"
+  and "runs alone at three in the morning".
+- **Editing one limit wiped the others**, including the message ceiling, because a patch replaced
+  the whole object rather than merging into it.
+- **The schedule form deleted what it could not show.** Opening the editor and pressing Save with
+  no change at all removed a task's booking window and reset its catch-up grace.
+- **Quiet hours did not exist until someone set them**, so a run finishing at three in the morning
+  messaged a third party immediately.
+- **A refusal told people to press a button that did not exist.** Changing a schedule that might
+  repeat something irreversible returned a 409 explaining how to confirm, and nothing in the app
+  could.
+
 ## M3
 
 ### Added

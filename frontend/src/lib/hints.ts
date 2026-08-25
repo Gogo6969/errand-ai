@@ -281,6 +281,13 @@ export const hints = {
   "task.save_sites": {
     short: "Save the list. It takes effect on the next run.",
   },
+  "task.confirm_repeat": {
+    short: "Change the schedule anyway, knowing it might do the same thing twice.",
+    long:
+      "Errand fences anything irreversible against the slot it was done for. Moving that slot " +
+      "means the new one looks untouched, so work already done for the old one can happen again. " +
+      "Check the site first if that would matter.",
+  },
   "task.cancel_edit": {
     short: "Leave it as it was. Nothing you typed is saved.",
   },

@@ -156,6 +156,35 @@ expect "and the next run it promises is in the future" \
   "(lambda n: n is None or n > __import__('datetime').datetime.now(__import__('datetime').timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ'))(d.get('next_run_at'))"
 
 # ---------------------------------------------------------------------------
+head2 "Editing a schedule does not quietly delete the parts the form cannot show"
+# The schedule editor builds a spec from five fields. A booking window and a
+# catch-up grace can only be set through the API, so a save from the form must
+# carry them across rather than dropping them — a task that armed five minutes
+# early would otherwise stop doing so with nothing said.
+
+api PATCH "/v1/tasks/$TID" '{"schedule":{"kind":"cron","expr":"0 0 8 * * MON","tz":"UTC","catch_up_grace_min":1440,"window":{"not_before":"08:00","not_after":"09:00","arm_early_s":300}}}' >/dev/null
+WITH=$(api GET "/v1/tasks/$TID" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("schedule_describes",""))')
+# Exactly what the form sends back: the five fields it models, plus what it carries.
+api PATCH "/v1/tasks/$TID" '{"schedule":{"kind":"cron","expr":"0 0 8 * * MON","tz":"UTC","catch_up":"run_once_late","jitter_s":0,"catch_up_grace_min":1440,"window":{"not_before":"08:00","not_after":"09:00","arm_early_s":300}}}' >/dev/null
+AFTER=$(api GET "/v1/tasks/$TID" | python3 -c 'import sys,json;print(json.load(sys.stdin).get("schedule_describes",""))')
+if [ "$WITH" = "$AFTER" ]; then
+  ok "a save that changes nothing really changes nothing"
+else
+  bad "re-saving the same schedule altered it" "was: $WITH"$'\n'"      now: $AFTER"
+fi
+
+# ---------------------------------------------------------------------------
+head2 "Editing one limit does not wipe the others"
+# A PATCH of a single limit must not drop the message ceiling, which is what
+# stops a run messaging everyone it can reach.
+
+api PATCH "/v1/tasks/$TID" '{"limits":{"max_steps":40,"max_minutes":10,"max_usd":0.25,"max_heal_cycles":1,"max_messages":2}}' >/dev/null
+api PATCH "/v1/tasks/$TID" '{"limits":{"max_usd":2.0}}' >/dev/null
+expect "changing the money ceiling leaves the message ceiling alone" \
+  "$(api GET "/v1/tasks/$TID")" \
+  "d.get('limits',{}).get('max_messages')==2 and d.get('limits',{}).get('max_usd')==2.0"
+
+# ---------------------------------------------------------------------------
 head2 "An untaught task cannot be put on a schedule behind the gate's back"
 # activate() refuses an untaught task only when it is already scheduled, so a
 # PATCH onto a cron must apply the same rule or it becomes the way round it.

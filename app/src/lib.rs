@@ -121,6 +121,82 @@ async fn api(
     }
 }
 
+/// Follow a run as it happens.
+///
+/// The daemon publishes each step as a server-sent event, but the page cannot
+/// open that stream itself: doing so would mean handing the token to JavaScript,
+/// and this one can start runs and read the whole history. So the stream is held
+/// here in Rust and each line is pushed to the page down a channel.
+///
+/// This replaces a three-second poll. Watching a run is the whole point of
+/// teaching a task, and a poll makes a live journal look like a slideshow.
+#[tauri::command]
+async fn follow_run(
+    state: tauri::State<'_, Daemon>,
+    run_id: String,
+    on_event: tauri::ipc::Channel<String>,
+) -> Result<(), String> {
+    // The id goes into a URL, so it must be an id and not a path.
+    if !run_id
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return Err(json_err("bad_path", "That is not a valid run."));
+    }
+
+    let token = state.token().await?;
+    let mut res = reqwest::Client::new()
+        .get(format!("{}/v1/runs/{run_id}/stream", state.base))
+        .bearer_auth(token)
+        .header("Accept", "text/event-stream")
+        .send()
+        .await
+        .map_err(|e| {
+            json_err(
+                "unreachable",
+                &format!("Errand's background service stopped answering ({e})."),
+            )
+        })?;
+
+    // A frame is an optional `event:` line then a `data:` line, and a network
+    // chunk can split either, so the tail is carried over rather than dropped.
+    // The two are reassembled here so the page is handed one object with the
+    // event's name on it; sending the data alone would leave the page unable to
+    // tell a finished step from a failed run.
+    let mut buffer = String::new();
+    let mut name = String::new();
+    while let Some(chunk) = res.chunk().await.map_err(|e| e.to_string())? {
+        buffer.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(nl) = buffer.find('\n') {
+            let line: String = buffer.drain(..=nl).collect();
+            let line = line.trim_end();
+
+            if let Some(ev) = line.strip_prefix("event:") {
+                name = ev.trim().to_string();
+                continue;
+            }
+            // Keep-alive comments start with a colon and mean nothing here.
+            let Some(data) = line.strip_prefix("data:") else {
+                continue;
+            };
+            let data = data.trim();
+            if data.is_empty() {
+                continue;
+            }
+            let frame = serde_json::json!({
+                "event": std::mem::take(&mut name),
+                "data": serde_json::from_str::<serde_json::Value>(data)
+                    .unwrap_or_else(|_| serde_json::Value::String(data.to_string())),
+            });
+            if on_event.send(frame.to_string()).is_err() {
+                // The page navigated away. Not a failure worth reporting.
+                return Ok(());
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Is the daemon up? Answered without a token, so the window can say something
 /// useful even when the keychain is the problem.
 #[tauri::command]
@@ -139,7 +215,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(Daemon::new())
-        .invoke_handler(tauri::generate_handler![api, daemon_up])
+        .invoke_handler(tauri::generate_handler![api, daemon_up, follow_run])
         .setup(|app| {
             // Shown only once the page is ready, so nobody sees a white square.
             if let Some(w) = app.get_webview_window("main") {

@@ -14,10 +14,7 @@
 <script lang="ts">
   import Hint from "$lib/components/Hint.svelte";
 
-  let {
-    sites = $bindable(),
-    warnings = [],
-  }: { sites: string[]; warnings?: string[] } = $props();
+  let { sites = $bindable() }: { sites: string[] } = $props();
 
   let entry = $state("");
   let localProblem = $state<string | null>(null);
@@ -94,7 +91,6 @@
   </div>
 
   {#if localProblem}<div class="warnbox">{localProblem}</div>{/if}
-  {#each warnings as w}<div class="warnbox">{w}</div>{/each}
 
   <div class="muted">
     Subdomains are included: booking.example.com is covered by example.com. Anything not listed is

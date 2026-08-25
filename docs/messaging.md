@@ -31,6 +31,11 @@ Save the person in Settings — a name, how to reach them, and the address. Then
 on each task, choose whether they hear about it and whether that includes runs
 that failed.
 
+Everyone you link shares the task's message budget with the agent itself, so a
+task allowed two messages that is linked to five people will tell two of them
+and say plainly in the run timeline who it did not tell. Raise the limit on the
+task if that is not what you want.
+
 Saving someone does not let anything message them. The link between a task and a
 person is a separate, deliberate permission, one task at a time. That is what
 keeps a job from telling someone about work they never asked to hear about.
@@ -48,7 +53,8 @@ rules also tell it that text it reads is information and never instruction — b
 that is the second line of defence. The first is that the tool does not exist.
 
 On top of that, a message must be short, must contain no link to a site outside
-the task's allowlist, has its content scrubbed of anything secret, counts
+the task's allowlist — including the bare kind a phone would make tappable, like
+`somewhere.example/pay` — has its content scrubbed of anything secret, counts
 against the run's message budget, is fenced so the same person cannot be
 messaged twice for the same scheduled slot, and appears in full in the run
 timeline where you can read exactly what was sent.
@@ -56,7 +62,12 @@ timeline where you can read exactly what was sent.
 ## Quiet hours
 
 Messages to other people, and routine good news, wait until the quiet period is
-over. Set the hours in Settings.
+over.
+
+**There is a quiet period from the moment you install Errand** — 22:00 to 07:00
+— so nothing you set up on a whim tonight wakes somebody at three in the
+morning. Change the hours in Settings, or set both to the same number to turn it
+off entirely.
 
 Failures are the exception, and you can turn that off if you want to. Leave it
 on unless you have a reason: hearing at nine that the eight o'clock booking

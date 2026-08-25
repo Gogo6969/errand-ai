@@ -1,27 +1,41 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { page } from "$app/state";
-  import { api, statusLabel, ApiError } from "$lib/api";
+  import { api, followRun, statusLabel, ApiError } from "$lib/api";
   import Hint from "$lib/components/Hint.svelte";
 
   const id = page.params.id!;
   let run = $state<any>(null);
   let problem = $state<string | null>(null);
+  let stop: (() => void) | undefined;
   let timer: any;
+
+  const FINISHED = ["succeeded", "failed", "cancelled", "skipped"];
 
   async function load() {
     try { run = await api.runDetail(id); problem = null; }
     catch (e) { problem = e instanceof ApiError ? e.message : String(e); }
   }
+
   onMount(() => {
     load();
-    // A run in flight is worth watching, so refresh while it is going.
+    // Each step arrives as it happens rather than up to three seconds later,
+    // which matters most while you are watching a task being taught.
+    stop = followRun(id, () => load());
+
+    // A slow safety net, not the mechanism. If the stream drops — the daemon
+    // restarts mid-run, say — a stalled page would otherwise look like a
+    // stalled run, which is the more alarming of the two.
     timer = setInterval(() => {
-      if (!run || ["succeeded","failed","cancelled","skipped"].includes(run.status)) return;
+      if (!run || FINISHED.includes(run.status)) return;
       load();
-    }, 3000);
+    }, 20000);
   });
-  onDestroy(() => clearInterval(timer));
+
+  onDestroy(() => {
+    stop?.();
+    clearInterval(timer);
+  });
 </script>
 
 {#if problem}<div class="err"><h3>Could not load that run</h3><div>{problem}</div></div>{/if}

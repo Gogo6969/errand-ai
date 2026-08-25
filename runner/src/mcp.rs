@@ -844,17 +844,36 @@ fn looks_like_a_secret(text: &str) -> bool {
     no_spaces && has_digit && (has_upper || has_sym) && text.len() >= 10
 }
 
-fn apex_of(host: &str) -> String {
+/// Which browser profile a task's logins live in.
+///
+/// This has to agree with the allowlist rule, because the profile is claimed
+/// from the task's first allowed site: two tasks that come out with the same
+/// identity share a profile, and so share whatever is signed in inside it. A
+/// hand-written list of two-level endings used to live here, it did not match
+/// the one core owns, and so every task on a .co.nz or .co.za address collapsed
+/// onto one profile — one person's shop account sitting in the browser another
+/// task opens.
+///
+/// So the question is put to core rather than answered a second time here.
+/// `PUBLIC_SUFFIXES` is private to core/src/domains.rs, but the rule built on it
+/// is not: `normalize_domain` accepts example.co.uk and refuses a bare co.uk. An
+/// ending core will not allow on its own cannot identify a profile either, so
+/// one more label is taken. One list, and it lives in core.
+fn profile_identity(host: &str) -> String {
+    // Not registrable names, and nothing here to shorten. Joining the last two
+    // pieces of 127.0.0.1 gives "0.1", which every machine on the network would
+    // then share a profile under.
+    if host == "localhost" || host.starts_with('[') || host.parse::<std::net::Ipv4Addr>().is_ok() {
+        return host.to_string();
+    }
     let parts: Vec<&str> = host.split('.').filter(|p| !p.is_empty()).collect();
     if parts.len() <= 2 {
         return host.to_string();
     }
     let two = parts[parts.len() - 2..].join(".");
-    const TWO_LEVEL: &[&str] = &["co.uk", "org.uk", "ac.uk", "com.au", "co.jp", "com.br"];
-    if TWO_LEVEL.contains(&two.as_str()) && parts.len() >= 3 {
-        parts[parts.len() - 3..].join(".")
-    } else {
-        two
+    match errand_core::domains::normalize_domain(&two) {
+        Ok(apex) => apex,
+        Err(_) => parts[parts.len() - 3..].join("."),
     }
 }
 
@@ -886,7 +905,7 @@ async fn open_browser(state: &AppState, run_id: &str) -> anyhow::Result<String> 
         );
     }
 
-    let apex = apex_of(&allowed[0]);
+    let apex = profile_identity(&allowed[0]);
     let (_pid, dir_name) =
         errand_core::db::claim_browser_profile(state.pool(), &apex, run_id).await?;
     let profile_dir = errand_core::paths::data_root()?.join(dir_name);
@@ -1305,7 +1324,11 @@ fn allowed_domains(task: &errand_core::models::Task) -> Vec<String> {
 }
 
 /// How many messages this run has sent so far.
-async fn messages_this_run(state: &AppState, run_id: &str) -> i64 {
+///
+/// Counted from the journal, which is the one place both the agent's own sends
+/// and the automatic end-of-run report write to. Anything that counts from
+/// somewhere else is a second budget, and two budgets are no budget.
+pub(crate) async fn messages_this_run(state: &AppState, run_id: &str) -> i64 {
     errand_core::db::list_steps(state.pool(), run_id)
         .await
         .map(|s| s.iter().filter(|x| x.kind == "message").count() as i64)
@@ -1384,41 +1407,99 @@ fn is_invisible(c: char) -> bool {
 
 /// Every link in a piece of text, as a URL with a scheme on it.
 ///
-/// Only the two shapes that are actually clickable when they arrive: something
-/// beginning http:// or https://, and a bare www. host. A domain merely named
-/// in a sentence is left alone, because refusing "I checked the club's website"
-/// would help nobody.
+/// Three shapes, because all three are clickable by the time they reach the
+/// person. Something written out with http:// or https://. A bare www. host.
+/// And the one that matters most, because it is what a link lifted off a page
+/// actually looks like: a plain host with a path on it, `refund-check.example/pay`
+/// or `bit.example/xy9`, which every chat client and every mail client turns
+/// into a tappable link at the moment it arrives.
+///
+/// A domain merely named in a sentence is still left alone, because refusing "I
+/// checked the club's website" would help nobody. The path is what separates the
+/// two: an address somebody is meant to open has one, a site mentioned in
+/// passing does not.
+///
+/// What counts as a host is decided by `errand_core::domains`, the same code
+/// that decided what the task's allowlist means, so the extractor and the
+/// allowlist cannot form different opinions about the same string. It is also
+/// what keeps ordinary writing out of here: core reads "3.5" as a machine
+/// address and refuses it, so "£3.50/kg" is a price and not a link.
+///
+/// Known and deliberate: a bare IP address with a path is not extracted, since
+/// the last-label rule is what stops a decimal number reading as a host. A
+/// message pointing somebody at one would go out.
 fn links_in(text: &str) -> Vec<String> {
-    const MARKS: &[&str] = &["http://", "https://", "www."];
-    // Lowercasing ASCII never changes a byte's width, so an index into one of
-    // these strings is the same index into the other.
-    let lower = text.to_ascii_lowercase();
+    const SCHEMES: &[&str] = &["http://", "https://"];
     let mut out = Vec::new();
-    let mut i = 0;
-    while i < lower.len() {
-        let Some((start, mark)) = MARKS
-            .iter()
-            .filter_map(|m| lower[i..].find(m).map(|p| (i + p, *m)))
-            .min_by_key(|(p, _)| *p)
-        else {
-            break;
-        };
-        let end = text[start..]
-            .find(|c: char| {
-                c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']')
-            })
-            .map(|o| start + o)
-            .unwrap_or(text.len());
+    for raw in text.split(|c: char| {
+        c.is_whitespace() || matches!(c, '<' | '>' | '"' | '\'' | '(' | ')' | '[' | ']')
+    }) {
         // Sentence punctuation clings to the end of a pasted link.
-        let token = text[start..end].trim_end_matches(['.', ',', ';', ':', '!', '?']);
-        if token.len() > mark.len() {
-            out.push(if mark == "www." {
-                format!("https://{token}")
-            } else {
-                token.to_string()
-            });
+        let token = raw.trim_end_matches(['.', ',', ';', ':', '!', '?']);
+        if token.is_empty() {
+            continue;
         }
-        i = end.max(start + mark.len());
+        // Lowercasing ASCII never changes a byte's width, so an index into one
+        // of these strings is the same index into the other.
+        let lower = token.to_ascii_lowercase();
+
+        // Written out with a scheme, wherever in the token it begins.
+        if let Some(at) = SCHEMES.iter().filter_map(|m| lower.find(m)).min() {
+            let link = &token[at..];
+            // A scheme with nothing after it addresses nothing.
+            if link
+                .split_once("://")
+                .is_some_and(|(_, rest)| !rest.is_empty())
+            {
+                out.push(link.to_string());
+            }
+            continue;
+        }
+
+        // A bare www host, with or without a path. Still found anywhere in the
+        // token rather than only at its start, which is how it has always
+        // behaved; narrowing it would mean quietly missing a link.
+        if let Some(at) = lower.find("www.") {
+            let link = &token[at..];
+            if link.len() > "www.".len() {
+                out.push(format!("https://{link}"));
+            }
+            continue;
+        }
+
+        // An address, not a link. Refusing x@d.example would refuse writing
+        // somebody's email address down.
+        if token.contains('@') {
+            continue;
+        }
+        let Some(slash) = token.find('/') else {
+            continue;
+        };
+        let (host, path) = token.split_at(slash);
+        // A port is not part of the name; core strips it too, and the labels
+        // have to be read without it.
+        let labels = host
+            .split(':')
+            .next()
+            .unwrap_or_default()
+            .trim_end_matches('.');
+        if !labels.contains('.') {
+            continue;
+        }
+        // The last label of a real address is letters — .com, .uk, .example.
+        // Without this, "3.5/5" and "p.12/13" read as addresses, and a message
+        // written in ordinary English never reaches the person it was for.
+        let last = labels.rsplit('.').next().unwrap_or_default();
+        if last.len() < 2 || !last.chars().all(|c| c.is_ascii_alphabetic()) {
+            continue;
+        }
+        // Core has the final say on whether this is a name at all, and hands
+        // back the exact string the allowlist stores, punycode and all. Comparing
+        // anything else would be a second opinion about what a domain is.
+        let Ok(normalised) = errand_core::domains::normalize_domain(host) else {
+            continue;
+        };
+        out.push(format!("https://{normalised}{path}"));
     }
     out
 }
@@ -1481,6 +1562,40 @@ const REPEAT_WINDOW_MIN: i64 = 10;
 enum Guard {
     Proceed(String),
     Refuse(String),
+}
+
+/// Was this person written to a few minutes ago, for a different occurrence?
+///
+/// A scheduled slot is protected by the fence itself, but pressing Run now twice
+/// mints a fresh slot each time, so nothing else would stop the same person being
+/// told the same thing twice in a minute.
+///
+/// Both message paths ask through here rather than each keeping its own copy of
+/// the question: the agent's own `message_person`, and the automatic end-of-run
+/// report in the outbox. Only one of them had the check, which is precisely how
+/// the gap opened, so a second copy of the window or the query is the thing to
+/// avoid. Returns when it happened and what was recorded, for whoever has to
+/// explain it afterwards.
+pub(crate) async fn messaged_moments_ago(
+    state: &AppState,
+    task_id: &str,
+    person_id: &str,
+    occurrence_id: &str,
+) -> anyhow::Result<Option<(String, Option<String>)>> {
+    let recent = errand_core::db::recent_commit(
+        state.pool(),
+        task_id,
+        "message",
+        person_id,
+        REPEAT_WINDOW_MIN,
+    )
+    .await?;
+    match recent {
+        Some((prev_occurrence, at, evidence)) if prev_occurrence != occurrence_id => {
+            Ok(Some((at, evidence)))
+        }
+        _ => Ok(None),
+    }
 }
 
 /// Ask the fence whether this run may do something irreversible.
@@ -1583,34 +1698,23 @@ async fn guard_message(
 
     Ok(match verdict {
         FenceVerdict::Armed(id) => {
-            // A scheduled slot is protected by the fence itself, but pressing
-            // Run now twice mints a fresh slot each time, so nothing else would
-            // stop the same person being told the same thing twice in a minute.
-            if let Some((prev_occurrence, at, evidence)) = errand_core::db::recent_commit(
-                state.pool(),
-                &run.task_id,
-                "message",
-                &person.id,
-                REPEAT_WINDOW_MIN,
-            )
-            .await?
+            if let Some((at, evidence)) =
+                messaged_moments_ago(state, &run.task_id, &person.id, &run.occurrence_id).await?
             {
-                if prev_occurrence != run.occurrence_id {
-                    let _ = errand_core::db::abort_side_effect(
-                        state.pool(),
-                        &id,
-                        "this person had just been messaged",
-                    )
-                    .await;
-                    return Ok(Guard::Refuse(format!(
-                        "This task messaged {} at {at}, only minutes ago: {}. Writing to them \
-                         again now would almost certainly repeat it, so it has been stopped. Do \
-                         not look for another way round this. Report that they appear to have \
-                         been told already and carry on.",
-                        person.label,
-                        evidence.unwrap_or_else(|| "no details recorded".into())
-                    )));
-                }
+                let _ = errand_core::db::abort_side_effect(
+                    state.pool(),
+                    &id,
+                    "this person had just been messaged",
+                )
+                .await;
+                return Ok(Guard::Refuse(format!(
+                    "This task messaged {} at {at}, only minutes ago: {}. Writing to them again \
+                     now would almost certainly repeat it, so it has been stopped. Do not look \
+                     for another way round this. Report that they appear to have been told \
+                     already and carry on.",
+                    person.label,
+                    evidence.unwrap_or_else(|| "no details recorded".into())
+                )));
             }
             Guard::Proceed(id)
         }
@@ -2199,18 +2303,151 @@ mod tests {
     #[test]
     fn a_link_is_found_however_it_is_written() {
         let found = links_in(
-            "see https://a.example/x, or www.b.example. Not c.example. mail me at x@d.example \
-             (https://e.example)",
+            "see https://a.example/x, or www.b.example. Not c.example. But c.example/x is one. \
+             mail me at x@d.example (https://e.example)",
         );
         assert_eq!(
             found,
             vec![
                 "https://a.example/x",
                 "https://www.b.example",
+                "https://c.example/x",
                 "https://e.example"
             ],
-            "a plain domain in a sentence is not a link, but a written-out one always is"
+            "a site merely named in a sentence is not a link; the same name with a path on it is \
+             exactly what a chat client makes tappable"
         );
+    }
+
+    /// Bodies that must never leave, and bodies that must.
+    ///
+    /// Both halves matter equally, and the second half is the one that is easy
+    /// to forget: a link that gets through sends a person to a page a stranger
+    /// chose, and a sentence wrongly read as a link is a message that never
+    /// reaches them at all.
+    #[test]
+    fn an_address_a_client_would_make_tappable_is_refused_and_ordinary_writing_is_not() {
+        let allowed = vec!["shop.example".to_string(), "tennis-club.co.uk".to_string()];
+
+        // Each of these arrives on a phone as something to tap. The second
+        // column is the address the person would have been sent to.
+        let must_not_go_out = [
+            (
+                "The order needs confirming at secure-refund-check.example/verify",
+                "secure-refund-check.example",
+            ),
+            ("Track the parcel here: bit.example/xy9", "bit.example"),
+            ("Confirm at EVIL.example/pay before Friday", "evil.example"),
+            ("Details are at evil.example:8443/pay", "evil.example"),
+            (
+                "Sort it out (refund-check.example/now)",
+                "refund-check.example",
+            ),
+            ("Pay the balance at evil.example/", "evil.example"),
+            ("See https://evil.example/pay", "evil.example"),
+            ("See www.evil.example", "www.evil.example"),
+            (
+                "It moved to shop.example.evil.example/basket",
+                "shop.example.evil.example",
+            ),
+        ];
+        for (body, address) in must_not_go_out {
+            let problem = message_body_problem(body, &allowed)
+                .unwrap_or_else(|| panic!("this would have gone out exactly as it is: {body:?}"));
+            assert!(
+                problem.contains(address),
+                "the refusal has to name the address it found, or nobody can act on it: {problem}"
+            );
+        }
+
+        // Ordinary sentences. Every one of these has to reach the person.
+        let must_go_out = [
+            "I booked it. Done.",
+            "The shopping is ordered. It arrives Friday.",
+            "It came to £3.50/kg, which is up on last week.",
+            "The reviews rate it 3.5/5, so I went ahead.",
+            "Ready Mon/Tue, whichever suits.",
+            "We split it 50/50.",
+            "See p.12/13 of the booklet they sent.",
+            "Ask for Dr Smith w/ the referral letter.",
+            "The reference is AB.12/C if they ask.",
+            "e.g./i.e. either wording is fine.",
+            "Open 24/7 over the bank holiday.",
+            "I checked the club's website, tennis-club.co.uk, and it was fine.",
+            "Write to mum@shop.example if any of that is wrong.",
+            // On the task's own list, so it is allowed to be there.
+            "It is all on shop.example/basket if you want a look.",
+            "See https://shop.example/basket",
+            "Court 4 is booked at bookings.tennis-club.co.uk/court4.",
+        ];
+        for body in must_go_out {
+            assert!(
+                message_body_problem(body, &allowed).is_none(),
+                "an ordinary sentence was refused, so the person was told nothing at all: \
+                 {body:?} -> {:?}",
+                message_body_problem(body, &allowed)
+            );
+        }
+    }
+
+    // ------------------------------------------- which browser profile is used --
+
+    #[test]
+    fn two_sites_that_share_only_an_ending_do_not_share_a_browser_profile() {
+        // What this replaces: a list written out here by hand had no .co.nz in
+        // it, so both of these came out as "co.nz" and one household's shop
+        // account sat signed in inside the browser the other task opened.
+        assert_eq!(profile_identity("tennis-club.co.nz"), "tennis-club.co.nz");
+        assert_ne!(
+            profile_identity("tennis-club.co.nz"),
+            profile_identity("powershop.co.nz")
+        );
+        assert_ne!(
+            profile_identity("bank.co.za"),
+            profile_identity("shop.co.za")
+        );
+    }
+
+    #[test]
+    fn a_subdomain_uses_the_profile_its_own_site_is_signed_in_to() {
+        assert_eq!(profile_identity("example.com"), "example.com");
+        assert_eq!(profile_identity("shop.eu.example.com"), "example.com");
+        assert_eq!(
+            profile_identity("bookings.tennis-club.co.uk"),
+            "tennis-club.co.uk"
+        );
+    }
+
+    #[test]
+    fn a_machine_address_is_not_shortened_into_something_every_machine_shares() {
+        // "0.1" is what 127.0.0.1 used to be filed under, along with everything
+        // else whose address happens to end that way.
+        assert_eq!(profile_identity("127.0.0.1"), "127.0.0.1");
+        assert_eq!(profile_identity("localhost"), "localhost");
+        assert_eq!(profile_identity("[::1]"), "[::1]");
+    }
+
+    #[test]
+    fn the_browser_profile_and_the_allowlist_never_disagree_about_where_a_name_begins() {
+        // Each kept its own list of the endings that belong to everybody rather
+        // than to somebody, and the two did not match. This asserts the property
+        // rather than the list, so it goes on holding when core's list changes.
+        for ending in [
+            "co.uk", "org.uk", "ac.uk", "com.au", "co.jp", "com.br", "co.nz", "co.za", "gov.uk",
+            "com", "example",
+        ] {
+            let host = format!("shop.example.{ending}");
+            let core_refuses_the_bare_ending =
+                errand_core::domains::normalize_domain(ending).is_err();
+            let profile_keeps_the_whole_name =
+                profile_identity(&host) == format!("example.{ending}");
+            assert_eq!(
+                core_refuses_the_bare_ending, profile_keeps_the_whole_name,
+                "'{ending}': the allowlist and the browser profile disagree about whether anybody \
+                 can register under this, which is how two unrelated tasks came to share one \
+                 browser"
+            );
+        }
     }
 
     #[test]

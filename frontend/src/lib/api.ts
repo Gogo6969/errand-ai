@@ -6,7 +6,7 @@
  * in the page, readable by anything that ends up running there, and this one
  * can start runs and read your task history.
  */
-import { invoke } from "@tauri-apps/api/core";
+import { Channel, invoke } from "@tauri-apps/api/core";
 
 export interface Task {
   id: string;
@@ -90,6 +90,27 @@ async function call<T>(method: string, path: string, body?: unknown): Promise<T>
       throw new ApiError("unreachable", text);
     }
   }
+}
+
+/**
+ * Follow a run as it happens.
+ *
+ * The page cannot open the daemon's event stream itself — that would mean
+ * holding the API token in JavaScript — so Rust holds it and pushes each event
+ * down a channel. Returns a function that stops listening.
+ */
+export function followRun(runId: string, onEvent: (e: { event: string; data: unknown }) => void) {
+  const channel = new Channel<string>();
+  let stopped = false;
+  channel.onmessage = (raw) => {
+    if (stopped) return;
+    try { onEvent(JSON.parse(raw)); }
+    catch { /* a frame we do not understand is not worth breaking the page over */ }
+  };
+  invoke("follow_run", { runId, onEvent: channel }).catch(() => {
+    // The stream ending is normal: the run finished, or the window moved on.
+  });
+  return () => { stopped = true; };
 }
 
 export const api = {

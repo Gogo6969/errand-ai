@@ -1,0 +1,163 @@
+# The API
+
+Errand's own window is a client of this API, which is the only reliable way to
+keep an integration API honest: if a screen can do it, so can you.
+
+```
+http://127.0.0.1:4477
+```
+
+Loopback only. Use the numeric address rather than `localhost` — the listener is
+IPv4, and `localhost` resolves to IPv6 first on some systems, which fails in a
+way that looks like the daemon being down.
+
+## Authenticating
+
+Every request but `/v1/health` needs a bearer token.
+
+```bash
+curl -H "Authorization: Bearer $(errandd token)" http://127.0.0.1:4477/v1/tasks
+```
+
+Mint one for another program with `POST /v1/tokens`, and give it only the scopes
+it needs. Errand stores a hash, so a token is shown once and never again.
+
+| Scope | Lets the holder |
+|---|---|
+| `read` | See tasks, runs and settings |
+| `run` | Start a run |
+| `webhook` | Subscribe to events |
+| `approve` | Approve a plan, resolve a hold, let a task message a person |
+| `manage` | Create and change tasks, credentials, channels, models |
+| `admin` | Everything, including tokens |
+
+`approve` is separate from `manage` on purpose. Approving a plan and letting a
+task message someone both decide whether a real, irreversible thing happens.
+
+Errors come back as `{ "code": "...", "title": "...", "detail": "..." }`, and
+`detail` is written for a person to read. Show it.
+
+## From TypeScript
+
+```bash
+npm install @errand-ai/client
+```
+
+```ts
+import { Errand } from "@errand-ai/client";
+
+const errand = new Errand({ token: process.env.ERRAND_TOKEN! });
+
+const [task] = await errand.listTasks();
+await errand.updateTask(task.id, { allowed_domains: ["club.example"] });
+const run = await errand.runTask(task.id);
+
+for await (const event of errand.watchRun(run.id)) {
+  console.log(event.event, event.data);
+}
+```
+
+## Tasks
+
+| | |
+|---|---|
+| `GET /v1/tasks` | List. `?include_archived=true` for the rest. |
+| `POST /v1/tasks` | Create. `name`, `description`, and optionally `emoji`, `schedule`, `allowed_domains`, `notify`, `limits`. |
+| `GET /v1/tasks/{id}` | One task, including `schedule_describes` and `schedule_preview`. |
+| `PATCH /v1/tasks/{id}` | Change any of the above. Absent fields are left alone. |
+| `POST /v1/tasks/{id}/teach` | Run it once in teach mode, so it can write a plan. |
+| `POST /v1/tasks/{id}/run` | Run now. `{"dry_run": true}` rehearses without doing anything. |
+| `POST /v1/tasks/{id}/activate` | Arm it, once a plan is approved. |
+| `POST /v1/tasks/{id}/pause` · `/resume` | Stop and restart scheduled runs. |
+| `GET /v1/tasks/{id}/playbook` | The plan, and any version waiting for approval. |
+| `POST /v1/tasks/{id}/playbook/{version}/approve` | Approve one. |
+| `POST /v1/tasks/{id}/holds` | Say what you found after an interrupted irreversible action. |
+
+Two refusals from `PATCH` are worth handling rather than showing raw:
+
+- **`task_not_taught` (409)** — the task has no approved plan, so it cannot be
+  put on a schedule. This is the one line between "tried once while watched" and
+  "runs alone at three in the morning", and it applies to `PATCH` as well as
+  `activate`.
+- **`schedule_change_may_repeat` (409)** — the new schedule's first run comes
+  sooner than the old one's would have, and something irreversible has already
+  been done for this slot. Retry with `"acknowledge_repeat": true` only after a
+  person has read that.
+
+Changing a schedule never replays the past: each task carries a floor, so the
+first run under a new schedule is the next one, not a missed one.
+
+### Sites
+
+`allowed_domains` is a list of bare hosts. A full URL is accepted and tidied.
+Subdomains are included; wildcards, single labels and bare public suffixes are
+refused with a message saying what to type instead, because they would save
+happily and match nothing. The response may carry `warnings` — things worth
+saying but not worth refusing over, such as `www.x.com` without `x.com`.
+
+Order matters: the first entry decides which browser profile the task uses, and
+that profile holds its saved logins.
+
+### Schedules
+
+```json
+{ "kind": "cron", "expr": "0 0 8 * * *", "tz": "Europe/Vienna",
+  "catch_up": "run_once_late", "jitter_s": 60 }
+```
+
+`kind` is `manual`, `once` (with `at`) or `cron` (with `expr`). **Six fields,
+seconds first** — an expression copied from elsewhere usually has five and will
+mean something quite different.
+
+`POST /v1/schedule/preview` takes a schedule and returns
+`{valid, describes, preview, problem}`: the engine's own words for what it
+means, and the next few times it would really fire. Call it before saving one.
+
+## Runs
+
+| | |
+|---|---|
+| `GET /v1/runs` | `?task_id=` and `?limit=`. |
+| `GET /v1/runs/{id}` | One run, with every step. |
+| `GET /v1/runs/{id}/stream` | Server-sent events, live. |
+| `GET /v1/events` | Every run, live. |
+
+## People a task may message
+
+| | |
+|---|---|
+| `GET`/`POST /v1/recipients` | The address book. `label`, `channel`, `address`. |
+| `DELETE /v1/recipients/{id}` | Forget someone. |
+| `GET /v1/tasks/{id}/recipients` | Who this task may tell. |
+| `POST /v1/tasks/{id}/recipients` | Let it. **Needs `approve`.** `{recipient_id, on_success, on_failure}` |
+| `DELETE /v1/tasks/{id}/recipients/{recipient_id}` | Stop it. |
+
+Saving a person does not let anything message them. The per-task link is the
+grant, and it is what stops one task from telling someone about another task's
+work.
+
+## Credentials, channels, models
+
+| | |
+|---|---|
+| `GET`/`POST /v1/credentials`, `DELETE /v1/credentials/{id}` | Logins. Write-only: the secret never comes back. |
+| `GET /v1/channels` | How each way of reaching you is doing. |
+| `POST /v1/channels/{channel}/config` | `{secrets, settings}`. Secrets go to the keychain. |
+| `POST /v1/channels/{channel}/test` · `/enable` | Send yourself one; ask macOS for permission. |
+| `GET /v1/settings` | Settings the engine reads, such as `messaging.quiet`. |
+| `GET /v1/ai` | Which model does each job, and whether anything leaves the machine. |
+| `GET /v1/ai/catalogue` | Services Errand knows by name. |
+| `POST /v1/ai/providers`, `DELETE /v1/ai/providers/{id}`, `POST /v1/ai/providers/{id}/test` | Add, remove, check. |
+| `POST /v1/ai/discover?scan_network=true` | Look for models here, and optionally on your network. |
+| `POST /v1/ai/roles/{role}` | Which provider does which job. |
+| `POST /v1/ai/local-only` | Refuse to send anything off this machine. |
+
+## Webhooks
+
+`POST /v1/webhooks` with `{url, events}` returns a secret. Deliveries carry
+`X-Errand-Signature` and `X-Errand-Timestamp`; verify both, and reject anything
+more than a few minutes old so an old delivery cannot be replayed at you. The
+client package exports `verifySignature` for this.
+
+Targets must be loopback or a private address unless you allow otherwise —
+Errand will not be turned into a way of reaching arbitrary hosts.

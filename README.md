@@ -67,7 +67,7 @@ Two processes, one owner of the database.
 
 | Component | What it does |
 |---|---|
-| `Errand-AI.app` | Tauri 2 shell and menu bar presence. Never executes a task. A pure API client. |
+| `Errand-AI.app` | Tauri 2 window. Never executes a task, never opens the database. A pure API client. |
 | `errandd` | Headless daemon under launchd. Schedules, executes, journals, holds the keychain, serves the API. Runs whether or not the window is open. |
 
 The daemon owns every permission on purpose: macOS binds Automation consent and keychain access
@@ -85,6 +85,8 @@ prompt nobody is awake to answer.
 | M4 | Teach mode and playbooks | **done** |
 | M5 | Self-heal and the failure surface | **done** |
 | M6 | Telegram, WhatsApp, Apple Mail, Apple Messages | **done** |
+| M8b | Every AI it is given: fifteen services, and models on your own machines | **done** |
+| M8c | The task configuration surface: schedules, sites, limits, people | **done** |
 | M7 | API hardening, scoped tokens, webhooks, TypeScript client | **done** |
 | M8 | The interface, with every control explained | **done** |
 | M9 | Open-source preparation and signing from CI | next |
@@ -95,9 +97,20 @@ prompt nobody is awake to answer.
 Requires a stable Rust toolchain and macOS.
 
 ```bash
-cargo test --workspace       # 138 tests, including a real keychain round-trip
+cargo test --workspace       # 266 tests, including a real keychain round-trip
+./scripts/smoke.sh           # drives the real daemon through the real API
 cargo tauri build            # produces Errand-AI.app and a DMG
 ```
+
+The bundle carries the browser helper, so building it also needs Node 20 and the helper's own
+dependencies:
+
+```bash
+npm --prefix sidecars/browser-agent install
+```
+
+Errand drives a Chrome-family browser you already have rather than downloading its own. It uses a
+separate profile, so your windows, tabs, history and saved logins are untouched.
 
 Run the daemon in your terminal:
 

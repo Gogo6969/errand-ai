@@ -232,6 +232,205 @@ export class ErrandClient {
   async unsubscribe(id: string): Promise<void> {
     await this.request("DELETE", `/v1/webhooks/${id}`);
   }
+
+  // ------------------------------------------------------ configuring a task --
+
+  /**
+   * Change a task. Every field is optional; anything you leave out is left
+   * alone, so you never have to read a task in order to edit one field of it.
+   *
+   * Two refusals are worth handling rather than surfacing raw:
+   * `task_not_taught` means the task has no approved plan, so it cannot be put
+   * on a schedule; `schedule_change_may_repeat` means the new schedule's first
+   * run comes sooner than the old one's would have, and something irreversible
+   * has already been done for this slot. Pass `acknowledge_repeat: true` only
+   * once a person has actually read that.
+   */
+  async updateTask(id: string, patch: TaskPatch): Promise<{ task: Task; warnings?: string[] }> {
+    return this.request("PATCH", `/v1/tasks/${id}`, patch);
+  }
+
+  /**
+   * What a schedule really means, and when it would next run.
+   *
+   * Worth calling before saving one. A schedule expression that parses can
+   * still say something other than what was meant, and this is the engine's own
+   * answer rather than your interpretation of it.
+   */
+  async previewSchedule(schedule: unknown): Promise<SchedulePreview> {
+    return this.request("POST", "/v1/schedule/preview", schedule);
+  }
+
+  // ---------------------------------------------------------------- people --
+
+  async listRecipients(): Promise<Recipient[]> {
+    const r = await this.request<{ items: Recipient[] }>("GET", "/v1/recipients");
+    return r.items;
+  }
+
+  async addRecipient(label: string, channel: Channel, address: string): Promise<Recipient> {
+    return this.request("POST", "/v1/recipients", { label, channel, address });
+  }
+
+  async removeRecipient(id: string): Promise<void> {
+    await this.request("DELETE", `/v1/recipients/${id}`);
+  }
+
+  async taskRecipients(taskId: string): Promise<TaskRecipient[]> {
+    const r = await this.request<{ items: TaskRecipient[] }>(
+      "GET",
+      `/v1/tasks/${taskId}/recipients`,
+    );
+    return r.items;
+  }
+
+  /**
+   * Let one task message one person. This is the grant that makes messaging
+   * possible at all, and it needs the `approve` scope rather than `manage`,
+   * because it decides whether a real message reaches a real third party.
+   */
+  async allowTaskToMessage(
+    taskId: string,
+    recipientId: string,
+    when: { onSuccess?: boolean; onFailure?: boolean } = {},
+  ): Promise<void> {
+    await this.request("POST", `/v1/tasks/${taskId}/recipients`, {
+      recipient_id: recipientId,
+      on_success: when.onSuccess ?? true,
+      on_failure: when.onFailure ?? true,
+    });
+  }
+
+  async stopTaskMessaging(taskId: string, recipientId: string): Promise<void> {
+    await this.request("DELETE", `/v1/tasks/${taskId}/recipients/${recipientId}`);
+  }
+
+  // ------------------------------------------------------------- the machine --
+
+  /** Which model would do each job, and whether anything leaves the machine. */
+  async ai(): Promise<AiSetup> {
+    return this.request("GET", "/v1/ai");
+  }
+
+  /**
+   * Logins Errand may use. Secrets are write-only: this returns what each one
+   * is for and which site it is bound to, never the value.
+   */
+  async listCredentials(): Promise<Credential[]> {
+    const r = await this.request<{ items: Credential[] }>("GET", "/v1/credentials");
+    return r.items;
+  }
+
+  async addCredential(c: {
+    label: string;
+    domain: string;
+    username?: string;
+    secret: string;
+  }): Promise<{ id: string }> {
+    return this.request("POST", "/v1/credentials", c);
+  }
+
+  async removeCredential(id: string): Promise<void> {
+    await this.request("DELETE", `/v1/credentials/${id}`);
+  }
+
+  /** How each way of reaching you is doing, and what to do about any that is not. */
+  async channels(): Promise<{ channels: ChannelHealth[]; notes: Record<string, string> }> {
+    return this.request("GET", "/v1/channels");
+  }
+
+  async settings(): Promise<Record<string, unknown>> {
+    return this.request("GET", "/v1/settings");
+  }
+
+  /**
+   * Mint a key for another program. Give each one only the scopes it needs.
+   * The key is returned once and stored only as a hash, so it cannot be shown
+   * again — if you lose it, mint another and revoke this one.
+   */
+  async createToken(name: string, scopes: Scope[]): Promise<{ id: string; token: string }> {
+    return this.request("POST", "/v1/tokens", { name, scopes: scopes.join(",") });
+  }
+
+  async revokeToken(id: string): Promise<void> {
+    await this.request("DELETE", `/v1/tokens/${id}`);
+  }
+}
+
+export type Channel = "telegram" | "whatsapp" | "apple_mail" | "imessage";
+
+/** Every field optional: absent means leave it as it is. */
+export interface TaskPatch {
+  name?: string;
+  emoji?: string;
+  description?: string;
+  /** A ScheduleSpec. Check it with previewSchedule first. */
+  schedule?: unknown;
+  notify?: Record<string, boolean>;
+  limits?: Record<string, number>;
+  /** Bare hosts. A full URL is accepted and tidied; a wildcard is refused. */
+  allowed_domains?: string[];
+  acknowledge_repeat?: boolean;
+}
+
+export interface SchedulePreview {
+  valid: boolean;
+  /** The schedule in plain English, from the engine that will run it. */
+  describes: string;
+  /** The next few moments it would fire, as ISO timestamps. */
+  preview: string[];
+  problem?: string | null;
+}
+
+export interface Recipient {
+  id: string;
+  label: string;
+  channel: Channel;
+  address: string;
+  address_masked?: string;
+}
+
+export interface TaskRecipient extends Recipient {
+  on_success: boolean;
+  on_failure: boolean;
+}
+
+export interface Credential {
+  id: string;
+  label: string;
+  domain: string;
+  username?: string | null;
+  use_count: number;
+}
+
+export interface ChannelHealth {
+  channel: string;
+  status: string;
+  detail: string;
+  fix?: string | null;
+}
+
+export interface AiSetup {
+  providers: {
+    id: string;
+    kind: string;
+    label: string;
+    base_url?: string | null;
+    model?: string | null;
+    enabled: boolean;
+    health?: string | null;
+    health_detail?: string | null;
+  }[];
+  roles: {
+    role: string;
+    explains: string;
+    in_use: boolean;
+    not_used_because?: string | null;
+    using?: { id: string; label: string; model: string; local: boolean } | null;
+    fallbacks: string[];
+    problem?: string | null;
+  }[];
+  local_only: boolean;
 }
 
 /**

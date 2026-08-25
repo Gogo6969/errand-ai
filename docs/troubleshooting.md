@@ -99,6 +99,23 @@ exactly like a task that never ran. `errandd doctor` reports this.
 Messages to *other people* also wait for quiet hours to end. Your own failure
 alerts do not, unless you turned that off.
 
+## The build fails with "Operation not permitted"
+
+Keep the repository out of iCloud Drive.
+
+macOS syncs `~/Documents` and `~/Desktop` when "Desktop & Documents Folders" is
+on, which makes them a managed folder rather than an ordinary one. Once iCloud
+has registered a file, `clonefile()` on it fails with `EPERM` for ever, and
+Rust's `std::fs::copy` tries `clonefile()` first and treats that error as fatal
+instead of falling back. Tauri's build script copies several files out of the
+repository, so the build dies on whichever one iCloud has claimed most recently,
+which makes the failure look as though it moves around by itself.
+
+It also uploads every byte of `target/` to iCloud, and leaves conflict copies
+named `something 2`, `something 3` scattered through the build output.
+
+Keep it somewhere like `~/Developer` instead. Nothing else needs to change.
+
 ## The browser will not start
 
 Three separate causes, and doctor distinguishes them:

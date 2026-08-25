@@ -464,6 +464,34 @@ pub async fn get_run(pool: &Pool, id: &str) -> Result<Option<crate::models::Run>
     row.as_ref().map(run_from_row).transpose()
 }
 
+/// The newest run of every task, in one query.
+///
+/// The task list needs this: a task can say "Learning" while the run it is
+/// learning from finished hours ago, and a screen that shows the stored word
+/// without the run behind it is telling somebody something untrue. One query
+/// rather than one per task, because the list is drawn on every visit.
+///
+/// Newest by id, not by created_at: ids are time-ordered, and two runs created
+/// in the same second would otherwise both win.
+pub async fn latest_run_per_task(
+    pool: &Pool,
+) -> Result<std::collections::HashMap<String, crate::models::Run>> {
+    let rows = sqlx::query(
+        "SELECT r.* FROM runs r
+           JOIN (SELECT task_id, MAX(id) AS newest FROM runs GROUP BY task_id) x
+             ON x.task_id = r.task_id AND x.newest = r.id",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    let mut out = std::collections::HashMap::new();
+    for row in &rows {
+        let run = run_from_row(row)?;
+        out.insert(run.task_id.clone(), run);
+    }
+    Ok(out)
+}
+
 fn run_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<crate::models::Run> {
     let code: Option<String> = r.try_get("failure_code")?;
     let human: Option<String> = r.try_get("failure_human")?;

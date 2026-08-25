@@ -3,6 +3,7 @@
   import { page } from "$app/state";
   import { api, channelName, followRun, statusLabel, when, ApiError, type Task, type Run, type TaskRecipient, type Recipient } from "$lib/api";
   import Hint from "$lib/components/Hint.svelte";
+  import { headlineFor, ranHeadline } from "$lib/taskState";
   import ScheduleEditor from "$lib/components/ScheduleEditor.svelte";
   import SitesEditor from "$lib/components/SitesEditor.svelte";
 
@@ -57,29 +58,8 @@
    * exact lie this page was rebuilt to stop telling. Where the newest run
    * disagrees with the task, the run is the one that knows.
    */
-  const headline = $derived.by(() => {
-    if (liveRun) return { text: statusLabel(liveRun.status), cls: "" };
-    if (task?.status === "teaching" && finishedRun) {
-      return finishedRun.status === "succeeded"
-        ? { text: "Learned, waiting for you", cls: "warn" }
-        : { text: "Learning did not finish", cls: "bad" };
-    }
-    return { text: task ? statusLabel(task.status) : "", cls: "" };
-  });
+  const headline = $derived(headlineFor(task, liveRun ?? finishedRun));
 
-  /** "The teaching run could not finish", in words nobody has to decode. */
-  function ranHeadline(r: Run): string {
-    const what =
-      r.trigger === "teach" ? "The teaching run"
-      : r.mode === "dry_run" ? "The last rehearsal"
-      : "The last run";
-    const how =
-      r.status === "succeeded" ? "worked"
-      : r.status === "failed" ? "could not finish"
-      : r.status === "cancelled" ? "was stopped"
-      : "was skipped";
-    return `${what} ${how}`;
-  }
 
   async function countSteps(runId: string) {
     try {

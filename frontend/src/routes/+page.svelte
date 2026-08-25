@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api, statusLabel, when, type Task, ApiError } from "$lib/api";
+  import { api, when, type Task, ApiError } from "$lib/api";
+  import { headlineFor, subline, isLive } from "$lib/taskState";
   import Hint from "$lib/components/Hint.svelte";
   import SitesEditor from "$lib/components/SitesEditor.svelte";
 
@@ -34,11 +35,6 @@
     }
   }
 
-  function pill(t: Task) {
-    if (t.status === "ready") return "ok";
-    if (t.status === "paused") return t.auto_paused ? "bad" : "warn";
-    return "";
-  }
 </script>
 
 <h1>Tasks</h1>
@@ -90,12 +86,17 @@
 {:else}
   <div style="margin-top:20px">
     {#each tasks as t}
+      {@const h = headlineFor(t, t.last_run)}
+      {@const sub = subline(t, t.last_run)}
       <a class="plain" href={`/task/${t.id}`} data-hint-exempt="opens the task shown in this card">
         <div class="card">
           <div class="row spread">
             <div>
               <strong>{t.emoji ?? ""} {t.name}</strong>
               <div class="muted">{t.description.slice(0, 96)}{t.description.length > 96 ? "…" : ""}</div>
+              {#if sub}
+                <div class="muted said" class:bad={t.last_run?.status === "failed"}>{sub}</div>
+              {/if}
             </div>
             <div class="row">
               {#if t.next_run_at}
@@ -104,7 +105,9 @@
                 </Hint>
               {/if}
               <Hint id="task.status">
-                <span class="pill {pill(t)}">{statusLabel(t.status)}</span>
+                <span class="pill {h.cls}">
+                  {#if isLive(t.last_run)}<span class="live"></span>{/if}{h.text}
+                </span>
               </Hint>
             </div>
           </div>

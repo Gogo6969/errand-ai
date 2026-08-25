@@ -27,6 +27,8 @@ export interface Task {
   /** The engine's own words for the schedule. Never interpreted in the browser. */
   schedule_describes?: string;
   schedule_preview?: string[];
+  /** The newest run, so a screen can say what really happened. */
+  last_run?: Run | null;
 }
 
 export interface Failure {

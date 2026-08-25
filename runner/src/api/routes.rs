@@ -136,8 +136,29 @@ const NOT_TAUGHT: &str =
 /// disagree with the engine, and the disagreement only shows up on the morning
 /// nothing happens. Both of these come from the code that will actually fire
 /// the task, so they cannot drift from it.
-fn task_json(task: &errand_core::models::Task, open_holds: i64) -> serde_json::Value {
+fn task_json(
+    task: &errand_core::models::Task,
+    open_holds: i64,
+    last_run: Option<&errand_core::models::Run>,
+) -> serde_json::Value {
     let mut v = serde_json::to_value(task).unwrap_or_else(|_| json!({}));
+    // The newest run, so a screen can say what really happened rather than the
+    // word stored on the task. A task sits at "teaching" until somebody
+    // approves what it learned, so without this the list says "Learning" long
+    // after the run finished, which reads as nothing having happened at all.
+    v["last_run"] = match last_run {
+        Some(r) => json!({
+            "id": r.id,
+            "status": r.status,
+            "mode": r.mode,
+            "trigger": r.trigger,
+            "created_at": r.created_at,
+            "finished_at": r.finished_at,
+            "summary": r.summary,
+            "failure": r.failure,
+        }),
+        None => serde_json::Value::Null,
+    };
     // The number the "needs you" card keys off. It is a count rather than a
     // sentence because a sentence can be reworded; an armed fence cannot.
     v["open_holds"] = json!(open_holds);
@@ -196,9 +217,12 @@ async fn list_tasks(
     let holds = errand_core::db::open_hold_counts(state.pool())
         .await
         .map_err(ApiError::from)?;
+    let latest = errand_core::db::latest_run_per_task(state.pool())
+        .await
+        .map_err(ApiError::from)?;
     let items: Vec<serde_json::Value> = tasks
         .iter()
-        .map(|t| task_json(t, *holds.get(&t.id).unwrap_or(&0)))
+        .map(|t| task_json(t, *holds.get(&t.id).unwrap_or(&0), latest.get(&t.id)))
         .collect();
     Ok(Json(json!({ "items": items })))
 }
@@ -216,7 +240,10 @@ async fn get_task(
     let holds = errand_core::db::count_open_holds(state.pool(), &id)
         .await
         .map_err(ApiError::from)?;
-    Ok(Json(task_json(&task, holds)))
+    let latest = errand_core::db::latest_run_per_task(state.pool())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(task_json(&task, holds, latest.get(&id))))
 }
 
 #[derive(Deserialize)]
@@ -302,7 +329,10 @@ async fn create_task(
     let holds = errand_core::db::count_open_holds(state.pool(), &task.id)
         .await
         .map_err(ApiError::from)?;
-    let mut out = task_json(&task, holds);
+    let latest = errand_core::db::latest_run_per_task(state.pool())
+        .await
+        .map_err(ApiError::from)?;
+    let mut out = task_json(&task, holds, latest.get(&task.id));
     out["warnings"] = json!(warnings);
     Ok(Json(out))
 }
@@ -483,7 +513,13 @@ async fn patch_task(
     let holds = errand_core::db::count_open_holds(state.pool(), &id)
         .await
         .map_err(ApiError::from)?;
-    let out = json!({ "task": task_json(&updated, holds), "warnings": warnings });
+    let latest = errand_core::db::latest_run_per_task(state.pool())
+        .await
+        .map_err(ApiError::from)?;
+    let out = json!({
+        "task": task_json(&updated, holds, latest.get(&updated.id)),
+        "warnings": warnings,
+    });
     if let Some(key) = idem {
         let _ = errand_core::db::remember_idempotent(
             state.pool(),

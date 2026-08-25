@@ -81,6 +81,14 @@
 
   const unlinked = $derived(everyone.filter((r) => !people.some((p) => p.id === r.id)));
 
+  // The report a finished run sends shares the task's message budget with the
+  // agent's own sends, so linking more people than the limit allows means some
+  // of them are simply not told. Better to say so here than to let it be
+  // discovered from a line in a run timeline.
+  const tooManyPeople = $derived(
+    task?.limits?.max_messages !== undefined && people.length > task.limits.max_messages,
+  );
+
   async function act(fn: () => Promise<unknown>) {
     busy = true;
     try { await fn(); await load(); }
@@ -276,6 +284,14 @@
           </div>
         </div>
       {/each}
+    {/if}
+
+    {#if tooManyPeople}
+      <div class="warnbox" style="margin-top:10px">
+        This task may send {task.limits!.max_messages} message(s) per run but {people.length}
+        people are waiting to hear from it, so some of them will not be told. The run says who.
+        Raise the message limit if that is not what you want.
+      </div>
     {/if}
 
     {#if unlinked.length}

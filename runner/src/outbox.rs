@@ -231,6 +231,12 @@ pub async fn notify_run(state: &AppState, run_id: &str) -> anyhow::Result<()> {
         _ => 0,
     };
 
+    // The Narrator's actual job. If a model is configured for it, it rewrites
+    // the raw summary into something worth reading on a phone; if not, or if it
+    // fails, the raw summary goes out unchanged. A notification is never held up
+    // or lost over its own wording.
+    let summary = narrate(state, &task.name, ok, &summary).await;
+
     let body = channels::telegram::result_card(&task.name, ok, &summary, duration, run.cost_usd);
     errand_core::db::enqueue_message(
         state.pool(),
@@ -248,6 +254,45 @@ pub async fn notify_run(state: &AppState, run_id: &str) -> anyhow::Result<()> {
     )
     .await?;
     Ok(())
+}
+
+/// Turn a bare outcome into a sentence a person would want to receive.
+///
+/// Deliberately conservative: it is told not to invent, and anything that comes
+/// back too long or empty is discarded in favour of what the run actually said.
+/// A prettier message is not worth a wrong one.
+async fn narrate(state: &AppState, task: &str, ok: bool, summary: &str) -> String {
+    let prompt = format!(
+        "Rewrite this as one or two short sentences for a phone notification.\n\n\
+         Task: {task}\n\
+         Outcome: {}\n\
+         What happened: {summary}\n\n\
+         Say only what is here. Do not invent a detail, a time, a price or a name that is not \
+         above. Do not add a greeting, an emoji or a sign-off. If there is nothing to say beyond \
+         the outcome, repeat it plainly. Reply with the sentences and nothing else.",
+        if ok { "finished" } else { "did not finish" }
+    );
+
+    // Scrubbed like everything else that reaches a model: a summary can quote a
+    // page that had a secret on it.
+    let prompt = state.redactor("").scrub(&prompt);
+
+    match crate::models::ask(state, errand_core::providers::Role::Narrator, &prompt).await {
+        Ok(a) => {
+            let t = a.text.trim();
+            // A model that rambles, returns nothing, or writes an essay is not
+            // improving on the summary, so the summary wins.
+            if t.is_empty() || t.len() > summary.len() * 4 + 400 {
+                summary.to_string()
+            } else {
+                t.to_string()
+            }
+        }
+        Err(e) => {
+            tracing::info!("no model rewrote the notification, sending it as it was: {e}");
+            summary.to_string()
+        }
+    }
 }
 
 #[cfg(test)]

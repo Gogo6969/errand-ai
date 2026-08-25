@@ -125,6 +125,8 @@ pub enum ExecError {
     NoClaudeBinary,
     Spawn(String),
     NoOutcome,
+    /// Nothing Errand could reach was able to answer.
+    NoModel(String),
 }
 
 impl std::error::Error for ExecError {}
@@ -139,6 +141,7 @@ impl std::fmt::Display for ExecError {
                  this task. Install it, run 'claude /login' once, then try again."
             ),
             Self::Spawn(e) => write!(f, "Could not start the agent: {e}"),
+            Self::NoModel(why) => write!(f, "{why}"),
             Self::NoOutcome => write!(
                 f,
                 "The agent stopped without reporting whether it finished the job. Nothing was \
@@ -595,8 +598,9 @@ pub async fn run_to_completion(state: AppState, run_id: String) {
                                     &state,
                                     &run_id,
                                     &format!(
-                                        "That did not work. Best guess at why: {}. Trying: {}",
-                                        d.cause, d.advice
+                                        "That did not work. {} looked at it. Best guess at why: \
+                                         {}. Trying: {}",
+                                        d.by, d.cause, d.advice
                                     ),
                                 )
                                 .await;

@@ -11,6 +11,7 @@ pub mod limits;
 pub mod models;
 pub mod paths;
 pub mod playbook;
+pub mod providers;
 pub mod schedule;
 
 /// Bundle identifier of the app. Data directory derives from this.

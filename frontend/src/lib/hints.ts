@@ -192,6 +192,89 @@ export const hints = {
       "It runs whether or not this window is open, which is what lets a task fire at eight in the " +
       "morning while you are asleep.",
   },
+  // ------------------------------------------------------------------- ai --
+  "ai.role": {
+    short: "One of the four jobs Errand needs a model for.",
+    long:
+      "Only the first one, doing the task, needs a model that can drive a browser and use tools. " +
+      "The other three are single questions, which any model can answer, including one running " +
+      "on your own machine.",
+  },
+  "ai.local": {
+    short: "Whether your task text leaves this machine to be answered.",
+    long:
+      "A model running on your own computer sees your task and nothing else does. Claude is a " +
+      "service, so the wording of your task and what the agent reads on a page go to Anthropic " +
+      "to be answered. Your saved logins never go to either.",
+  },
+  "ai.pick": {
+    short: "Choose which model does this job.",
+    long:
+      "No preference means Errand uses whatever is switched on and working, so one model being " +
+      "down does not stop a task. A model that cannot do a job is shown but cannot be picked, " +
+      "with the reason.",
+  },
+  "ai.test": {
+    short: "Ask it right now whether it is there, and say what came back.",
+  },
+  "ai.enable": {
+    short: "Stop using this model without forgetting it.",
+    long: "Its settings are kept, and any job set to prefer it falls back to something else rather than failing.",
+  },
+  "ai.remove": {
+    short: "Forget this model. Jobs using it fall back to whatever else is available.",
+  },
+  "ai.scan": {
+    short: "Look for a model already running, and offer whatever it finds.",
+    long:
+      "Nothing found is switched on for you. Finding a model and deciding to trust it are two " +
+      "different things, and the second one is yours.",
+  },
+  "ai.scan_network": {
+    short: "Also try the other machines on the network this computer is on.",
+    long:
+      "For a model running on a different box — a mini PC, a home server. Errand tries every " +
+      "address on your own subnet, which takes a few seconds. Leave it off on a network that is " +
+      "not yours: sweeping an office or hotel network is rude, and it looks like something worse.",
+  },
+  "ai.service": {
+    short: "Pick a service by name. Errand already knows its address.",
+    long:
+      "All of these speak the same language, so Errand reaches them the same way. Anthropic is " +
+      "not in this list because Errand talks to it properly through its own connection instead.",
+  },
+  "ai.add_service": {
+    short: "Save it, with the key going straight to your keychain.",
+    long:
+      "The key is checked against what that service's keys look like, then written to your " +
+      "macOS keychain. It never reaches Errand's database, its logs, or this window, and Errand " +
+      "cannot show it to you again.",
+  },
+  "ai.custom": {
+    short: "For a model at an address Errand did not find or does not know.",
+  },
+  "ai.add_found": {
+    short: "Start using this one. You choose which jobs it does afterwards.",
+  },
+  "ai.add": {
+    short: "Add a model by address. Checked before it is saved.",
+    long: "If nothing answers at that address you are told now, rather than at the moment a task needs it.",
+  },
+  "ai.local_only": {
+    short: "Refuse to send anything to a model Errand does not run itself.",
+    long:
+      "This is a real restriction, not a preference: with it on, a task that needs a browser " +
+      "stops rather than quietly falling back to Claude. Errand will not let you turn it on " +
+      "until there is a local model to use.",
+  },
+  "ai.key": {
+    short: "Save an Anthropic key. It goes to your keychain and is never shown again.",
+    long:
+      "Optional, and separate from the others because Errand talks to Anthropic in its own " +
+      "language rather than the common one. Errand already works without a key by using the " +
+      "Claude command line tool you are signed in to; a key here bills your own account instead.",
+  },
+
   "hold.resolve": {
     short: "Tell Errand what you found, so this task can run again.",
     long:

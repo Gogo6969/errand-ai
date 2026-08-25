@@ -53,3 +53,4 @@ frontend/build/
 frontend/.svelte-kit/
 frontend/package-lock.json
 app/gen/
+app/icons/icon.iconset/

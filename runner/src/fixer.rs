@@ -26,6 +26,9 @@ pub struct Diagnosis {
     pub cause: String,
     /// What to try instead.
     pub advice: String,
+    /// Which AI worked this out, so the run can say so rather than presenting
+    /// an anonymous verdict.
+    pub by: String,
 }
 
 impl Diagnosis {
@@ -121,8 +124,26 @@ pub async fn diagnose(state: &AppState, run_id: &str) -> anyhow::Result<Diagnosi
 
     // Scrubbed, because the journal can quote a page that contained a secret.
     let prompt = state.redactor(run_id).scrub(&prompt);
-    let raw = crate::executor::ask_model(&prompt, "haiku", 4).await?;
-    Ok(parse(&raw))
+    // Through the provider chain, so a local model set for this job is really
+    // used and a diagnosis can name what produced it.
+    let answer = crate::models::ask(state, errand_core::providers::Role::Fixer, &prompt)
+        .await
+        .map_err(|e| crate::executor::ExecError::NoModel(e.to_string()))?;
+
+    let mut d = parse(&answer.text);
+    // Named, and said where it ran. A guess about your failed booking is worth
+    // knowing the origin of, including whether it left the machine.
+    d.by = format!(
+        "{} ({}{})",
+        answer.provider_label,
+        answer.model,
+        if answer.was_local {
+            ", on this machine"
+        } else {
+            ""
+        }
+    );
+    Ok(d)
 }
 
 /// Pull the two lines out, tolerantly. A model that ignores the format should
@@ -149,7 +170,12 @@ pub fn parse(raw: &str) -> Diagnosis {
     if advice.is_empty() {
         advice = "nothing worth retrying".to_string();
     }
-    Diagnosis { cause, advice }
+    Diagnosis {
+        cause,
+        advice,
+        // Filled in by whatever asked; a hand-parsed answer has no author yet.
+        by: String::new(),
+    }
 }
 
 impl Diagnosis {

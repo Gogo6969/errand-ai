@@ -5,6 +5,7 @@
   const nav = [
     { href: "/", label: "Tasks" },
     { href: "/runs", label: "History" },
+    { href: "/ai", label: "AI" },
     { href: "/settings", label: "Settings" },
   ];
 </script>

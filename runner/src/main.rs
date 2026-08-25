@@ -20,6 +20,7 @@ mod executor;
 mod fixer;
 mod lock;
 mod mcp;
+mod models;
 mod outbox;
 mod redact;
 mod scheduler;
@@ -253,6 +254,21 @@ async fn serve(foreground: bool) -> Result<()> {
     // The scheduler is what makes a task fire without anyone asking. It starts
     // after the listener so a scheduling problem can never stop the API from
     // answering questions about why nothing is running.
+    // Which AI to use is a question the Settings screen must be able to answer,
+    // so the list is seeded and checked at boot rather than the first time
+    // something needs a model.
+    {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            if let Err(e) = models::ensure_builtin(&pool).await {
+                tracing::warn!("could not record the built-in AI: {e}");
+            }
+            if let Err(e) = models::refresh_health(&pool).await {
+                tracing::warn!("could not check the AI providers: {e}");
+            }
+        });
+    }
+
     scheduler::spawn(state.clone());
     outbox::spawn(state.clone());
     channels::inbound::spawn(state.clone());

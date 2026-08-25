@@ -122,7 +122,78 @@ export const api = {
   enableChannel: (c: string) => call<ChannelHealth>("POST", `/v1/channels/${c}/enable`),
   configureChannel: (c: string, secrets: Record<string, string>) =>
     call("POST", `/v1/channels/${c}/config`, { secrets }),
+
+  ai: () => call<AiSetup>("GET", "/v1/ai"),
+  aiCatalogue: () => call<{ services: KnownService[] }>("GET", "/v1/ai/catalogue").then((r) => r.services),
+  saveProvider: (p: SaveProvider) => call<{ id: string; health: string; health_detail: string }>("POST", "/v1/ai/providers", p),
+  removeProvider: (id: string) => call("DELETE", `/v1/ai/providers/${id}`),
+  testProvider: (id: string) => call<{ health: string; health_detail: string }>("POST", `/v1/ai/providers/${id}/test`),
+  discoverProviders: (scanNetwork = false) =>
+    call<{ found: Provider[]; looked_at: string; note: string }>(
+      "POST",
+      `/v1/ai/discover?scan_network=${scanNetwork}`,
+    ),
+  bindRole: (role: string, providerId: string | null) =>
+    call("POST", `/v1/ai/roles/${role}`, { provider_id: providerId }),
+  setLocalOnly: (enabled: boolean) => call("POST", "/v1/ai/local-only", { enabled }),
+  saveAnthropicKey: (key: string) => call("POST", "/v1/ai/anthropic-key", { key }),
 };
+
+export interface Provider {
+  id: string;
+  kind: "claude_cli" | "anthropic_api" | "openai_compat";
+  label: string;
+  base_url: string | null;
+  model: string | null;
+  enabled: boolean;
+  discovered: boolean;
+  health: string | null;
+  health_detail: string | null;
+}
+
+export interface SaveProvider {
+  id?: string;
+  /** One of the names Errand knows, e.g. "openai". Fills in the rest. */
+  known?: string;
+  kind?: string;
+  label?: string;
+  base_url?: string;
+  model?: string;
+  /** Write-only. Goes to the keychain and never comes back. */
+  key?: string;
+  enabled?: boolean;
+}
+
+/** A service Errand can talk to without being told its address. */
+export interface KnownService {
+  id: string;
+  name: string;
+  base_url: string;
+  key_prefix: string;
+  keys_url: string;
+  example_model: string;
+  needs_key: boolean;
+}
+
+/** What each of Errand's four jobs would use if it were asked right now. */
+export interface RoleSetup {
+  role: string;
+  explains: string;
+  needs_agentic: boolean;
+  /** False when Errand does not consult this role yet. */
+  in_use: boolean;
+  not_used_because: string | null;
+  chosen: string | null;
+  using: { id: string; label: string; model: string; local: boolean } | null;
+  fallbacks: string[];
+  problem: string | null;
+}
+
+export interface AiSetup {
+  providers: Provider[];
+  roles: RoleSetup[];
+  local_only: boolean;
+}
 
 /** Human wording for a status, so no screen has to invent its own. */
 export function statusLabel(s: string): string {

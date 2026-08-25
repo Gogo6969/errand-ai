@@ -2755,3 +2755,260 @@ mod tests {
         );
     }
 }
+
+// ------------------------------------------------------------------- ai --
+
+/// Every place Errand could send a question, in a stable order so the Settings
+/// list does not reshuffle itself between visits.
+pub async fn list_providers(pool: &Pool) -> Result<Vec<crate::providers::Provider>> {
+    let rows = sqlx::query(
+        "SELECT id, kind, label, base_url, model, enabled, pinned, health_status, health_detail
+           FROM provider_endpoints ORDER BY pinned DESC, label ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .map(|r| crate::providers::Provider {
+            id: r.get("id"),
+            kind: r.get("kind"),
+            label: r.get("label"),
+            base_url: r.get("base_url"),
+            model: r.get("model"),
+            enabled: r.get::<i64, _>("enabled") != 0,
+            // `pinned` marks the ones Errand set up for itself, which is the same
+            // question as "did a person type this in".
+            discovered: r.get::<i64, _>("pinned") != 0,
+            health: r.get("health_status"),
+            health_detail: r.get("health_detail"),
+        })
+        .collect())
+}
+
+pub async fn upsert_provider(pool: &Pool, p: &crate::providers::Provider) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO provider_endpoints
+             (id, kind, label, base_url, model, enabled, pinned, health_status, health_detail)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(id) DO UPDATE SET
+             kind = excluded.kind, label = excluded.label, base_url = excluded.base_url,
+             model = excluded.model, enabled = excluded.enabled",
+    )
+    .bind(&p.id)
+    .bind(&p.kind)
+    .bind(&p.label)
+    .bind(&p.base_url)
+    .bind(&p.model)
+    .bind(i64::from(p.enabled))
+    .bind(i64::from(p.discovered))
+    .bind(&p.health)
+    .bind(&p.health_detail)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn set_provider_health(
+    pool: &Pool,
+    id: &str,
+    status: &str,
+    detail: Option<&str>,
+) -> Result<()> {
+    sqlx::query(
+        "UPDATE provider_endpoints
+            SET health_status = ?, health_detail = ?, checked_at = ? WHERE id = ?",
+    )
+    .bind(status)
+    .bind(detail)
+    .bind(crate::now_iso())
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Remove a provider. Any role pointing at it falls back to the rest of the
+/// chain rather than breaking, which is why the foreign key cascades.
+pub async fn delete_provider(pool: &Pool, id: &str) -> Result<bool> {
+    Ok(sqlx::query("DELETE FROM provider_endpoints WHERE id = ?")
+        .bind(id)
+        .execute(pool)
+        .await?
+        .rows_affected()
+        > 0)
+}
+
+/// Which provider each role prefers, in preference order.
+pub async fn list_role_bindings(pool: &Pool) -> Result<Vec<(crate::providers::Role, String)>> {
+    let rows = sqlx::query(
+        "SELECT role, endpoint_id FROM role_bindings WHERE scope = 'global' ORDER BY position ASC",
+    )
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows
+        .into_iter()
+        .filter_map(|r| {
+            let role: String = r.get("role");
+            crate::providers::Role::parse(&role)
+                .map(|role| (role, r.get::<String, _>("endpoint_id")))
+        })
+        .collect())
+}
+
+/// Point a role at a provider. Passing None means "no preference", which puts
+/// the role back on whatever is available rather than leaving it stuck.
+pub async fn set_role_binding(
+    pool: &Pool,
+    role: crate::providers::Role,
+    endpoint_id: Option<&str>,
+) -> Result<()> {
+    let mut tx = pool.begin().await?;
+    sqlx::query("DELETE FROM role_bindings WHERE role = ? AND scope = 'global'")
+        .bind(role.as_str())
+        .execute(&mut *tx)
+        .await?;
+    if let Some(id) = endpoint_id {
+        sqlx::query(
+            "INSERT INTO role_bindings (role, scope, position, endpoint_id)
+             VALUES (?, 'global', 0, ?)",
+        )
+        .bind(role.as_str())
+        .bind(id)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    Ok(())
+}
+
+#[cfg(test)]
+mod ai_tests {
+    use super::*;
+    use crate::providers::{Kind, Provider, Role};
+
+    fn p(id: &str, kind: Kind, label: &str) -> Provider {
+        Provider {
+            id: id.into(),
+            kind: kind.as_str().into(),
+            label: label.into(),
+            base_url: matches!(kind, Kind::OpenAiCompat)
+                .then(|| "http://127.0.0.1:11434".to_string()),
+            model: Some("some-model".into()),
+            enabled: true,
+            discovered: false,
+            health: None,
+            health_detail: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_provider_survives_a_round_trip() {
+        let pool = open_memory().await.unwrap();
+        upsert_provider(&pool, &p("a", Kind::OpenAiCompat, "Ollama"))
+            .await
+            .unwrap();
+        let back = list_providers(&pool).await.unwrap();
+        assert_eq!(back.len(), 1);
+        assert_eq!(back[0].label, "Ollama");
+        assert_eq!(back[0].base_url.as_deref(), Some("http://127.0.0.1:11434"));
+        assert!(back[0].enabled);
+    }
+
+    #[tokio::test]
+    async fn switching_one_off_does_not_forget_it() {
+        let pool = open_memory().await.unwrap();
+        let mut prov = p("a", Kind::OpenAiCompat, "Ollama");
+        upsert_provider(&pool, &prov).await.unwrap();
+        prov.enabled = false;
+        upsert_provider(&pool, &prov).await.unwrap();
+
+        let back = list_providers(&pool).await.unwrap();
+        assert_eq!(back.len(), 1, "it should still be listed, just off");
+        assert!(!back[0].enabled);
+    }
+
+    #[tokio::test]
+    async fn a_role_can_be_pointed_somewhere_and_then_released() {
+        let pool = open_memory().await.unwrap();
+        upsert_provider(&pool, &p("cli", Kind::ClaudeCli, "Claude"))
+            .await
+            .unwrap();
+        upsert_provider(&pool, &p("loc", Kind::OpenAiCompat, "Ollama"))
+            .await
+            .unwrap();
+
+        set_role_binding(&pool, Role::Fixer, Some("loc"))
+            .await
+            .unwrap();
+        assert_eq!(
+            list_role_bindings(&pool).await.unwrap(),
+            vec![(Role::Fixer, "loc".to_string())]
+        );
+
+        set_role_binding(&pool, Role::Fixer, None).await.unwrap();
+        assert!(list_role_bindings(&pool).await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_a_provider_does_not_leave_a_role_pointing_at_a_ghost() {
+        let pool = open_memory().await.unwrap();
+        upsert_provider(&pool, &p("loc", Kind::OpenAiCompat, "Ollama"))
+            .await
+            .unwrap();
+        set_role_binding(&pool, Role::Narrator, Some("loc"))
+            .await
+            .unwrap();
+
+        assert!(delete_provider(&pool, "loc").await.unwrap());
+        assert!(
+            list_role_bindings(&pool).await.unwrap().is_empty(),
+            "the binding must go with it, or the role resolves to nothing forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_role_bound_to_something_that_cannot_do_the_job_still_resolves() {
+        // The point of the chain: a person picking a local model for the executor
+        // must not silently stop every task from running.
+        let pool = open_memory().await.unwrap();
+        upsert_provider(&pool, &p("cli", Kind::ClaudeCli, "Claude"))
+            .await
+            .unwrap();
+        upsert_provider(&pool, &p("loc", Kind::OpenAiCompat, "Ollama"))
+            .await
+            .unwrap();
+        set_role_binding(&pool, Role::Executor, Some("loc"))
+            .await
+            .unwrap();
+
+        let providers = list_providers(&pool).await.unwrap();
+        let bindings = list_role_bindings(&pool).await.unwrap();
+        let chain = crate::providers::resolve_chain(&providers, &bindings, Role::Executor, false);
+
+        assert_eq!(chain.len(), 1);
+        assert_eq!(
+            chain[0].id, "cli",
+            "it should fall through to the one that can"
+        );
+    }
+
+    #[tokio::test]
+    async fn health_is_recorded_where_the_interface_can_show_it() {
+        let pool = open_memory().await.unwrap();
+        upsert_provider(&pool, &p("loc", Kind::OpenAiCompat, "Ollama"))
+            .await
+            .unwrap();
+        set_provider_health(&pool, "loc", "unreachable", Some("nothing at that address"))
+            .await
+            .unwrap();
+
+        let back = list_providers(&pool).await.unwrap();
+        assert_eq!(back[0].health.as_deref(), Some("unreachable"));
+        assert_eq!(
+            back[0].health_detail.as_deref(),
+            Some("nothing at that address")
+        );
+    }
+}

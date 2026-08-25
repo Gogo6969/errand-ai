@@ -57,6 +57,15 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/tokens/{id}", delete(revoke_token))
         .route("/v1/webhooks", get(list_webhooks).post(create_webhook))
         .route("/v1/webhooks/{id}", delete(delete_webhook))
+        .route("/v1/ai", get(get_ai))
+        .route("/v1/ai/catalogue", get(ai_catalogue))
+        .route("/v1/ai/providers", post(save_provider))
+        .route("/v1/ai/providers/{id}", delete(remove_provider))
+        .route("/v1/ai/providers/{id}/test", post(test_provider))
+        .route("/v1/ai/discover", post(discover_providers))
+        .route("/v1/ai/roles/{role}", post(bind_role))
+        .route("/v1/ai/local-only", post(set_local_only))
+        .route("/v1/ai/anthropic-key", post(save_anthropic_key))
         .route("/v1/admin/quiesce", post(quiesce))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -1179,4 +1188,438 @@ async fn quiesce(
         "busy_runs": busy,
         "note": "Exiting cleanly. launchd will leave the runner down until it is kickstarted."
     })))
+}
+
+// ---------------------------------------------------------------------- ai --
+//
+// Which AI does the work is a question the app has to be able to answer out
+// loud, so all of it — what is configured, what is reachable, and what each job
+// would actually use right now — comes back from one call.
+
+async fn get_ai(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Read)?;
+    let providers = errand_core::db::list_providers(state.pool())
+        .await
+        .map_err(ApiError::from)?;
+    let bindings = errand_core::db::list_role_bindings(state.pool())
+        .await
+        .map_err(ApiError::from)?;
+    let local_only = local_only_setting(&state).await;
+
+    // For each job, what would happen if it were asked right now. This is the
+    // part that turns "it uses AI somehow" into something you can point at.
+    let roles: Vec<serde_json::Value> = errand_core::providers::Role::ALL
+        .iter()
+        .map(|&role| {
+            let chain =
+                errand_core::providers::resolve_chain(&providers, &bindings, role, local_only);
+            let chosen = bindings
+                .iter()
+                .find(|(r, _)| *r == role)
+                .map(|(_, id)| id.clone());
+            json!({
+                "role": role.as_str(),
+                "explains": role.describe(),
+                "needs_agentic": role.needs_agentic(),
+                // Said plainly, so the screen cannot offer a choice that would
+                // not change anything.
+                "in_use": role.is_wired(),
+                "not_used_because": role.not_wired_reason(),
+                "chosen": chosen,
+                "using": chain.first().map(|p| json!({
+                    "id": p.id,
+                    "label": p.label,
+                    "model": p.model.clone().unwrap_or_else(||
+                        errand_core::providers::default_model_for(role).to_string()),
+                    "local": p.is_local(),
+                })),
+                "fallbacks": chain.iter().skip(1).map(|p| p.label.clone()).collect::<Vec<_>>(),
+                "problem": chain.is_empty().then(||
+                    errand_core::providers::explain_empty_chain(role, local_only, &providers)),
+            })
+        })
+        .collect();
+
+    Ok(Json(json!({
+        "providers": providers,
+        "roles": roles,
+        "local_only": local_only,
+    })))
+}
+
+async fn local_only_setting(state: &AppState) -> bool {
+    errand_core::db::get_setting(state.pool(), "privacy.local_only")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+}
+
+/// Every service Errand knows by name, so nobody has to look up a base URL.
+async fn ai_catalogue(Extension(caller): Extension<Caller>) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Read)?;
+    Ok(Json(
+        json!({ "services": errand_core::providers::CATALOGUE }),
+    ))
+}
+
+#[derive(Deserialize)]
+struct SaveProvider {
+    id: Option<String>,
+    /// One of the names Errand knows, e.g. "openai". Fills in everything else.
+    known: Option<String>,
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    label: String,
+    base_url: Option<String>,
+    model: Option<String>,
+    /// Write-only. Goes to the keychain and is never read back out.
+    key: Option<String>,
+    #[serde(default = "yes")]
+    enabled: bool,
+}
+
+fn yes() -> bool {
+    true
+}
+
+async fn save_provider(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Json(body): Json<SaveProvider>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+
+    // Picking a service by name fills in the address, so a base URL is
+    // something you only ever type for something Errand has not heard of.
+    let known = match &body.known {
+        Some(id) => Some(errand_core::providers::known(id).ok_or_else(|| {
+            ApiError::bad_request(format!("Errand does not know a service called '{id}'."))
+        })?),
+        None => None,
+    };
+
+    let kind_str = if body.kind.is_empty() && known.is_some() {
+        "openai_compat"
+    } else {
+        body.kind.as_str()
+    };
+    let kind = errand_core::providers::Kind::parse(kind_str).ok_or_else(|| {
+        ApiError::bad_request(format!(
+            "'{kind_str}' is not a kind of AI Errand knows about."
+        ))
+    })?;
+
+    // Checked before it is saved, so a typo is a message now rather than a
+    // failed run at seven in the morning.
+    let base_url = match kind {
+        errand_core::providers::Kind::OpenAiCompat => {
+            let raw = body
+                .base_url
+                .clone()
+                .filter(|u| !u.trim().is_empty())
+                .or_else(|| known.map(|k| k.base_url.to_string()))
+                .unwrap_or_default();
+            if raw.trim().is_empty() {
+                return Err(ApiError::bad_request(
+                    "A model of your own needs an address, such as http://127.0.0.1:11434",
+                ));
+            }
+            Some(
+                errand_core::providers::parse_base_url(&raw)
+                    .map_err(|e| ApiError::bad_request(e.to_string()))?,
+            )
+        }
+        _ => None,
+    };
+
+    let provider = errand_core::providers::Provider {
+        // A known service keeps its own id, so adding OpenAI twice updates the
+        // one row rather than quietly stacking up duplicates with one key each.
+        id: body
+            .id
+            .or_else(|| known.map(|k| k.id.to_string()))
+            .unwrap_or_else(errand_core::new_id),
+        kind: kind.as_str().into(),
+        label: if !body.label.trim().is_empty() {
+            body.label.trim().to_string()
+        } else if let Some(k) = known {
+            k.name.to_string()
+        } else {
+            kind.as_str().to_string()
+        },
+        base_url,
+        model: body.model.filter(|m| !m.trim().is_empty()).or_else(|| {
+            known
+                .map(|k| k.example_model.to_string())
+                .filter(|m| !m.is_empty())
+        }),
+        enabled: body.enabled,
+        discovered: false,
+        health: None,
+        health_detail: None,
+    };
+
+    // The key goes to the keychain before the row is written, so a saved
+    // provider is never left pointing at a key that failed to store.
+    if let Some(raw) = body.key.as_ref() {
+        let key = raw.trim();
+        if key.is_empty() {
+            crate::secrets::delete_internal(&errand_core::providers::key_account(&provider.id))
+                .await
+                .ok();
+        } else {
+            if let Some(k) = known {
+                if !k.key_prefix.is_empty() && !key.starts_with(k.key_prefix) {
+                    return Err(ApiError::bad_request(format!(
+                        "A {} key starts with {}. Check you pasted the right one.",
+                        k.name, k.key_prefix
+                    )));
+                }
+            }
+            crate::secrets::put_internal(
+                &errand_core::providers::key_account(&provider.id),
+                errand_core::keychain::Secret::new(key.to_string()),
+            )
+            .await
+            .map_err(|_| {
+                ApiError::internal(
+                    "Errand could not write to your keychain, so the key was not saved. If macOS \
+                     asked for permission and it was refused, allow it and try again.",
+                )
+            })?;
+        }
+    }
+
+    errand_core::db::upsert_provider(state.pool(), &provider)
+        .await
+        .map_err(ApiError::from)?;
+
+    let (status, detail) = crate::models::check_one(&provider).await;
+    errand_core::db::set_provider_health(state.pool(), &provider.id, status, Some(&detail))
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(json!({
+        "id": provider.id,
+        "health": status,
+        "health_detail": detail,
+    })))
+}
+
+async fn remove_provider(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    if id == crate::models::BUILTIN_CLAUDE {
+        return Err(ApiError::bad_request(
+            "This is the AI Errand falls back to. You can switch it off, but removing it would \
+             leave nothing to run tasks with.",
+        ));
+    }
+    let gone = errand_core::db::delete_provider(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?;
+    if !gone {
+        return Err(ApiError::not_found("There is no such model in the list."));
+    }
+    // The key goes with it. Leaving a key in the keychain for something the
+    // person believes they removed is exactly the surprise to avoid.
+    crate::secrets::delete_internal(&errand_core::providers::key_account(&id))
+        .await
+        .ok();
+    Ok(Json(json!({ "removed": true })))
+}
+
+/// Ask a provider whether it is really there, and say what came back.
+async fn test_provider(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    let providers = errand_core::db::list_providers(state.pool())
+        .await
+        .map_err(ApiError::from)?;
+    let p = providers
+        .into_iter()
+        .find(|p| p.id == id)
+        .ok_or_else(|| ApiError::not_found("There is no such model in the list."))?;
+
+    let (status, detail) = crate::models::check_one(&p).await;
+    errand_core::db::set_provider_health(state.pool(), &id, status, Some(&detail))
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(json!({ "health": status, "health_detail": detail })))
+}
+
+#[derive(Deserialize)]
+struct Discover {
+    /// Look on the local network too, not just this machine. Off by default,
+    /// because scanning somebody's network is not something to do unasked.
+    #[serde(default)]
+    scan_network: bool,
+}
+
+fn scanned_where(scan_network: bool) -> &'static str {
+    if scan_network {
+        "this machine and every address on your network"
+    } else {
+        "this machine only"
+    }
+}
+
+/// Look for models running on this machine, and optionally on this network.
+///
+/// The flag is a query parameter rather than a body, so that "did it scan?" can
+/// never come down to whether a body parsed. An optional body silently becomes
+/// "no" when anything about the request is slightly off, and a scan that
+/// quietly did not happen looks exactly like a network with nothing on it.
+async fn discover_providers(
+    Extension(caller): Extension<Caller>,
+    Query(q): Query<Discover>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    let found = crate::models::discover(q.scan_network).await;
+    Ok(Json(json!({
+        "found": found,
+        // Said back, so nobody has to infer from an empty list whether the scan
+        // they asked for actually happened.
+        "looked_at": scanned_where(q.scan_network),
+        // Nothing is switched on by this call. Finding something and using it
+        // are separate decisions, and the second one is the person's.
+        "note": "Nothing has been added yet. Pick the ones you want to use.",
+    })))
+}
+
+#[derive(Deserialize)]
+struct BindRole {
+    /// None means "no preference": use whatever is available.
+    provider_id: Option<String>,
+}
+
+async fn bind_role(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(role): Path<String>,
+    Json(body): Json<BindRole>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    let role = errand_core::providers::Role::parse(&role)
+        .ok_or_else(|| ApiError::bad_request(format!("'{role}' is not one of Errand's jobs.")))?;
+
+    // Refused with a reason rather than accepted and quietly ignored later.
+    if let Some(id) = &body.provider_id {
+        let providers = errand_core::db::list_providers(state.pool())
+            .await
+            .map_err(ApiError::from)?;
+        let p = providers
+            .iter()
+            .find(|p| &p.id == id)
+            .ok_or_else(|| ApiError::not_found("There is no such model in the list."))?;
+        if role.needs_agentic() && !p.can_carry_out_tasks() {
+            return Err(ApiError::bad_request(
+                p.cannot_fill(role).unwrap_or_default(),
+            ));
+        }
+    }
+
+    errand_core::db::set_role_binding(state.pool(), role, body.provider_id.as_deref())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct LocalOnly {
+    enabled: bool,
+}
+
+async fn set_local_only(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Json(body): Json<LocalOnly>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+
+    // Turning this on with nothing local configured would silently stop every
+    // task, so it is refused with the reason instead.
+    if body.enabled {
+        let providers = errand_core::db::list_providers(state.pool())
+            .await
+            .map_err(ApiError::from)?;
+        if !providers.iter().any(|p| p.enabled && p.is_local()) {
+            return Err(ApiError::bad_request(
+                "There is no model on this machine for Errand to use, so turning this on would \
+                 stop everything. Add one first — Find models on this machine will look.",
+            ));
+        }
+    }
+
+    errand_core::db::set_setting(state.pool(), "privacy.local_only", &json!(body.enabled))
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({ "local_only": body.enabled })))
+}
+
+#[derive(Deserialize)]
+struct AnthropicKey {
+    /// Write-only. Goes to the keychain and is never read back out to anyone.
+    key: String,
+}
+
+async fn save_anthropic_key(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Json(body): Json<AnthropicKey>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    let key = body.key.trim().to_string();
+    if key.is_empty() {
+        crate::secrets::delete_internal("anthropic.api_key")
+            .await
+            .ok();
+        return Ok(Json(json!({ "saved": false, "removed": true })));
+    }
+    if !key.starts_with("sk-ant-") {
+        return Err(ApiError::bad_request(
+            "An Anthropic key starts with sk-ant-. Check you pasted the whole thing.",
+        ));
+    }
+
+    crate::secrets::put_internal("anthropic.api_key", errand_core::keychain::Secret::new(key))
+        .await
+        .map_err(|_| {
+            ApiError::internal(
+                "Errand could not write to your keychain. If macOS asked for permission and it \
+                 was refused, allow it and try again.",
+            )
+        })?;
+
+    // Having a key is only useful with something to use it, so the row appears
+    // at the same moment rather than needing a second step nobody would guess.
+    let provider = errand_core::providers::Provider {
+        id: "anthropic-api".into(),
+        kind: errand_core::providers::Kind::AnthropicApi.as_str().into(),
+        label: "Anthropic API".into(),
+        base_url: None,
+        model: None,
+        enabled: true,
+        discovered: false,
+        health: Some("ok".into()),
+        health_detail: Some("a key is saved in your keychain".into()),
+    };
+    errand_core::db::upsert_provider(state.pool(), &provider)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(json!({ "saved": true, "provider_id": provider.id })))
 }

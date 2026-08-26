@@ -4542,8 +4542,13 @@ mod ai_tests {
 
     #[tokio::test]
     async fn a_role_bound_to_something_that_cannot_do_the_job_still_resolves() {
-        // The point of the chain: a person picking a local model for the executor
-        // must not silently stop every task from running.
+        // The point of the chain: a person picking a model that turns out not to
+        // be able to carry out a task must not silently stop every task from
+        // running.
+        //
+        // A model nobody has asked is a different case, and used to be treated
+        // as the same one: it goes first, because not having checked is not the
+        // same as having found out it cannot.
         let pool = open_memory().await.unwrap();
         upsert_provider(&pool, &p("cli", Kind::ClaudeCli, "Claude"))
             .await
@@ -4557,8 +4562,24 @@ mod ai_tests {
 
         let providers = list_providers(&pool).await.unwrap();
         let bindings = list_role_bindings(&pool).await.unwrap();
-        let chain = crate::providers::resolve_chain(&providers, &bindings, Role::Executor, false);
 
+        let unchecked =
+            crate::providers::resolve_chain(&providers, &bindings, Role::Executor, false);
+        assert_eq!(
+            unchecked.first().map(|p| p.id.as_str()),
+            Some("loc"),
+            "a model nobody has checked must still get the job it was chosen for"
+        );
+
+        let found_wanting =
+            crate::providers::ToolsSeen::from([("loc".to_string(), crate::providers::Tools::No)]);
+        let chain = crate::providers::resolve_chain_knowing(
+            &providers,
+            &bindings,
+            Role::Executor,
+            false,
+            &found_wanting,
+        );
         assert_eq!(chain.len(), 1);
         assert_eq!(
             chain[0].id, "cli",

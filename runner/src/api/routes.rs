@@ -2474,18 +2474,55 @@ async fn get_ai(
         .await
         .map_err(ApiError::from)?;
     let local_only = local_only_setting(&state).await;
+    let seen = tools_seen(&state).await;
+
+    // Each model with what Errand has found out about it, because "can this one
+    // do the task" is the question the screen exists to answer and it must not
+    // be guessed at from the kind of endpoint.
+    let listed: Vec<serde_json::Value> = providers
+        .iter()
+        .map(|p| {
+            let tools = p.tools(&seen);
+            json!({
+                "id": p.id,
+                "kind": p.kind,
+                "label": p.label,
+                "base_url": p.base_url,
+                "model": p.model,
+                "enabled": p.enabled,
+                "discovered": p.discovered,
+                "health": p.health,
+                "health_detail": p.health_detail,
+                "tools": tools.as_str(),
+                "tools_says": tools.describe(),
+                // Null when it can, or when nobody has checked. Only a model
+                // Errand has actually found wanting gets a reason.
+                "cannot_carry_out_because": p.cannot_carry_out_tasks(tools),
+            })
+        })
+        .collect();
 
     // For each job, what would happen if it were asked right now. This is the
     // part that turns "it uses AI somehow" into something you can point at.
     let roles: Vec<serde_json::Value> = errand_core::providers::Role::ALL
         .iter()
         .map(|&role| {
-            let chain =
-                errand_core::providers::resolve_chain(&providers, &bindings, role, local_only);
+            let chain = errand_core::providers::resolve_chain_knowing(
+                &providers, &bindings, role, local_only, &seen,
+            );
             let chosen = bindings
                 .iter()
                 .find(|(r, _)| *r == role)
                 .map(|(_, id)| id.clone());
+            // A model can be picked for a job and only later turn out to be
+            // unable to do it, in which case the chain quietly moves on and the
+            // person is owed the reason rather than a silent substitution.
+            let chosen_problem = chosen.as_ref().and_then(|id| {
+                providers
+                    .iter()
+                    .find(|p| &p.id == id)
+                    .and_then(|p| p.cannot_fill(role, p.tools(&seen)))
+            });
             json!({
                 "role": role.as_str(),
                 "explains": role.describe(),
@@ -2495,6 +2532,7 @@ async fn get_ai(
                 "in_use": role.is_wired(),
                 "not_used_because": role.not_wired_reason(),
                 "chosen": chosen,
+                "chosen_problem": chosen_problem,
                 "using": chain.first().map(|p| json!({
                     "id": p.id,
                     "label": p.label,
@@ -2510,10 +2548,196 @@ async fn get_ai(
         .collect();
 
     Ok(Json(json!({
-        "providers": providers,
+        "providers": listed,
         "roles": roles,
         "local_only": local_only,
     })))
+}
+
+// --------------------------------------------------- can it use tools? --
+//
+// Carrying out a task needs exactly one thing from a model: that it answers
+// with a tool call instead of with a paragraph. Errand supplies the loop, the
+// tools, the budget and the fence, so this is the whole question, and it is
+// cheaper to ask the model once than to find out at seven in the morning when
+// a booking did not happen.
+
+/// What Errand has learned about which models can use tools.
+async fn tools_seen(state: &AppState) -> errand_core::providers::ToolsSeen {
+    let stored = errand_core::db::get_setting(state.pool(), errand_core::providers::TOOLS_SEEN_KEY)
+        .await
+        .ok()
+        .flatten();
+    errand_core::providers::read_tools_seen(stored.as_ref())
+}
+
+/// Write down what one model turned out to be able to do.
+///
+/// "Unknown" is stored by forgetting rather than by writing the word, so the
+/// note holds only what was actually found out and a model that is removed
+/// leaves nothing behind.
+async fn remember_tools(state: &AppState, id: &str, tools: errand_core::providers::Tools) {
+    let mut seen = tools_seen(state).await;
+    if tools == errand_core::providers::Tools::Unknown {
+        seen.remove(id);
+    } else {
+        seen.insert(id.to_string(), tools);
+    }
+    let _ = errand_core::db::set_setting(
+        state.pool(),
+        errand_core::providers::TOOLS_SEEN_KEY,
+        &errand_core::providers::write_tools_seen(&seen),
+    )
+    .await;
+}
+
+/// How long to wait for an answer to the tool question.
+///
+/// Long enough for a large model that is not in memory yet.
+///
+/// Measured rather than guessed: on an ordinary home network a 27B model that
+/// has to load itself from disk took about 150 seconds to answer its first
+/// question, and answered in under two once it was warm. A short timeout would
+/// report exactly the models somebody most wants to use as unchecked, over and
+/// over, which reads as the feature not working. Waiting is the lesser evil,
+/// and the screen says it may take a couple of minutes.
+const TOOL_CHECK_SECONDS: u64 = 240;
+
+/// Ask a model the smallest question that can only be answered with a tool call.
+///
+/// Deliberately trivial and free of side effects. It proves one thing, that the
+/// model will reach for a tool when it is given one, and claims nothing at all
+/// about how well it would do a real errand.
+///
+/// Returns what was found out, and a sentence for the health detail saying how
+/// it was found out, because a verdict with no evidence behind it is the sort of
+/// thing people rightly distrust.
+async fn ask_whether_it_can_use_tools(
+    p: &errand_core::providers::Provider,
+) -> (errand_core::providers::Tools, String) {
+    use errand_core::providers::Tools;
+
+    let base = p.base_url.clone().unwrap_or_default();
+    let Some(model) = p.model.clone().filter(|m| !m.trim().is_empty()) else {
+        return (
+            Tools::Unknown,
+            "Errand does not know which model to ask for here, so it could not find out whether \
+             this one can carry out tasks. Give it a model name and check again."
+                .into(),
+        );
+    };
+
+    let tools = vec![json!({
+        "type": "function",
+        "function": {
+            "name": "report",
+            "description": "The only way to reply. Call this with the answer.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "answer": { "type": "string", "description": "The answer to the question." }
+                },
+                "required": ["answer"],
+            }
+        }
+    })];
+    let messages = vec![
+        json!({
+            "role": "system",
+            "content": "You answer only by calling a tool. Never reply in words.",
+        }),
+        json!({
+            "role": "user",
+            "content": "What colour is a ripe lemon? Reply by calling the report tool.",
+        }),
+    ];
+
+    let key = crate::models::key_for(&p.id).await;
+    let asked = tokio::time::timeout(
+        std::time::Duration::from_secs(TOOL_CHECK_SECONDS),
+        crate::models::chat_with_tools(&base, &model, &messages, &tools, key.as_deref()),
+    )
+    .await;
+
+    match asked {
+        Ok(Ok(turn)) if !turn.tool_calls.is_empty() => (
+            Tools::Yes,
+            format!("{model} used the tool it was given, so it can carry out tasks."),
+        ),
+        Ok(Ok(_)) => (
+            Tools::No,
+            format!(
+                "{model} answered in words instead of using the tool it was given, so it cannot \
+                 drive a browser. It can still do Errand's other three jobs."
+            ),
+        ),
+        Ok(Err(e)) if e.no_tool_support => (
+            Tools::No,
+            format!(
+                "{model} does not support tool calling, so it cannot carry out a task. It can \
+                 still do Errand's other three jobs. What the server said: {e}"
+            ),
+        ),
+        Ok(Err(e)) => (
+            Tools::Unknown,
+            format!("Errand could not find out whether {model} can use tools: {e}"),
+        ),
+        Err(_) => (
+            Tools::Unknown,
+            format!(
+                "{model} did not answer within {TOOL_CHECK_SECONDS} seconds, so Errand still does \
+                 not know whether it can carry out tasks. A model that has just been loaded is \
+                 often slow the first time: press Check again."
+            ),
+        ),
+    }
+}
+
+/// Why a provider is being checked, which decides what to do about the tool
+/// question.
+enum Checking {
+    /// Where this model lives, or which model it is, has just changed. Whatever
+    /// was known is about something else now, so it is dropped rather than
+    /// carried over onto a model that never earned it.
+    AfterAChange,
+    /// Somebody pressed Check. Ask again, and keep what was already known if
+    /// the question cannot be put, because a machine being asleep is not an
+    /// answer about what it can do.
+    OnPurpose,
+    /// Only the switch was flipped. Nothing new to find out, and nobody should
+    /// be made to wait on a model while they turn it off.
+    NothingNew,
+}
+
+/// Check a provider, and where it makes sense, find out whether it can be
+/// handed a whole task.
+async fn check_and_remember(
+    state: &AppState,
+    p: &errand_core::providers::Provider,
+    why: Checking,
+) -> (&'static str, String) {
+    use errand_core::providers::{Kind, Tools};
+
+    let (status, mut detail) = crate::models::check_one(p).await;
+
+    // Only the OpenAI-compatible ones are a question. The command line tool is
+    // an agent loop already, and Anthropic's own API is refused for a reason
+    // that has nothing to do with what its model can do.
+    if !matches!(p.kind_enum(), Some(Kind::OpenAiCompat)) || matches!(why, Checking::NothingNew) {
+        return (status, detail);
+    }
+
+    if status == "ok" {
+        let (tools, said) = ask_whether_it_can_use_tools(p).await;
+        detail = format!("{detail} {said}");
+        if tools != Tools::Unknown || matches!(why, Checking::AfterAChange) {
+            remember_tools(state, &p.id, tools).await;
+        }
+    } else if matches!(why, Checking::AfterAChange) {
+        remember_tools(state, &p.id, Tools::Unknown).await;
+    }
+
+    (status, detail)
 }
 
 async fn local_only_setting(state: &AppState) -> bool {
@@ -2662,11 +2886,32 @@ async fn save_provider(
         }
     }
 
+    // What this row said before, so that flipping the switch on a model does not
+    // put somebody through the whole interrogation again.
+    let before = errand_core::db::list_providers(state.pool())
+        .await
+        .map_err(ApiError::from)?
+        .into_iter()
+        .find(|e| e.id == provider.id);
+    let why = match &before {
+        Some(b)
+            if b.base_url == provider.base_url
+                && b.model == provider.model
+                && body.key.is_none() =>
+        {
+            Checking::NothingNew
+        }
+        _ => Checking::AfterAChange,
+    };
+
     errand_core::db::upsert_provider(state.pool(), &provider)
         .await
         .map_err(ApiError::from)?;
 
-    let (status, detail) = crate::models::check_one(&provider).await;
+    // Asked now, once, rather than assumed: a model is capable or not on its
+    // own merits, and the answer belongs on the screen before anybody relies
+    // on it for a real errand.
+    let (status, detail) = check_and_remember(&state, &provider, why).await;
     errand_core::db::set_provider_health(state.pool(), &provider.id, status, Some(&detail))
         .await
         .map_err(ApiError::from)?;
@@ -2701,10 +2946,14 @@ async fn remove_provider(
     crate::secrets::delete_internal(&errand_core::providers::key_account(&id))
         .await
         .ok();
+    // And so does what Errand learned about it, or a model added later at the
+    // same address would inherit a verdict it never earned.
+    remember_tools(&state, &id, errand_core::providers::Tools::Unknown).await;
     Ok(Json(json!({ "removed": true })))
 }
 
-/// Ask a provider whether it is really there, and say what came back.
+/// Ask a provider whether it is really there and what it can do, then say what
+/// came back.
 async fn test_provider(
     State(state): State<AppState>,
     Extension(caller): Extension<Caller>,
@@ -2719,12 +2968,18 @@ async fn test_provider(
         .find(|p| p.id == id)
         .ok_or_else(|| ApiError::not_found("There is no such model in the list."))?;
 
-    let (status, detail) = crate::models::check_one(&p).await;
+    let (status, detail) = check_and_remember(&state, &p, Checking::OnPurpose).await;
     errand_core::db::set_provider_health(state.pool(), &id, status, Some(&detail))
         .await
         .map_err(ApiError::from)?;
 
-    Ok(Json(json!({ "health": status, "health_detail": detail })))
+    let tools = p.tools(&tools_seen(&state).await);
+    Ok(Json(json!({
+        "health": status,
+        "health_detail": detail,
+        "tools": tools.as_str(),
+        "tools_says": tools.describe(),
+    })))
 }
 
 #[derive(Deserialize)]
@@ -2803,10 +3058,13 @@ async fn bind_role(
             .iter()
             .find(|p| &p.id == id)
             .ok_or_else(|| ApiError::not_found("There is no such model in the list."))?;
-        if role.needs_agentic() && !p.can_carry_out_tasks() {
-            return Err(ApiError::bad_request(
-                p.cannot_fill(role).unwrap_or_default(),
-            ));
+        // Only a model Errand has actually found wanting is refused. One nobody
+        // has checked is allowed: refusing it would be inventing a limitation.
+        if role.needs_agentic() {
+            let tools = p.tools(&tools_seen(&state).await);
+            if let Some(why) = p.cannot_carry_out_tasks(tools) {
+                return Err(ApiError::bad_request(why));
+            }
         }
     }
 
@@ -2905,7 +3163,7 @@ async fn save_anthropic_key(
 #[cfg(test)]
 mod tests {
     use super::super::testkit::{self, a_ready_manual_task, a_task};
-    use serde_json::json;
+    use serde_json::{json, Value};
 
     /// A cron that comes round every minute, so a test never has to wait for a
     /// particular hour and never depends on what time it is run.
@@ -3789,5 +4047,270 @@ mod tests {
             .as_array()
             .expect("a preview list")
             .is_empty());
+    }
+
+    // ------------------------------------------- which models can do the task --
+
+    /// A stand-in for a model server on somebody's network, answering the two
+    /// things Errand asks of one: what it can run, and whether it will call a
+    /// tool when it is given one.
+    ///
+    /// Raw TCP rather than a web framework, because the point is to prove
+    /// Errand speaks the wire format, not to test a library. It counts the
+    /// questions put to the model, which is how a test tells "it asked" from
+    /// "it made somebody wait while it asked again for no reason".
+    struct ModelServer {
+        base: String,
+        asked: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl ModelServer {
+        fn times_asked(&self) -> usize {
+            self.asked.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    async fn a_model_server(answers_chat_with: &'static str) -> ModelServer {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("a free port");
+        let port = listener.local_addr().expect("the port it took").port();
+        let asked = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = asked.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+                    let mut buf = [0u8; 8192];
+                    let n = sock.read(&mut buf).await.unwrap_or(0);
+                    let asked = String::from_utf8_lossy(&buf[..n]).to_string();
+                    let body = if asked.contains("/chat/completions") {
+                        counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        answers_chat_with.to_string()
+                    } else {
+                        json!({ "data": [{ "id": "qwen3.5-27b" }] }).to_string()
+                    };
+                    let res = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+                        body.len(),
+                        body
+                    );
+                    let _ = sock.write_all(res.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        ModelServer {
+            base: format!("http://127.0.0.1:{port}"),
+            asked,
+        }
+    }
+
+    const CALLS_A_TOOL: &str = r#"{"choices":[{"message":{"role":"assistant","content":"",
+        "tool_calls":[{"id":"c1","type":"function",
+        "function":{"name":"report","arguments":"{\"answer\":\"yellow\"}"}}]}}]}"#;
+    const ONLY_TALKS: &str =
+        r#"{"choices":[{"message":{"role":"assistant","content":"Yellow."}}]}"#;
+
+    async fn add_model(api: &testkit::Api, label: &str, base_url: &str) -> (String, Value) {
+        let (code, body) = api
+            .post(
+                "/v1/ai/providers",
+                json!({ "kind": "openai_compat", "label": label,
+                        "base_url": base_url, "model": "qwen3.5-27b", "enabled": true }),
+            )
+            .await;
+        assert_eq!(code, 200, "saving {label} failed: {body}");
+        (
+            body["id"].as_str().expect("an id").to_string(),
+            body.clone(),
+        )
+    }
+
+    fn listed<'a>(setup: &'a Value, id: &str) -> &'a Value {
+        setup["providers"]
+            .as_array()
+            .expect("the list of models")
+            .iter()
+            .find(|p| p["id"] == id)
+            .expect("the model that was just added")
+    }
+
+    #[tokio::test]
+    async fn a_local_model_that_calls_a_tool_is_offered_the_job_of_doing_the_task() {
+        // The complaint, answered. A model on somebody's own network that will
+        // use a tool is capable of carrying out a task, and the screen has to
+        // be able to say so rather than greying it out.
+        let api = testkit::start().await;
+        let server = a_model_server(CALLS_A_TOOL).await;
+        let (id, saved) = add_model(&api, "The model on my desk", &server.base).await;
+
+        assert!(
+            saved["health_detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("can carry out tasks"),
+            "saving it should say what it found out: {saved}"
+        );
+
+        let setup = api.get("/v1/ai").await;
+        let p = listed(&setup, &id);
+        assert_eq!(p["tools"], "yes");
+        assert_eq!(
+            p["cannot_carry_out_because"],
+            Value::Null,
+            "a model that used the tool must not be given a reason it cannot: {p}"
+        );
+
+        // And it can actually be chosen for the job, which is the part that was
+        // refused before.
+        let (code, body) = api
+            .post("/v1/ai/roles/executor", json!({ "provider_id": id }))
+            .await;
+        assert_eq!(code, 200, "choosing it for the task failed: {body}");
+        let setup = api.get("/v1/ai").await;
+        let executor = &setup["roles"][0];
+        assert_eq!(executor["role"], "executor");
+        assert_eq!(executor["using"]["id"], json!(id));
+        assert_eq!(executor["chosen_problem"], Value::Null);
+    }
+
+    #[tokio::test]
+    async fn a_model_that_answers_in_words_is_refused_the_task_and_told_why() {
+        let api = testkit::start().await;
+        let server = a_model_server(ONLY_TALKS).await;
+        let (id, _) = add_model(&api, "Small local model", &server.base).await;
+
+        let setup = api.get("/v1/ai").await;
+        let p = listed(&setup, &id);
+        assert_eq!(p["tools"], "no");
+        let why = p["cannot_carry_out_because"].as_str().unwrap_or_default();
+        assert!(
+            why.contains("did not use the tools"),
+            "the reason has to be about this model: {why}"
+        );
+        assert!(
+            why.contains("other three jobs"),
+            "and it has to say what it can still do: {why}"
+        );
+
+        let (code, body) = api
+            .post("/v1/ai/roles/executor", json!({ "provider_id": id }))
+            .await;
+        assert_eq!(code, 400, "it cannot do this job, so it cannot be picked");
+        assert!(body["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("did not use the tools"));
+
+        // But it is still perfectly good at the rest.
+        let (code, body) = api
+            .post("/v1/ai/roles/narrator", json!({ "provider_id": id }))
+            .await;
+        assert_eq!(code, 200, "it can still write the messages: {body}");
+    }
+
+    #[tokio::test]
+    async fn a_model_errand_could_not_reach_is_unchecked_rather_than_incapable() {
+        // The line that made the app look like it was lying. Nothing was ever
+        // asked of these models, so "cannot do this job" was never true.
+        let api = testkit::start().await;
+        // Port 9 discards everything, so nothing answers and nothing is learned.
+        let (id, _) = add_model(&api, "The machine that is asleep", "http://127.0.0.1:9").await;
+
+        let setup = api.get("/v1/ai").await;
+        let p = listed(&setup, &id);
+        assert_eq!(p["tools"], "unknown");
+        assert!(
+            p["tools_says"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Not checked"),
+            "an unasked model must read as unchecked: {p}"
+        );
+        assert_eq!(
+            p["cannot_carry_out_because"],
+            Value::Null,
+            "not having checked is not a reason to call it incapable: {p}"
+        );
+
+        // And it can still be chosen: refusing it would be inventing a limit.
+        let (code, body) = api
+            .post("/v1/ai/roles/executor", json!({ "provider_id": id }))
+            .await;
+        assert_eq!(
+            code, 200,
+            "an unchecked model must still be pickable: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn checking_again_updates_what_errand_knows_about_a_model() {
+        let api = testkit::start().await;
+        let server = a_model_server(CALLS_A_TOOL).await;
+        let (id, _) = add_model(&api, "The mini PC", &server.base).await;
+
+        let (code, body) = api
+            .post(&format!("/v1/ai/providers/{id}/test"), json!({}))
+            .await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body["tools"], "yes");
+        assert!(body["tools_says"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Can carry out tasks"));
+        assert_eq!(
+            server.times_asked(),
+            2,
+            "adding it asked once, and pressing Check asks again"
+        );
+    }
+
+    #[tokio::test]
+    async fn switching_a_model_off_does_not_put_it_through_the_questions_again() {
+        // The switch on the row is the same save with one flag flipped. Asking
+        // the model again there would leave somebody waiting on a machine they
+        // are in the middle of turning off, and could learn nothing new.
+        let api = testkit::start().await;
+        let server = a_model_server(CALLS_A_TOOL).await;
+        let (id, _) = add_model(&api, "The mini PC", &server.base).await;
+        assert_eq!(server.times_asked(), 1, "adding it should ask once");
+
+        let (code, body) = api
+            .post(
+                "/v1/ai/providers",
+                json!({ "id": id, "kind": "openai_compat", "label": "The mini PC",
+                        "base_url": server.base, "model": "qwen3.5-27b", "enabled": false }),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(
+            server.times_asked(),
+            1,
+            "flipping a switch must not ask the model anything"
+        );
+
+        let setup = api.get("/v1/ai").await;
+        assert_eq!(
+            listed(&setup, &id)["tools"],
+            "yes",
+            "and what was learned about it must survive being switched off"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_job_of_doing_the_task_no_longer_claims_it_has_to_be_claude() {
+        // The card said this "must be Claude for now". It reached the screen
+        // from here, so it is checked from here.
+        let api = testkit::start().await;
+        let setup = api.get("/v1/ai").await;
+        let explains = setup["roles"][0]["explains"].as_str().unwrap_or_default();
+        assert!(!explains.contains("Claude"), "{explains}");
+        assert!(explains.contains("call tools"), "{explains}");
     }
 }

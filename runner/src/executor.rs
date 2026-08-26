@@ -1,4 +1,9 @@
-//! Running a task with Claude, contained.
+//! Running a task with Claude, contained, and choosing who runs it.
+//!
+//! `carry_out` picks the model and hands the run to one of two loops: this one,
+//! which shells out to the Claude command line tool, or `agent::run_with_tools`,
+//! which is Errand's own loop for anything speaking the OpenAI chat format. The
+//! rest of this file is the Claude path, and everything below is about it.
 //!
 //! The agent reads pages written by strangers, unattended, with access to your
 //! accounts. So the question is not "which tools do we ask it not to use" but
@@ -189,7 +194,7 @@ pub fn containment_breach(tools: &[String]) -> Vec<String> {
         .collect()
 }
 
-fn system_prompt(has_playbook: bool) -> String {
+pub(crate) fn system_prompt(has_playbook: bool) -> String {
     let mut p = String::from(
         "You are carrying out one errand for the person who set this task up. They are not \
          watching; they will read your journal afterwards.\n\n\
@@ -228,6 +233,115 @@ fn system_prompt(has_playbook: bool) -> String {
         );
     }
     p
+}
+
+/// Work out which model is carrying out this task, and hand the run to it.
+///
+/// Two loops can do this job now. The Claude command line tool brings its own,
+/// and `agent::run_with_tools` is Errand's, for anything speaking the OpenAI
+/// chat format: a model on your desk, on your network, or at a service you pay
+/// for. Both end the same way, through the same tools, under the same budget.
+///
+/// The chain is only walked to find something that can be *started*. Once a
+/// model has begun acting, a failure is that run's failure and is handled by
+/// the repair ladder above; quietly starting the whole task again somewhere
+/// else would risk doing half of it twice, and the person would have no idea
+/// which model did what.
+pub async fn carry_out(
+    state: &AppState,
+    run_id: &str,
+    opts: ExecOptions,
+) -> std::result::Result<Outcome, ExecError> {
+    use errand_core::providers::Kind;
+
+    let chain = crate::models::executor_chain(state)
+        .await
+        .map_err(|e| ExecError::NoModel(e.to_string()))?;
+
+    // Why each candidate was passed over, so the failure at the end names the
+    // real obstacles rather than saying nothing is configured.
+    let mut passed_over: Vec<String> = vec![];
+
+    for p in &chain {
+        match p.kind_enum() {
+            Some(Kind::ClaudeCli) => {
+                if find_claude().is_none() {
+                    passed_over.push(format!(
+                        "{} is chosen, but the Claude command line tool is not installed where \
+                         this background service can see it",
+                        p.label
+                    ));
+                    continue;
+                }
+                let model = p.model.clone().unwrap_or_else(|| opts.model.clone());
+                announce(state, run_id, p, &model).await;
+                return execute(state, run_id, ExecOptions { model, ..opts }).await;
+            }
+
+            Some(Kind::OpenAiCompat) => {
+                let Some(model) = p.model.clone().filter(|m| !m.trim().is_empty()) else {
+                    passed_over.push(format!(
+                        "{} has no model chosen, so Errand does not know what to ask for",
+                        p.label
+                    ));
+                    continue;
+                };
+                announce(state, run_id, p, &model).await;
+                return crate::agent::run_with_tools(
+                    state,
+                    run_id,
+                    p,
+                    &model,
+                    opts.advice.as_deref(),
+                )
+                .await;
+            }
+
+            // Errand talks to Anthropic's API properly for one-off questions,
+            // but the task loop is written against the OpenAI tool format, so
+            // this one is passed over rather than half-driven.
+            Some(Kind::AnthropicApi) => passed_over.push(format!(
+                "{} cannot carry out a task yet: use the Claude command line tool, or a model \
+                 that speaks the OpenAI format",
+                p.label
+            )),
+
+            None => passed_over.push(format!("Errand does not recognise what {} is", p.label)),
+        }
+    }
+
+    Err(ExecError::NoModel(format!(
+        "Nothing Errand can use is able to carry out this task. {}. Open Settings, under Models, \
+         and choose something for \"Doing the task\".",
+        passed_over.join(". ")
+    )))
+}
+
+/// Write down which model is doing the work.
+///
+/// "Who did this" is a question the run view should answer without anybody
+/// having to guess from the writing style, and it is also where a person finds
+/// out whether their task text left the machine.
+async fn announce(
+    state: &AppState,
+    run_id: &str,
+    p: &errand_core::providers::Provider,
+    model: &str,
+) {
+    let privacy = if p.is_local() {
+        "Nothing about this task leaves your machine."
+    } else {
+        "Your task text goes to that service."
+    };
+    let line = format!("Doing this task with {model}, via {}. {privacy}", p.label);
+    if let Err(e) =
+        errand_core::db::append_step(state.pool(), run_id, "plan", &line, true, None).await
+    {
+        tracing::warn!(
+            run_id,
+            "could not record which model is doing the task: {e}"
+        );
+    }
 }
 
 fn run_dir(run_id: &str) -> std::result::Result<PathBuf, ExecError> {
@@ -492,7 +606,7 @@ pub async fn execute(
     state.take_outcome(run_id).ok_or(ExecError::NoOutcome)
 }
 
-fn truncate(s: &str, n: usize) -> String {
+pub(crate) fn truncate(s: &str, n: usize) -> String {
     if s.chars().count() <= n {
         s.to_string()
     } else {
@@ -537,7 +651,7 @@ pub async fn run_to_completion(state: AppState, run_id: String) {
             status: RunStatus::Running,
         });
 
-        let outcome = execute(
+        let outcome = carry_out(
             &state,
             &run_id,
             ExecOptions {

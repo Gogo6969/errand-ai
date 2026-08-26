@@ -24,7 +24,7 @@ const INVALID_PARAMS: i64 = -32602;
 /// contained executor loop end to end, so the tools are the ones every run
 /// needs regardless of what the task does. Browser control arrives in M2b and
 /// slots in here without changing the containment story.
-fn tool_definitions() -> Value {
+pub(crate) fn tool_definitions() -> Value {
     json!([
         {
             "name": "read_brief",
@@ -391,7 +391,7 @@ pub async fn handle(
     }
 }
 
-async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &Value) -> Value {
+pub(crate) async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &Value) -> Value {
     // Checked before every tool call, not after the run.
     //
     // A ceiling only enforced once the agent has stopped is a post-mortem, not

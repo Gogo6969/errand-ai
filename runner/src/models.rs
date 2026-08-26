@@ -6,6 +6,7 @@
 //! rather than leaving you guessing.
 
 use errand_core::providers::{Kind, Provider, Role};
+use serde_json::{json, Value};
 
 use crate::state::AppState;
 
@@ -91,6 +92,65 @@ pub async fn ask(state: &AppState, role: Role, prompt: &str) -> anyhow::Result<A
     )
 }
 
+/// The models that could carry out a task, best first.
+///
+/// Not `resolve_chain(Role::Executor)`, which asks each provider whether it
+/// "can carry out tasks" and gets back a no from everything except the Claude
+/// command line tool. That answer was true only because there was one agent
+/// loop and it lived inside the CLI. There are two now, and Errand owns the
+/// tools, the budget and the fence in both, so the question here is which loop
+/// to use rather than whether to refuse.
+///
+/// The person's own choice comes first, then anything else that is switched on,
+/// so a machine that is asleep does not stop a run before it starts.
+pub async fn executor_chain(state: &AppState) -> anyhow::Result<Vec<Provider>> {
+    let providers = errand_core::db::list_providers(state.pool()).await?;
+    let bindings = errand_core::db::list_role_bindings(state.pool()).await?;
+    let local_only = errand_core::db::get_setting(state.pool(), "privacy.local_only")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let mut chain: Vec<Provider> = vec![];
+    for (role, id) in &bindings {
+        if *role != Role::Executor {
+            continue;
+        }
+        if let Some(p) = providers.iter().find(|p| &p.id == id) {
+            if p.enabled {
+                chain.push(p.clone());
+            }
+        }
+    }
+    for p in &providers {
+        if !p.enabled || chain.iter().any(|c| c.id == p.id) {
+            continue;
+        }
+        chain.push(p.clone());
+    }
+    if local_only {
+        chain.retain(|p| p.is_local());
+    }
+
+    if chain.is_empty() {
+        if local_only {
+            anyhow::bail!(
+                "This task is set to stay on your own machine, and no model on this machine is \
+                 switched on. Add one in Settings under Models, or turn that setting off for this \
+                 task."
+            );
+        }
+        anyhow::bail!(
+            "Errand has no model switched on to carry out this task. Open Settings and either \
+             install the Claude command line tool and run 'claude /login' once, or add a model of \
+             your own by address and choose it for \"Doing the task\"."
+        );
+    }
+    Ok(chain)
+}
+
 /// Anything speaking the OpenAI chat format.
 ///
 /// This is the whole point of the module: OpenAI, Google, OpenRouter, xAI,
@@ -107,8 +167,147 @@ pub async fn ask_openai_compatible(
     prompt: &str,
     key: Option<&str>,
 ) -> Result<String, String> {
+    let body = json!({
+        "model": model,
+        "messages": [{ "role": "user", "content": prompt }],
+        "temperature": 0.2,
+        "stream": false,
+    });
+    let v = post_chat(base_url, key, &body, false)
+        .await
+        .map_err(|e| e.message)?;
+    Ok(v["choices"][0]["message"]["content"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string())
+}
+
+/// Why a chat request did not come back with an answer.
+///
+/// The tool-calling case is separated out because the fix is a different one:
+/// a model that cannot call tools is not a network problem or a bad key, and
+/// telling somebody to check their connection when they need to pick another
+/// model wastes their evening.
+#[derive(Debug, Clone)]
+pub struct ChatError {
+    pub message: String,
+    pub no_tool_support: bool,
+}
+
+impl ChatError {
+    fn plain(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            no_tool_support: false,
+        }
+    }
+}
+
+impl std::fmt::Display for ChatError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for ChatError {}
+
+/// One assistant turn, in the only two forms that matter: what it said, and
+/// what it wants run.
+#[derive(Debug, Clone, Default)]
+pub struct Turn {
+    pub text: String,
+    pub tool_calls: Vec<ToolCall>,
+}
+
+/// One tool call, with its arguments already unpacked.
+#[derive(Debug, Clone)]
+pub struct ToolCall {
+    pub id: String,
+    pub name: String,
+    pub arguments: Value,
+    /// The original text, when the server sent arguments that were not
+    /// readable JSON. Kept so the caller can tell the model what it sent
+    /// rather than dispatching a guess.
+    pub unreadable: Option<String>,
+}
+
+impl ToolCall {
+    /// The arguments as they go back into the conversation, which is always a
+    /// string: that is the shape every server accepts, whichever shape it sent.
+    fn arguments_text(&self) -> String {
+        match &self.unreadable {
+            Some(raw) => raw.clone(),
+            None => self.arguments.to_string(),
+        }
+    }
+}
+
+impl Turn {
+    /// This turn as a message to append to the conversation.
+    ///
+    /// Rebuilt rather than echoed verbatim, so the ids in the assistant message
+    /// are the same ones the tool replies will quote even where the server sent
+    /// no ids at all.
+    pub fn as_message(&self) -> Value {
+        let mut m = json!({ "role": "assistant", "content": self.text });
+        if !self.tool_calls.is_empty() {
+            m["tool_calls"] = Value::Array(
+                self.tool_calls
+                    .iter()
+                    .map(|c| {
+                        json!({
+                            "id": c.id,
+                            "type": "function",
+                            "function": { "name": c.name, "arguments": c.arguments_text() }
+                        })
+                    })
+                    .collect(),
+            );
+        }
+        m
+    }
+}
+
+/// A conversation with tools, for anything speaking the OpenAI chat format.
+///
+/// The same wire as `ask_openai_compatible` and deliberately so, but this one
+/// hands over a tool list and gives back whatever the model wants run, so the
+/// caller can execute it and come round again. That loop is what makes a model
+/// able to carry out a task rather than only answer a question.
+pub async fn chat_with_tools(
+    base_url: &str,
+    model: &str,
+    messages: &[Value],
+    tools: &[Value],
+    key: Option<&str>,
+) -> Result<Turn, ChatError> {
+    let mut body = json!({
+        "model": model,
+        "messages": messages,
+        "temperature": 0.2,
+        "stream": false,
+    });
+    if !tools.is_empty() {
+        body["tools"] = Value::Array(tools.to_vec());
+        body["tool_choice"] = json!("auto");
+    }
+    let v = post_chat(base_url, key, &body, !tools.is_empty()).await?;
+    Ok(read_turn(&v["choices"][0]["message"]))
+}
+
+/// One POST to a chat endpoint, with the error wording both callers share.
+///
+/// `wants_tools` only changes what a failure says: when tools were sent, a
+/// refusal is worth quoting, because the server's own sentence is usually the
+/// thing that names the model that cannot do it.
+async fn post_chat(
+    base_url: &str,
+    key: Option<&str>,
+    body: &Value,
+    wants_tools: bool,
+) -> Result<Value, ChatError> {
     if base_url.is_empty() {
-        return Err("no address configured".into());
+        return Err(ChatError::plain("no address configured"));
     }
     let mut req = reqwest::Client::new().post(format!(
         "{}/chat/completions",
@@ -118,41 +317,134 @@ pub async fn ask_openai_compatible(
         req = req.bearer_auth(k);
     }
     let res = req
-        .json(&serde_json::json!({
-            "model": model,
-            "messages": [{ "role": "user", "content": prompt }],
-            "temperature": 0.2,
-            "stream": false,
-        }))
+        .json(body)
         .timeout(std::time::Duration::from_secs(120))
         .send()
         .await
-        .map_err(|e| format!("could not reach it: {e}"))?;
+        .map_err(|e| ChatError::plain(format!("could not reach it: {e}")))?;
 
     let status = res.status();
-    let body = res.text().await.unwrap_or_default();
+    let raw = res.text().await.unwrap_or_default();
     if !status.is_success() {
         // The two that are worth naming, because the fix is different and
         // "it returned 401" tells nobody which one it was.
-        return Err(match status.as_u16() {
+        let message = match status.as_u16() {
             401 | 403 => {
                 "it refused the key. Check the key, and that it is for this service.".to_string()
             }
             429 => "it is rate limiting or out of credit.".to_string(),
             _ => format!("it returned {status}"),
-        });
+        };
+        if wants_tools && rejected_the_tools(&raw) {
+            return Err(ChatError {
+                message: server_complaint(&raw).unwrap_or(message),
+                no_tool_support: true,
+            });
+        }
+        return Err(ChatError::plain(message));
     }
-    let v: serde_json::Value =
-        serde_json::from_str(&body).map_err(|_| "it returned something unreadable".to_string())?;
+    let v: Value = serde_json::from_str(&raw)
+        .map_err(|_| ChatError::plain("it returned something unreadable"))?;
     // Some services put a refusal in a 200. Better to say so than to return an
     // empty answer that reads as a model having nothing to add.
     if let Some(msg) = v["error"]["message"].as_str() {
-        return Err(msg.to_string());
+        return Err(ChatError {
+            message: msg.to_string(),
+            no_tool_support: wants_tools && rejected_the_tools(msg),
+        });
     }
-    Ok(v["choices"][0]["message"]["content"]
+    Ok(v)
+}
+
+/// Does this refusal say the server or model will not do tool calling?
+///
+/// Pattern matching on prose, which is unlovely, but there is no field for it:
+/// servers say it in words and every one says it differently. Wrong either way
+/// is survivable, because the caller's next move is the same sort of honest
+/// failure; getting it right just makes the sentence a person reads useful.
+fn rejected_the_tools(body: &str) -> bool {
+    let b = body.to_lowercase();
+    if !b.contains("tool") && !b.contains("function") {
+        return false;
+    }
+    [
+        "not supported",
+        "unsupported",
+        "does not support",
+        "doesn't support",
+        "no support",
+        "unknown parameter",
+        "unrecognized",
+        "unrecognised",
+        "invalid parameter",
+        "not allowed",
+        "cannot use",
+    ]
+    .iter()
+    .any(|s| b.contains(s))
+}
+
+/// The server's own words about what went wrong, if it gave any.
+fn server_complaint(raw: &str) -> Option<String> {
+    let v: Value = serde_json::from_str(raw).ok()?;
+    let msg = v["error"]["message"]
         .as_str()
+        .or_else(|| v["error"].as_str())
+        .or_else(|| v["message"].as_str())?;
+    Some(msg.trim().chars().take(300).collect())
+}
+
+/// Read one assistant message, in whichever shape the server used.
+///
+/// Two shapes are real and both are common: `function.arguments` as a JSON
+/// string, which is what the format says, and arguments already parsed into an
+/// object, which several local servers do. A model replying with prose and no
+/// tool call at all is also normal and is not an error here.
+fn read_turn(msg: &Value) -> Turn {
+    let text = msg["content"].as_str().unwrap_or_default().to_string();
+    let mut tool_calls = vec![];
+    for (i, c) in msg["tool_calls"]
+        .as_array()
+        .map(Vec::as_slice)
         .unwrap_or_default()
-        .to_string())
+        .iter()
+        .enumerate()
+    {
+        let name = c["function"]["name"]
+            .as_str()
+            .or_else(|| c["name"].as_str())
+            .unwrap_or_default()
+            .to_string();
+        if name.is_empty() {
+            continue;
+        }
+        // Some servers leave the id out entirely, and a tool reply has to quote
+        // one, so make a stable one rather than dropping the call.
+        let id = c["id"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("call_{i}"));
+
+        let raw = &c["function"]["arguments"];
+        let (arguments, unreadable) = match raw {
+            Value::String(s) if s.trim().is_empty() => (json!({}), None),
+            Value::String(s) => match serde_json::from_str::<Value>(s) {
+                Ok(v) => (v, None),
+                Err(_) => (json!({}), Some(s.clone())),
+            },
+            Value::Object(_) => (raw.clone(), None),
+            Value::Null => (json!({}), None),
+            other => (json!({}), Some(other.to_string())),
+        };
+        tool_calls.push(ToolCall {
+            id,
+            name,
+            arguments,
+            unreadable,
+        });
+    }
+    Turn { text, tool_calls }
 }
 
 /// Anthropic's API, with a key from the keychain.
@@ -829,6 +1121,190 @@ mod tests {
         assert!(
             e.contains("claude /login"),
             "an empty setup should say how to fix it, got: {e}"
+        );
+    }
+
+    // ------------------------------------------------------ calling tools --
+
+    fn one_call(arguments: Value) -> Value {
+        json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{ "id": "abc", "type": "function",
+                             "function": { "name": "journal", "arguments": arguments } }]
+        })
+    }
+
+    #[test]
+    fn arguments_are_understood_whether_they_arrive_as_text_or_as_an_object() {
+        // Both shapes are out there. Reading only the one the specification
+        // describes would drop every call from several local servers, which is
+        // exactly the sort of thing that reads as "local models do not work".
+        for arguments in [
+            json!("{\"title\":\"Opened the basket\"}"),
+            json!({ "title": "Opened the basket" }),
+        ] {
+            let turn = read_turn(&one_call(arguments.clone()));
+            assert_eq!(turn.tool_calls.len(), 1, "dropped a call: {arguments}");
+            let call = &turn.tool_calls[0];
+            assert_eq!(call.name, "journal");
+            assert_eq!(call.arguments["title"], "Opened the basket");
+            assert!(call.unreadable.is_none());
+        }
+    }
+
+    #[test]
+    fn arguments_that_are_not_readable_are_reported_rather_than_guessed_at() {
+        // Dispatching an empty object here would be worse than useless: the
+        // tool would do something other than what was asked for.
+        let turn = read_turn(&one_call(json!("title: Opened the basket")));
+        let call = &turn.tool_calls[0];
+        assert_eq!(
+            call.unreadable.as_deref(),
+            Some("title: Opened the basket"),
+            "unreadable arguments must be kept, so the model can be told what it sent"
+        );
+    }
+
+    #[test]
+    fn a_call_with_no_id_still_gets_a_conversation_that_hangs_together() {
+        // Several servers leave the id out. A tool reply has to quote one, so
+        // dropping the call or inventing a different id each time would break
+        // the very next turn.
+        let msg = json!({
+            "role": "assistant",
+            "tool_calls": [{ "function": { "name": "finish", "arguments": "{}" } }]
+        });
+        let turn = read_turn(&msg);
+        assert_eq!(turn.tool_calls.len(), 1);
+        let id = turn.tool_calls[0].id.clone();
+        assert!(!id.is_empty());
+        assert_eq!(
+            turn.as_message()["tool_calls"][0]["id"].as_str(),
+            Some(id.as_str()),
+            "the id the tool reply will quote must be the one in the assistant message"
+        );
+    }
+
+    #[test]
+    fn a_model_answering_in_words_is_ordinary_rather_than_broken() {
+        let turn = read_turn(&json!({ "role": "assistant", "content": "I would start by..." }));
+        assert!(turn.tool_calls.is_empty());
+        assert!(turn.text.starts_with("I would start"));
+    }
+
+    #[test]
+    fn a_server_that_will_not_do_tools_is_told_apart_from_a_bad_key() {
+        // The fix is different: one means pick another model, the other means
+        // check the key. Saying the wrong one costs somebody an evening.
+        for refusal in [
+            "this model does not support tools",
+            "tool_choice is not supported",
+            "Unknown parameter: 'tools'",
+            "function calling unsupported for this model",
+        ] {
+            assert!(rejected_the_tools(refusal), "missed: {refusal}");
+        }
+        for other in [
+            "invalid api key",
+            "rate limit exceeded",
+            "model not found",
+            "context length exceeded",
+        ] {
+            assert!(!rejected_the_tools(other), "wrongly blamed tools: {other}");
+        }
+    }
+
+    #[tokio::test]
+    async fn the_model_chosen_for_the_task_is_the_one_asked_to_do_it() {
+        // The point of the whole change: a model on your own machine can be the
+        // one that carries out the task, and being chosen means being first.
+        let pool = errand_core::db::open_memory().await.unwrap();
+        for (id, kind, url, enabled) in [
+            (BUILTIN_CLAUDE, Kind::ClaudeCli, None, true),
+            (
+                "desk",
+                Kind::OpenAiCompat,
+                Some("http://127.0.0.1:11434/v1"),
+                true,
+            ),
+            (
+                "asleep",
+                Kind::OpenAiCompat,
+                Some("http://127.0.0.1:1234/v1"),
+                false,
+            ),
+        ] {
+            errand_core::db::upsert_provider(
+                &pool,
+                &Provider {
+                    id: id.into(),
+                    kind: kind.as_str().into(),
+                    label: id.into(),
+                    base_url: url.map(str::to_string),
+                    model: Some("qwen3.5-27b".into()),
+                    enabled,
+                    discovered: false,
+                    health: None,
+                    health_detail: None,
+                },
+            )
+            .await
+            .unwrap();
+        }
+        errand_core::db::set_role_binding(&pool, Role::Executor, Some("desk"))
+            .await
+            .unwrap();
+
+        let state = AppState::new(pool);
+        let chain = executor_chain(&state).await.expect("something can do it");
+
+        assert_eq!(
+            chain.first().map(|p| p.id.as_str()),
+            Some("desk"),
+            "the model the person picked has to be the one that gets the job"
+        );
+        assert!(
+            chain.iter().any(|p| p.id == BUILTIN_CLAUDE),
+            "the others stay behind it, so a machine that is asleep does not stop the run"
+        );
+        assert!(
+            !chain.iter().any(|p| p.id == "asleep"),
+            "a model that is switched off must not be asked to do anything"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_kept_on_this_machine_is_never_handed_to_a_service() {
+        let pool = errand_core::db::open_memory().await.unwrap();
+        errand_core::db::upsert_provider(
+            &pool,
+            &Provider {
+                id: "a service".into(),
+                kind: Kind::OpenAiCompat.as_str().into(),
+                label: "Somebody else's computer".into(),
+                base_url: Some("https://api.example.com/v1".into()),
+                model: Some("big".into()),
+                enabled: true,
+                discovered: false,
+                health: None,
+                health_detail: None,
+            },
+        )
+        .await
+        .unwrap();
+        errand_core::db::set_setting(&pool, "privacy.local_only", &json!(true))
+            .await
+            .unwrap();
+
+        let state = AppState::new(pool);
+        let e = executor_chain(&state)
+            .await
+            .expect_err("nothing local is switched on")
+            .to_string();
+        assert!(
+            e.contains("stay on your own machine"),
+            "it must say why it refused, not just that it did: {e}"
         );
     }
 }

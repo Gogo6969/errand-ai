@@ -12,7 +12,15 @@
 -->
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api, ApiError, type AiSetup, type KnownService, type Provider, type ScanResult } from "$lib/api";
+  import {
+    api,
+    ApiError,
+    type AiSetup,
+    type KnownService,
+    type ListedProvider,
+    type Provider,
+    type ScanResult,
+  } from "$lib/api";
   import Hint from "$lib/components/Hint.svelte";
 
   let setup = $state<AiSetup | null>(null);
@@ -86,6 +94,35 @@
       checkingId = null;
     }
   }
+
+  // Every model nobody has asked yet, and that asking could tell us about.
+  // Shown by name rather than counted, because "three not checked" tells you
+  // nothing about whether the one you care about is among them.
+  const unchecked = $derived(
+    (setup?.providers ?? []).filter((p) => p.tools === "unknown" && !p.cannot_carry_out_because),
+  );
+
+  // Checking asks each one a single question, one after another, so a machine
+  // that is asleep costs its own wait and not everybody else's.
+  async function checkTheUnchecked() {
+    for (const p of unchecked) await check(p);
+  }
+
+  /**
+   * What to say after a model's name in the list of who could do the task.
+   *
+   * Nothing at all for one that can, because a list where every line carries a
+   * note is a list nobody reads. The reason itself sits under the dropdown.
+   */
+  function taskNote(p: ListedProvider): string {
+    if (p.tools === "no") return " (cannot use tools)";
+    if (p.cannot_carry_out_because) return " (cannot do this job)";
+    if (p.tools === "unknown") return " (not checked yet)";
+    return "";
+  }
+
+  const toolsDot = (p: ListedProvider) =>
+    p.tools === "yes" ? "ok" : p.cannot_carry_out_because ? "warn" : "";
 
   async function runScan() {
     busy = true;
@@ -175,6 +212,14 @@
 
         {#if !r.in_use}
           <div class="warnbox">{r.not_used_because}</div>
+        {:else if r.chosen_problem}
+          <!-- Picked before Errand knew what it could do. Saying so is better
+               than quietly using something else and letting the person believe
+               their choice stuck. -->
+          <div class="warnbox">
+            {r.chosen_problem}
+            {#if r.using}Errand is using {r.using.label} instead.{/if}
+          </div>
         {:else if r.using}
           <div class="using">
             <span class="pill ok">{r.using.label}</span>
@@ -201,12 +246,40 @@
             >
               <option value="">No preference: use whatever works</option>
               {#each setup.providers as p}
-                <option value={p.id} disabled={r.needs_agentic && p.kind !== "claude_cli"}>
-                  {p.label}{r.needs_agentic && p.kind !== "claude_cli" ? " (cannot do this job)" : ""}
+                <option value={p.id} disabled={r.needs_agentic && !!p.cannot_carry_out_because}>
+                  {p.label}{r.needs_agentic ? taskNote(p) : ""}
                 </option>
               {/each}
             </select>
           </Hint>
+
+          {#if r.needs_agentic}
+            <!-- What is actually known, rather than a blanket refusal. A model
+                 is only called incapable where Errand has asked it and found
+                 out; everything else says plainly that nobody has looked. -->
+            {#each setup.providers.filter((p) => p.cannot_carry_out_because) as p}
+              <div class="muted">{p.cannot_carry_out_because}</div>
+            {/each}
+
+            {#if unchecked.length}
+              <div class="muted">
+                Not checked yet: {unchecked.map((p) => p.label).join(", ")}. Errand has not asked
+                {unchecked.length === 1 ? "it" : "them"} to use a tool, so it does not know. You can
+                pick {unchecked.length === 1 ? "it" : "one"} anyway.
+              </div>
+              <Hint id="ai.check_tools">
+                <button disabled={busy || checkingId !== null} onclick={checkTheUnchecked}>
+                  {checkingId !== null ? "Asking…" : "Check which can carry out a task"}
+                </button>
+              </Hint>
+            {/if}
+
+            <div class="muted">
+              Any model that can use tools can do this job. One that only answers questions cannot
+              drive a browser. Being able to is not the same as being good at it: a small model
+              will misread a page and give up half way through, so use the best one you have.
+            </div>
+          {/if}
         {/if}
       </div>
     {/each}
@@ -219,6 +292,9 @@
         <div class="rname">
           {p.label}
           <span class="pill {dot(p.health)}">{health(p.health)}</span>
+          <Hint id="ai.tools">
+            <span class="pill {toolsDot(p)}">{p.tools_says}</span>
+          </Hint>
           {#if !p.enabled}<span class="pill">Switched off</span>{/if}
         </div>
         <div class="muted">{where(p)}{p.base_url ? ` · ${p.base_url}` : ""}{p.model ? ` · ${p.model}` : ""}</div>
@@ -228,7 +304,7 @@
       <div class="actions">
         <Hint id="ai.test">
           <button disabled={busy || checkingId === p.id} onclick={() => check(p)}>
-            {checkingId === p.id ? "Checking…" : "Check"}
+            {checkingId === p.id ? "Checking, this can take a minute or two…" : "Check"}
           </button>
         </Hint>
         <Hint id="ai.enable">
@@ -300,8 +376,9 @@
   <div class="card">
     <div class="muted" style="margin-bottom:10px">
       Ollama, LM Studio, vLLM, llama.cpp, GPT4All and Open WebUI all speak the same language, so
-      Errand can use any of them. A model here never sends your task to anyone. It cannot carry
-      out a task on its own, since that still needs Claude, but it can do the other jobs.
+      Errand can use any of them, for any of the four jobs. A model here never sends your task to
+      anyone. If it can use tools, it can carry out the task itself: Errand hands it the browser
+      and runs the loop. Adding one asks it a single question to find out.
     </div>
 
     <Hint id="ai.scan_network">
@@ -407,8 +484,8 @@
     </Hint>
     <div class="muted" style="margin-top:8px">
       With this on, Errand refuses to send anything to a model it does not reach on your own
-      machine or your own network. Tasks that need a browser will stop working, because that
-      needs Claude.
+      machine or your own network. Tasks that need a browser keep working, as long as one of your
+      own models can use tools. If none can, they stop rather than quietly going to a service.
     </div>
   </div>
 {:else if !problem}

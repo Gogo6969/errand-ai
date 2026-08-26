@@ -3,21 +3,27 @@
 //! Errand does not ship with an AI. It uses whichever ones you already have,
 //! and it is deliberately honest about what each can be trusted with.
 //!
-//! There are two quite different jobs here, and conflating them is how a
-//! product promises "use any model" and then quietly does not:
+//! **Carrying out a task** means driving a browser over many turns: reading a
+//! page, deciding what to click, calling a tool to do it. Errand owns that
+//! loop, the tools it offers, and the budget and fence around them, so the one
+//! thing it needs from a model is tool calling. Any model that can do that can
+//! carry out a task, whether it is the Claude command line tool, a service you
+//! pay for, or the machine under your desk.
 //!
-//! **Carrying out a task** means driving a browser over many turns, calling
-//! tools, and deciding what to do next. That needs a model with a working
-//! agent loop and tool use. Today that is the Claude command line tool, which
-//! brings its own loop and its own containment.
-//!
-//! **Everything else** is a single question with a single answer: diagnose this
+//! **The other three jobs** are one question with one answer: diagnose this
 //! failure, summarise this run, distil these steps. Any competent model can do
-//! that, including one running on your own machine, and there is no reason to
-//! send it to a cloud.
+//! that, and there is no reason to send it to a cloud.
 //!
-//! So a local model is genuinely useful here, and this module says exactly
-//! which roles it can fill rather than implying it can fill all of them.
+//! So being able to carry out a task is a property of the MODEL, not of the
+//! sort of endpoint it sits behind, and this module carries what is actually
+//! known about each one: that it used a tool when asked, that it would not, or
+//! that nobody has looked yet. That third answer is the common one on a fresh
+//! install, and reporting it as "cannot" is what had Errand refusing four
+//! perfectly capable machines on somebody's own network.
+//!
+//! None of this claims every capable model is a good idea. A small model will
+//! call the wrong tool, misread a page and give up half way through a booking.
+//! It can be offered the job without being recommended for it.
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
@@ -52,14 +58,34 @@ impl Kind {
         })
     }
 
-    /// Can this run a whole task, driving a browser over many turns?
+    /// What is known about tool calling before any model is asked.
     ///
-    /// Only the Claude command line tool, for now. Making a plain chat endpoint
-    /// do this means writing the agent loop, the tool protocol and the
-    /// containment again, and claiming it works before that exists would be a
-    /// lie a user only discovers at 08:00 on a Wednesday.
-    pub fn can_carry_out_tasks(&self) -> bool {
-        matches!(self, Self::ClaudeCli)
+    /// Only the command line tool answers here: it is an agent loop in its own
+    /// right, so whether it can call tools is not a question. Everything else
+    /// has to be asked, and until it is, the honest answer is that nobody knows.
+    pub fn tools_by_nature(&self) -> Option<Tools> {
+        match self {
+            Self::ClaudeCli => Some(Tools::Yes),
+            Self::AnthropicApi | Self::OpenAiCompat => None,
+        }
+    }
+
+    /// Why Errand cannot hand this kind a whole task, whatever its model can do.
+    ///
+    /// One case, and the obstacle is Errand's rather than the model's: Anthropic
+    /// API models use tools perfectly well, but they are asked in Anthropic's
+    /// own language and Errand's task loop speaks the OpenAI tool format. Saying
+    /// that plainly is fairer than blaming the model.
+    pub fn cannot_drive_a_task(&self) -> Option<&'static str> {
+        match self {
+            Self::AnthropicApi => Some(
+                "Errand carries out tasks over the OpenAI tool format, and it speaks to \
+                 Anthropic's API in Anthropic's own language, so it cannot drive this one \
+                 through a task yet. Use the Claude command line tool, or reach the same model \
+                 through a service that speaks the OpenAI format.",
+            ),
+            Self::ClaudeCli | Self::OpenAiCompat => None,
+        }
     }
 
     /// Does anything leave your machine when this is used?
@@ -69,6 +95,91 @@ impl Kind {
             Self::OpenAiCompat => base_url.map(is_local_url).unwrap_or(false),
         }
     }
+}
+
+/// Whether a model can call tools, which is the whole of what carrying out a
+/// task asks of it.
+///
+/// Three-valued because the truth is three-valued. "Nobody has asked yet" is a
+/// real answer, and the most common one, and folding it into "cannot" is how a
+/// screen ends up calling a capable model incapable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Tools {
+    /// It was asked, and it called the tool.
+    Yes,
+    /// It was asked, and it answered in words instead.
+    No,
+    /// Nobody has asked it.
+    #[default]
+    Unknown,
+}
+
+impl Tools {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Yes => "yes",
+            Self::No => "no",
+            Self::Unknown => "unknown",
+        }
+    }
+    pub fn parse(s: &str) -> Option<Self> {
+        Some(match s {
+            "yes" => Self::Yes,
+            "no" => Self::No,
+            "unknown" => Self::Unknown,
+            _ => return None,
+        })
+    }
+
+    /// Said in the interface, as a standing label rather than as evidence.
+    ///
+    /// What happened when a model was actually asked belongs in its health
+    /// detail, next to everything else that came back from it.
+    pub fn describe(&self) -> &'static str {
+        match self {
+            Self::Yes => "Can carry out tasks",
+            Self::No => "Answers questions, but cannot use tools",
+            Self::Unknown => "Not checked for tool use yet",
+        }
+    }
+}
+
+/// What Errand has learned about each endpoint, by provider id.
+///
+/// Kept apart from the provider itself because it is something Errand found
+/// out, not something anybody typed in: a person configures an address and a
+/// model name, and this is the app's own note of what happened when it asked.
+pub type ToolsSeen = std::collections::BTreeMap<String, Tools>;
+
+/// Where that note is written down.
+pub const TOOLS_SEEN_KEY: &str = "ai.tools_seen";
+
+/// Read it back, forgiving whatever else is in there.
+///
+/// Lenient on purpose: an entry written by a newer version, or one left behind
+/// by a model that has since been removed, must not throw away everything else
+/// that was learned.
+pub fn read_tools_seen(stored: Option<&serde_json::Value>) -> ToolsSeen {
+    let mut seen = ToolsSeen::new();
+    let Some(obj) = stored.and_then(|v| v.as_object()) else {
+        return seen;
+    };
+    for (id, value) in obj {
+        if let Some(t) = value.as_str().and_then(Tools::parse) {
+            seen.insert(id.clone(), t);
+        }
+    }
+    seen
+}
+
+/// The same note, ready to be written back.
+pub fn write_tools_seen(seen: &ToolsSeen) -> serde_json::Value {
+    serde_json::Value::Object(
+        seen.iter()
+            .map(|(id, t)| (id.clone(), serde_json::Value::String(t.as_str().into())))
+            .collect(),
+    )
 }
 
 /// Loopback, a private network, or a .local name.
@@ -149,12 +260,24 @@ impl Role {
         None
     }
 
+    /// The job in plain words, for a sentence that has to name it.
+    pub fn plain(&self) -> &'static str {
+        match self {
+            Self::Executor => "carrying out the task",
+            Self::Planner => "writing down what it learned",
+            Self::Fixer => "working out why something failed",
+            Self::Narrator => "writing the message you get",
+        }
+    }
+
     /// Said in the interface, so nobody has to guess what a role is for.
     pub fn describe(&self) -> &'static str {
         match self {
             Self::Executor => {
                 "Actually does the task: opens the browser, signs in, decides what to click. \
-                 Needs a model that can use tools over many turns, so this must be Claude for now."
+                 Errand hands it the browser as tools and runs the loop itself, so any model \
+                 that can call tools can do this job. A model that only answers questions \
+                 cannot drive a browser."
             }
             Self::Planner => {
                 "Writes the plan you approve when a run finishes without leaving one. Normally the \
@@ -197,21 +320,45 @@ impl Provider {
             .map(|k| k.is_local(self.base_url.as_deref()))
             .unwrap_or(false)
     }
-    pub fn can_carry_out_tasks(&self) -> bool {
-        self.kind_enum()
-            .map(|k| k.can_carry_out_tasks())
-            .unwrap_or(false)
+    /// What Errand knows about this endpoint's tool calling.
+    ///
+    /// The kind answers first where it can, and otherwise this is whatever was
+    /// written down the last time the model itself was asked.
+    pub fn tools(&self, seen: &ToolsSeen) -> Tools {
+        if let Some(settled) = self.kind_enum().and_then(|k| k.tools_by_nature()) {
+            return settled;
+        }
+        seen.get(&self.id).copied().unwrap_or_default()
+    }
+
+    /// Why this model cannot be handed a whole task, if it cannot.
+    ///
+    /// Not knowing is not a reason to refuse. An unchecked model is offered the
+    /// job, because the alternative is telling somebody their perfectly good
+    /// model cannot do something nobody has ever asked it to do.
+    pub fn cannot_carry_out_tasks(&self, tools: Tools) -> Option<String> {
+        let Some(kind) = self.kind_enum() else {
+            return Some(format!("Errand does not recognise what {} is.", self.label));
+        };
+        if let Some(why) = kind.cannot_drive_a_task() {
+            return Some(why.to_string());
+        }
+        match tools {
+            Tools::No => Some(format!(
+                "{} answers questions, but it did not use the tools Errand gave it, so it cannot \
+                 drive a browser. It can still do any of the other three jobs.",
+                self.label
+            )),
+            Tools::Yes | Tools::Unknown => None,
+        }
     }
 
     /// Why this provider cannot fill this role, if it cannot.
-    pub fn cannot_fill(&self, role: Role) -> Option<String> {
-        if role.needs_agentic() && !self.can_carry_out_tasks() {
-            return Some(format!(
-                "{} answers one question at a time. Carrying out a task means driving a browser \
-                 over many turns and calling tools, which needs the Claude command line tool. It \
-                 can do any of the other three jobs.",
-                self.label
-            ));
+    pub fn cannot_fill(&self, role: Role, tools: Tools) -> Option<String> {
+        if role.needs_agentic() {
+            if let Some(why) = self.cannot_carry_out_tasks(tools) {
+                return Some(why);
+            }
         }
         if !self.enabled {
             return Some(format!("{} is switched off.", self.label));
@@ -540,11 +687,28 @@ pub fn default_model_for(role: Role) -> &'static str {
 ///
 /// Returns the chain to try in order. A chain rather than one answer because a
 /// local model that is switched off should fall back rather than fail the run.
+///
+/// Knows nothing about which models have been asked to use a tool, which is
+/// exactly right for the three jobs that are one question and one answer: tool
+/// calling never comes into those. For the job that does need it, use
+/// `resolve_chain_knowing` and hand over what has been learned, or a model
+/// already proved incapable would be offered the work again.
 pub fn resolve_chain<'a>(
     providers: &'a [Provider],
     bindings: &[(Role, String)],
     role: Role,
     local_only: bool,
+) -> Vec<&'a Provider> {
+    resolve_chain_knowing(providers, bindings, role, local_only, &ToolsSeen::new())
+}
+
+/// The same, told what each model turned out to be able to do.
+pub fn resolve_chain_knowing<'a>(
+    providers: &'a [Provider],
+    bindings: &[(Role, String)],
+    role: Role,
+    local_only: bool,
+    seen: &ToolsSeen,
 ) -> Vec<&'a Provider> {
     let mut chain: Vec<&Provider> = vec![];
 
@@ -554,7 +718,7 @@ pub fn resolve_chain<'a>(
             continue;
         }
         if let Some(p) = providers.iter().find(|p| &p.id == pid) {
-            if p.cannot_fill(role).is_none() {
+            if p.cannot_fill(role, p.tools(seen)).is_none() {
                 chain.push(p);
             }
         }
@@ -566,7 +730,7 @@ pub fn resolve_chain<'a>(
         if !p.enabled || chain.iter().any(|c| c.id == p.id) {
             continue;
         }
-        if p.cannot_fill(role).is_some() {
+        if p.cannot_fill(role, p.tools(seen)).is_some() {
             continue;
         }
         chain.push(p);
@@ -587,20 +751,21 @@ pub fn explain_empty_chain(role: Role, local_only: bool, providers: &[Provider])
     }
     if local_only {
         return format!(
-            "This task is set to stay on your own machine, and nothing local can do the {} job. \
-             Add a local model in Settings, or turn that setting off for this task.",
-            role.as_str()
+            "This task is set to stay on your own machine, and nothing on it can do the job of \
+             {}. Add a model of your own in Settings, or turn that setting off for this task.",
+            role.plain()
         );
     }
     if role.needs_agentic() {
-        return "Carrying out a task needs the Claude command line tool, and Errand cannot find a \
-                working one. Install it and run 'claude /login' once."
+        return "Nothing Errand can reach is able to carry out a task. Any model that can use \
+                tools can do this: add one in Settings under Models and choose it for \"Doing \
+                the task\", or install the Claude command line tool and run 'claude /login' once."
             .into();
     }
     format!(
-        "Nothing available can do the {} job. Check Settings: every model may be switched off or \
-         unreachable.",
-        role.as_str()
+        "Nothing available can do the job of {}. Check Settings: every model may be switched off \
+         or unreachable.",
+        role.plain()
     )
 }
 
@@ -648,32 +813,96 @@ mod tests {
         }
     }
 
-    #[test]
-    fn only_the_claude_tool_can_carry_out_a_task() {
-        // Saying otherwise would be a lie a user discovers at 08:00 on a
-        // Wednesday, when the booking did not happen.
-        assert!(Kind::ClaudeCli.can_carry_out_tasks());
-        assert!(!Kind::OpenAiCompat.can_carry_out_tasks());
-        assert!(!Kind::AnthropicApi.can_carry_out_tasks());
-    }
-
-    #[test]
-    fn a_local_model_is_refused_the_executor_job_with_a_reason() {
-        let local = p(
+    fn local() -> Provider {
+        p(
             "ollama",
             Kind::OpenAiCompat,
             Some("http://127.0.0.1:11434"),
             true,
+        )
+    }
+
+    fn seen(id: &str, tools: Tools) -> ToolsSeen {
+        ToolsSeen::from([(id.to_string(), tools)])
+    }
+
+    #[test]
+    fn a_model_nobody_has_asked_is_not_reported_as_incapable() {
+        // The complaint this whole change exists for: four capable machines on
+        // somebody's network, every one of them greyed out as unable to do the
+        // one job that matters, because nothing had ever asked them.
+        let never_asked = local();
+        assert_eq!(never_asked.tools(&ToolsSeen::new()), Tools::Unknown);
+        assert!(
+            never_asked.cannot_carry_out_tasks(Tools::Unknown).is_none(),
+            "not having checked is not the same as having found out it cannot"
         );
-        let why = local.cannot_fill(Role::Executor).unwrap();
-        assert!(why.contains("many turns"));
+        assert!(never_asked
+            .cannot_fill(Role::Executor, Tools::Unknown)
+            .is_none());
+        assert!(
+            Tools::Unknown.describe().contains("Not checked"),
+            "the standing label has to say it is unchecked, not that it cannot"
+        );
+    }
+
+    #[test]
+    fn a_model_that_can_use_tools_may_carry_out_the_task_wherever_it_runs() {
+        let desk = local();
+        assert_eq!(desk.tools(&seen("ollama", Tools::Yes)), Tools::Yes);
+        assert!(desk.cannot_fill(Role::Executor, Tools::Yes).is_none());
+        // And the command line tool never needs asking: it is an agent loop.
+        let cli = p("claude", Kind::ClaudeCli, None, true);
+        assert_eq!(cli.tools(&ToolsSeen::new()), Tools::Yes);
+    }
+
+    #[test]
+    fn a_model_that_would_not_use_tools_is_refused_and_told_why_about_itself() {
+        let desk = local();
+        let why = desk.cannot_fill(Role::Executor, Tools::No).unwrap();
+        assert!(
+            why.contains("did not use the tools"),
+            "the reason has to be about this model, not about what kind of thing it is: {why}"
+        );
+        assert!(
+            !why.contains("Claude"),
+            "carrying out a task no longer requires Claude, so the reason must not say it: {why}"
+        );
         assert!(
             why.contains("other three jobs"),
             "it must say what it CAN do: {why}"
         );
-        // But it is perfectly good at the rest.
-        assert!(local.cannot_fill(Role::Narrator).is_none());
-        assert!(local.cannot_fill(Role::Fixer).is_none());
+        // And it is still perfectly good at the rest.
+        assert!(desk.cannot_fill(Role::Narrator, Tools::No).is_none());
+        assert!(desk.cannot_fill(Role::Fixer, Tools::No).is_none());
+    }
+
+    #[test]
+    fn anthropics_own_api_is_refused_for_a_reason_that_blames_errand_not_the_model() {
+        // The model behind it uses tools perfectly well. Errand's task loop
+        // speaks the other format, and pretending otherwise would send somebody
+        // off to find a better model when there is nothing wrong with theirs.
+        let api = p("anthropic-api", Kind::AnthropicApi, None, true);
+        let why = api.cannot_carry_out_tasks(Tools::Yes).unwrap();
+        assert!(why.contains("Errand"), "{why}");
+        assert!(why.contains("OpenAI tool format"), "{why}");
+        assert!(api.cannot_fill(Role::Narrator, Tools::Unknown).is_none());
+    }
+
+    #[test]
+    fn what_was_learned_survives_a_round_trip_and_a_stray_entry() {
+        let mut learned = ToolsSeen::new();
+        learned.insert("desk".into(), Tools::Yes);
+        learned.insert("tiny".into(), Tools::No);
+        let stored = write_tools_seen(&learned);
+        assert_eq!(read_tools_seen(Some(&stored)), learned);
+
+        // Something a newer version wrote must not lose everything else.
+        let mixed = serde_json::json!({ "desk": "yes", "future": "maybe", "n": 3 });
+        let back = read_tools_seen(Some(&mixed));
+        assert_eq!(back.get("desk"), Some(&Tools::Yes));
+        assert_eq!(back.len(), 1);
+        assert!(read_tools_seen(None).is_empty());
     }
 
     #[test]
@@ -726,15 +955,39 @@ mod tests {
     }
 
     #[test]
-    fn a_local_only_task_that_needs_a_browser_has_nowhere_to_go_and_says_so() {
-        let providers = vec![p(
-            "ollama",
-            Kind::OpenAiCompat,
-            Some("http://127.0.0.1:11434"),
+    fn a_local_only_task_can_be_carried_out_by_the_model_on_your_own_machine() {
+        // What the person was promised and did not get. Nothing here is Claude,
+        // and the task still has somewhere to go.
+        let providers = vec![local()];
+        let chain = resolve_chain_knowing(
+            &providers,
+            &[],
+            Role::Executor,
             true,
-        )];
-        let chain = resolve_chain(&providers, &[], Role::Executor, true);
-        assert!(chain.is_empty());
+            &seen("ollama", Tools::Yes),
+        );
+        assert_eq!(
+            chain.len(),
+            1,
+            "a capable local model must be offered the job"
+        );
+        assert_eq!(chain[0].id, "ollama");
+    }
+
+    #[test]
+    fn a_model_proved_incapable_is_left_out_of_the_chain_with_something_to_say() {
+        let providers = vec![local()];
+        let chain = resolve_chain_knowing(
+            &providers,
+            &[],
+            Role::Executor,
+            true,
+            &seen("ollama", Tools::No),
+        );
+        assert!(
+            chain.is_empty(),
+            "a model that would not use tools cannot be the executor"
+        );
         let why = explain_empty_chain(Role::Executor, true, &providers);
         assert!(why.contains("your own machine"));
         assert!(why.contains("Settings"));
@@ -750,6 +1003,23 @@ mod tests {
     fn with_nothing_configured_the_advice_is_how_to_get_started() {
         let why = explain_empty_chain(Role::Executor, false, &[]);
         assert!(why.contains("claude /login"));
+    }
+
+    #[test]
+    fn nothing_capable_switched_on_reads_as_a_choice_rather_than_a_dead_end() {
+        // It used to say the job needed the Claude command line tool. It does
+        // not, and sending somebody off to install one when the model on their
+        // desk would do is the exact complaint this change answers.
+        let providers = vec![p("claude", Kind::ClaudeCli, None, false)];
+        let why = explain_empty_chain(Role::Executor, false, &providers);
+        assert!(
+            why.contains("use tools"),
+            "it must say what a model needs to be able to do: {why}"
+        );
+        assert!(
+            !why.contains("needs the Claude"),
+            "carrying out a task no longer requires Claude: {why}"
+        );
     }
 
     #[test]
@@ -930,7 +1200,14 @@ mod tests {
             let d = r.describe();
             assert!(d.len() > 40, "{r:?} needs a real explanation");
         }
-        assert!(Role::Executor.describe().contains("Claude"));
+        // The old wording said this job "must be Claude for now", which stopped
+        // being true the moment Errand grew an agent loop of its own.
+        let executor = Role::Executor.describe();
+        assert!(executor.contains("call tools"), "{executor}");
+        assert!(!executor.contains("Claude"), "{executor}");
         assert!(Role::Narrator.describe().contains("own machine"));
+        for r in Role::ALL {
+            assert!(!r.plain().is_empty(), "{r:?} needs a plain name");
+        }
     }
 }

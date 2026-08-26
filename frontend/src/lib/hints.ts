@@ -415,9 +415,9 @@ export const hints = {
   "ai.role": {
     short: "One of the four jobs Errand needs a model for.",
     long:
-      "Only the first one, doing the task, needs a model that can drive a browser and use tools. " +
-      "The other three are single questions, which any model can answer, including one running " +
-      "on your own machine.",
+      "Only the first one, doing the task, needs a model that can call tools: Errand hands it the " +
+      "browser and runs the loop itself. The other three are single questions, which any model " +
+      "can answer, including one running on your own machine.",
   },
   "ai.local": {
     short: "Whether your task text leaves this machine to be answered.",
@@ -430,14 +430,32 @@ export const hints = {
     short: "Choose which model does this job.",
     long:
       "No preference means Errand uses whatever is switched on and working, so one model being " +
-      "down does not stop a task. A model that cannot do a job is shown but cannot be picked, " +
-      "with the reason.",
+      "down does not stop a task. A model Errand has asked and found cannot use tools is shown " +
+      "but cannot be picked for the task, with the reason. One nobody has checked can be picked: " +
+      "not having asked is not the same as knowing it cannot.",
+  },
+  "ai.tools": {
+    short: "Whether this model can carry out a task, as opposed to only answering questions.",
+    long:
+      "Carrying out a task means calling tools, because that is how Errand hands over the " +
+      "browser. This says what happened when Errand asked this model to use one: it did, it " +
+      "would not, or nobody has asked yet. A model that can use tools is allowed to do the job; " +
+      "whether it will do it well is a separate question, and a small model will not.",
+  },
+  "ai.check_tools": {
+    short: "Ask the models nobody has checked whether they can use a tool.",
+    long:
+      "One tiny question each, asking for an answer as a tool call rather than as a sentence. " +
+      "Nothing else is sent, nothing is changed, and a model that is asleep or slow to load is " +
+      "left as unchecked rather than written off.",
   },
   "ai.test": {
-    short: "Ask it right now whether it is there. The answer appears under the model.",
+    short: "Ask it right now whether it is there, and what it can do. This can take a minute or two.",
     long:
-      "The pill is the stored verdict from whenever it was last checked; this asks again this " +
-      "second and says the answer in place, even when the answer has not changed.",
+      "The pills are the stored verdict from whenever it was last checked; this asks again this " +
+      "second and says the answer in place, even when the answer has not changed. For a model " +
+      "of your own it also asks the tool question, which is what decides whether it can carry " +
+      "out a task.",
   },
   "ai.enable": {
     short: "Stop using this model without forgetting it.",
@@ -484,11 +502,12 @@ export const hints = {
     long: "If nothing answers at that address you are told now, rather than at the moment a task needs it.",
   },
   "ai.local_only": {
-    short: "Refuse to send anything to a model Errand does not run itself.",
+    short: "Refuse to send anything to a model Errand does not reach on your own machines.",
     long:
-      "This is a real restriction, not a preference: with it on, a task that needs a browser " +
-      "stops rather than quietly falling back to Claude. Errand will not let you turn it on " +
-      "until there is a local model to use.",
+      "This is a real restriction, not a preference: with it on, a task that nothing local can " +
+      "do stops rather than quietly going to a service. A task that needs a browser is fine as " +
+      "long as one of your own models can use tools. Errand will not let you turn this on until " +
+      "there is a local model to use.",
   },
   "ai.key": {
     short: "Save an Anthropic key. It goes to your keychain and is never shown again.",

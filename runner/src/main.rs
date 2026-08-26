@@ -13,6 +13,7 @@
 //!   errandd doctor           diagnose the environment
 //!   errandd token            print the primary API token
 
+mod agent;
 mod api;
 mod browser;
 mod channels;

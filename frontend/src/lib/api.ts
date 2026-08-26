@@ -241,7 +241,11 @@ export const api = {
   aiCatalogue: () => call<{ services: KnownService[] }>("GET", "/v1/ai/catalogue").then((r) => r.services),
   saveProvider: (p: SaveProvider) => call<{ id: string; health: string; health_detail: string }>("POST", "/v1/ai/providers", p),
   removeProvider: (id: string) => call("DELETE", `/v1/ai/providers/${id}`),
-  testProvider: (id: string) => call<{ health: string; health_detail: string }>("POST", `/v1/ai/providers/${id}/test`),
+  testProvider: (id: string) =>
+    call<{ health: string; health_detail: string; tools: string; tools_says: string }>(
+      "POST",
+      `/v1/ai/providers/${id}/test`,
+    ),
   discoverProviders: (scanNetwork = false) =>
     call<ScanResult>("POST", `/v1/ai/discover?scan_network=${scanNetwork}`),
   bindRole: (role: string, providerId: string | null) =>
@@ -314,6 +318,22 @@ export interface Provider {
   health_detail: string | null;
 }
 
+/**
+ * A model in Errand's own list, with what it has found out about it.
+ *
+ * Separate from Provider because a model a scan has only just noticed has been
+ * asked nothing at all: what follows is knowledge, and knowledge Errand does
+ * not have yet must not be able to arrive here looking like an answer.
+ */
+export interface ListedProvider extends Provider {
+  /** Whether it will call a tool, which is all that carrying out a task needs. */
+  tools: "yes" | "no" | "unknown";
+  /** That, as a standing label in plain words. */
+  tools_says: string;
+  /** Set only where Errand has actually found it wanting. Never for "not checked". */
+  cannot_carry_out_because: string | null;
+}
+
 export interface SaveProvider {
   id?: string;
   /** One of the names Errand knows, e.g. "openai". Fills in the rest. */
@@ -347,13 +367,15 @@ export interface RoleSetup {
   in_use: boolean;
   not_used_because: string | null;
   chosen: string | null;
+  /** Why the model picked for this job cannot do it, when that turns out to be so. */
+  chosen_problem: string | null;
   using: { id: string; label: string; model: string; local: boolean } | null;
   fallbacks: string[];
   problem: string | null;
 }
 
 export interface AiSetup {
-  providers: Provider[];
+  providers: ListedProvider[];
   roles: RoleSetup[];
   local_only: boolean;
 }

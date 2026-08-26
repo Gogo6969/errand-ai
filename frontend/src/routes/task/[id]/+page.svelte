@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
+  import Trouble from "$lib/components/Trouble.svelte";
+  import { reconnecting } from "$lib/reconnect.svelte";
   import { page } from "$app/state";
   import { api, channelName, followRun, statusLabel, when, ApiError, type AiSetup, type ListedProvider, type Task, type Run, type TaskRecipient, type Recipient, type MailGrant } from "$lib/api";
   import Hint from "$lib/components/Hint.svelte";
@@ -187,8 +189,13 @@
     });
   });
 
-  async function load() {
-    try {
+  /// Everything this page shows, in one place.
+  ///
+  /// Throws when it cannot be read, rather than swallowing it: that is what
+  /// lets the wrapper tell a service that is not there from an answer that is
+  /// genuinely empty, and try again in a moment.
+  async function loadEverything() {
+    {
       [task, runs, plan] = await Promise.all([api.task(id), api.runs(id), api.playbook(id)]);
       // Recipients are optional plumbing: a task page must still render when
       // nobody has set up a way to message anyone.
@@ -210,13 +217,13 @@
         const known = await api.channels();
         channelNames = Object.fromEntries(known.channels.map((c) => [c.channel, channelName(c)]));
       } catch { /* the id reads badly, but it beats a blank where a name should be */ }
-      problem = null;
-    } catch (e) {
-      problem = e instanceof ApiError ? e.message : String(e);
     }
   }
+
+  const conn = reconnecting(loadEverything, (p) => (problem = p));
+  const load = conn.run;
   onMount(() => {
-    load();
+    conn.run();
     // A slow safety net, not the mechanism. If the stream drops, a run that
     // ended would otherwise sit at the top of this page still claiming to be
     // working, which is the failure this whole section exists to prevent.
@@ -341,7 +348,7 @@
 </script>
 
 {#if problem}
-  <div class="err"><h3>Errand could not do that</h3><div>{problem}</div></div>
+  <Trouble {problem} retrying={conn.retrying} onRetry={() => conn.run(true)} />
 {/if}
 
 {#if mustConfirm}
@@ -873,14 +880,18 @@
   {:else}
     <div class="card">
       <p class="muted" style="margin:0">
-        Nothing yet. Teach it once, for real or as a rehearsal, and it will write down what worked.
+        Nothing yet. It writes this down the first time it does the job, and follows it after
+        that.
       </p>
     </div>
   {/if}
   {/if}
 
   <h2>Runs</h2>
-  {#if runs.length === 0}
+  <!-- Guarded, like the list on the front page: "It has not run yet" is a
+       sentence about the history being empty, and printing it when the history
+       could not be read is a lie that reads before the banner does. -->
+  {#if runs.length === 0 && !problem}
     <p class="muted">It has not run yet.</p>
   {:else}
     {#each runs.slice(0, 12) as r}

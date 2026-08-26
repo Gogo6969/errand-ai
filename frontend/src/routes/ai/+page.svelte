@@ -12,6 +12,8 @@
 -->
 <script lang="ts">
   import { onMount } from "svelte";
+  import Trouble from "$lib/components/Trouble.svelte";
+  import { reconnecting } from "$lib/reconnect.svelte";
   import {
     api,
     ApiError,
@@ -52,14 +54,18 @@
     narrator: "Writing the message you get",
   };
 
-  async function load() {
-    try {
+  const conn = reconnecting(
+    async () => {
       setup = await api.ai();
       if (!services.length) services = await api.aiCatalogue();
-      problem = null;
-    } catch (e) { problem = e instanceof ApiError ? e.message : String(e); }
-  }
-  onMount(load);
+    },
+    (p) => (problem = p),
+  );
+  const load = conn.run;
+  onMount(() => {
+    conn.run();
+    return conn.stop;
+  });
 
   async function act(fn: () => Promise<unknown>) {
     busy = true;
@@ -205,7 +211,9 @@
   you see which one, and change it.
 </p>
 
-{#if problem}<div class="err"><h3>Something went wrong</h3><div>{problem}</div></div>{/if}
+{#if problem}
+  <Trouble {problem} retrying={conn.retrying} onRetry={() => conn.run(true)} />
+{/if}
 
 {#if setup}
   <h2>What is doing each job</h2>

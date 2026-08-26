@@ -4,6 +4,8 @@
   import { headlineFor, hintFor, subline, isLive } from "$lib/taskState";
   import Hint from "$lib/components/Hint.svelte";
   import SitesEditor from "$lib/components/SitesEditor.svelte";
+  import Trouble from "$lib/components/Trouble.svelte";
+  import { reconnecting } from "$lib/reconnect.svelte";
   import { suggestFromText } from "$lib/sites";
 
   let tasks = $state<Task[]>([]);
@@ -17,44 +19,19 @@
   let setUp = $state<{ what: string; because: string }[]>([]);
   let setUpFor = $state<string | null>(null);
 
-  /// How long to keep trying to reach the daemon before giving up quietly.
-  ///
-  /// The window opens before the background service is listening often enough
-  /// to matter: after an update, after a restart, after the Mac wakes. One
-  /// failed fetch used to leave an empty list under a red banner, with the only
-  /// way out being to quit the app and open it again. It was even telling the
-  /// truth at that instant, which is what made it so bad: the tasks were all
-  /// there and the screen said "Nothing here yet".
-  const RETRY_MS = [400, 800, 1500, 2500, 4000];
-  let attempt = 0;
-  let retrying = $state(false);
-  let retryTimer: ReturnType<typeof setTimeout> | undefined;
-
-  async function load(manual = false) {
-    if (manual) attempt = 0;
-    try {
+  const conn = reconnecting(
+    async () => {
       tasks = await api.tasks();
-      problem = null;
-      attempt = 0;
-      retrying = false;
-    } catch (e) {
-      problem = e instanceof ApiError ? e.message : String(e);
-      const wait = RETRY_MS[attempt];
-      if (wait !== undefined) {
-        attempt += 1;
-        retrying = true;
-        clearTimeout(retryTimer);
-        retryTimer = setTimeout(() => load(), wait);
-      } else {
-        retrying = false;
-      }
-    } finally {
+    },
+    (p) => {
+      problem = p;
       loading = false;
-    }
-  }
+    },
+  );
+  const load = conn.run;
   onMount(() => {
-    load();
-    return () => clearTimeout(retryTimer);
+    conn.run();
+    return conn.stop;
   });
 
   let working = $state(false);
@@ -88,20 +65,7 @@
 <p class="deck">Jobs you have handed to Errand. Describe one and it works out how to do it, does it, and shows you what came back.</p>
 
 {#if problem}
-  <div class="err">
-    <h3>Something is not right</h3>
-    <div>{problem}</div>
-    <div class="row" style="margin-top:10px; align-items:center; gap:10px">
-      <Hint id="app.retry">
-        <button disabled={retrying} onclick={() => load(true)}>
-          {retrying ? "Trying again…" : "Try again"}
-        </button>
-      </Hint>
-      {#if retrying}
-        <span class="muted">It usually comes back on its own.</span>
-      {/if}
-    </div>
-  </div>
+  <Trouble {problem} retrying={conn.retrying} onRetry={() => conn.run(true)} />
 {/if}
 
 {#if !creating}

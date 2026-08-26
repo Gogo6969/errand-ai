@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
+  import Trouble from "$lib/components/Trouble.svelte";
+  import { reconnecting } from "$lib/reconnect.svelte";
   import { goto } from "$app/navigation";
   import { page } from "$app/state";
   import { api, artifactUrl, followRun, statusLabel, ApiError } from "$lib/api";
@@ -18,10 +20,13 @@
 
   const FINISHED = ["succeeded", "failed", "cancelled", "skipped"];
 
-  async function load() {
-    try { run = await api.runDetail(id); problem = null; }
-    catch (e) { problem = e instanceof ApiError ? e.message : String(e); }
-  }
+  const conn = reconnecting(
+    async () => {
+      run = await api.runDetail(id);
+    },
+    (p) => (problem = p),
+  );
+  const load = conn.run;
 
   async function retry() {
     retrying = true;
@@ -71,7 +76,9 @@
   });
 </script>
 
-{#if problem}<div class="err"><h3>Could not load that run</h3><div>{problem}</div></div>{/if}
+{#if problem}
+  <Trouble {problem} retrying={conn.retrying} onRetry={() => conn.run(true)} />
+{/if}
 
 {#if run}
   <div class="row spread">

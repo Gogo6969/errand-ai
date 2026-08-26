@@ -1,19 +1,29 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import Trouble from "$lib/components/Trouble.svelte";
+  import { reconnecting } from "$lib/reconnect.svelte";
   import { api, statusLabel, when, ApiError, type Run } from "$lib/api";
   import Hint from "$lib/components/Hint.svelte";
 
   let runs = $state<Run[]>([]);
   let problem = $state<string | null>(null);
-  onMount(async () => {
-    try { runs = await api.runs(); }
-    catch (e) { problem = e instanceof ApiError ? e.message : String(e); }
+  const conn = reconnecting(
+    async () => {
+      runs = await api.runs();
+    },
+    (p) => (problem = p),
+  );
+  onMount(() => {
+    conn.run();
+    return conn.stop;
   });
 </script>
 
 <h1>History</h1>
 <p class="deck">Everything Errand has done, most recent first.</p>
-{#if problem}<div class="err"><h3>Could not load history</h3><div>{problem}</div></div>{/if}
+{#if problem}
+  <Trouble {problem} retrying={conn.retrying} onRetry={() => conn.run(true)} />
+{/if}
 {#if runs.length === 0 && !problem}
   <p class="muted">Nothing has run yet.</p>
 {/if}

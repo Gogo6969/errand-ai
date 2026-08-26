@@ -34,13 +34,58 @@ export const hints = {
       "'Teach it once' on its page, and it cannot run on a schedule until you have approved " +
       "what it learned.",
   },
-  "task.status": {
-    short: "Draft means unfinished. Ready means it can run. Paused means it will not.",
+  // One per state, because a single sentence covering all of them explains the
+  // one the reader is looking at least of all. The pill says what the task is;
+  // these say what that means and what it is waiting for.
+  "task.state.draft": {
+    short: "Written down, but never tried. It cannot run yet.",
     long:
-      "A task starts as a draft. Teaching it once produces a written plan; approving that plan " +
-      "makes it ready. Paused keeps everything, including its schedule, but nothing fires. When a " +
-      "run is going or has just ended, this says what the run is really doing rather than the " +
-      "word stored on the task, because the two can disagree.",
+      "Press 'Teach it once' to watch it attempt the job from your description. Nothing runs on " +
+      "a schedule until you have read and approved what it works out.",
+  },
+  "task.state.teaching": {
+    short: "Trying the job for the first time, from your description alone.",
+    long:
+      "It has no plan yet, so it is working the job out as it goes. Open the run to watch each " +
+      "step as it happens.",
+  },
+  "task.state.awaiting_approval": {
+    short: "It finished, and wrote down how it did the job. That needs your approval.",
+    long:
+      "What it wrote is what future runs will follow while you are not watching, so it is worth " +
+      "reading. Until you approve it, this task will not run on its own.",
+  },
+  "task.state.teach_failed": {
+    short: "It tried the job and could not finish. The run says why.",
+    long:
+      "Nothing is broken and nothing was lost. Open the run to see where it stopped: usually the " +
+      "description needs to be more specific, a site is missing from the list, or it needed a " +
+      "login it does not have.",
+  },
+  "task.state.running": {
+    short: "Working on it now.",
+    long: "Open the run to watch each step as it happens.",
+  },
+  "task.state.ready": {
+    short: "Armed. It will run on its schedule, or whenever you ask.",
+    long:
+      "A plan has been approved, so it knows how to do the job. If it has no schedule it runs " +
+      "only when you press Run now.",
+  },
+  "task.state.paused": {
+    short: "You paused it. Scheduled runs are skipped; nothing has been deleted.",
+    long:
+      "Its plan, history and logins are all kept. Resuming does not go back and do the runs it " +
+      "missed; it picks up at the next one.",
+  },
+  "task.state.needs_attention": {
+    short: "Errand paused this itself and is waiting for you.",
+    long:
+      "Usually a run began something that cannot be undone and stopped before confirming it. " +
+      "Errand will not guess: check the site, then tell it what you found, and it carries on.",
+  },
+  "task.state.archived": {
+    short: "Put away. It does not run and does not appear in the ordinary list.",
   },
   "task.watch_run": {
     short: "Open the run that is going on now and watch it step by step.",

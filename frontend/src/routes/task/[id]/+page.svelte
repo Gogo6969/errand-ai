@@ -3,7 +3,7 @@
   import { page } from "$app/state";
   import { api, channelName, followRun, statusLabel, when, ApiError, type Task, type Run, type TaskRecipient, type Recipient } from "$lib/api";
   import Hint from "$lib/components/Hint.svelte";
-  import { headlineFor, ranHeadline } from "$lib/taskState";
+  import { headlineFor, hintFor, ranHeadline } from "$lib/taskState";
   import ScheduleEditor from "$lib/components/ScheduleEditor.svelte";
   import SitesEditor from "$lib/components/SitesEditor.svelte";
 
@@ -241,7 +241,7 @@
 {#if task}
   <div class="row spread">
     <h1>{task.emoji ?? ""} {task.name}</h1>
-    <Hint id="task.status"><span class="pill {headline.cls}">{headline.text}</span></Hint>
+    <Hint id={hintFor(task, liveRun ?? finishedRun)}><span class="pill {headline.cls}">{headline.text}</span></Hint>
   </div>
   <p class="deck">{task.description}</p>
 

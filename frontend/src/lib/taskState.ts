@@ -12,6 +12,7 @@
  * question here, so they cannot drift apart again.
  */
 import { statusLabel, type Run, type Task } from "$lib/api";
+import type { HintId } from "$lib/hints";
 
 /** Statuses that mean a run is over, one way or another. */
 export const FINISHED = ["succeeded", "failed", "cancelled", "skipped"];
@@ -59,6 +60,32 @@ export function headlineFor(task: Task | null, run?: Run | null): Headline {
     : task.status === "paused" ? "warn"
     : "";
   return { text: statusLabel(task.status), cls };
+}
+
+/**
+ * Which explanation belongs to the state this task is actually in.
+ *
+ * Kept beside `headlineFor` on purpose: the two answer the same question, and a
+ * pill saying "Waiting for your approval" above a tooltip reciting what a draft
+ * is helps nobody. They must move together.
+ */
+export function hintFor(task: Task | null, run?: Run | null): HintId {
+  if (!task) return "task.state.draft";
+  if (isLive(run)) return "task.state.running";
+  if (task.status === "teaching") {
+    if (isFinished(run)) {
+      return run!.status === "succeeded"
+        ? "task.state.awaiting_approval"
+        : "task.state.teach_failed";
+    }
+    return "task.state.teaching";
+  }
+  if (task.status === "paused") {
+    return task.auto_paused ? "task.state.needs_attention" : "task.state.paused";
+  }
+  if (task.status === "ready") return "task.state.ready";
+  if (task.status === "archived") return "task.state.archived";
+  return "task.state.draft";
 }
 
 /** "The teaching run could not finish", in words nobody has to decode. */

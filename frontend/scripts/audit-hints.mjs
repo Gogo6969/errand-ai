@@ -11,11 +11,16 @@ import { join } from "node:path";
 
 const SRC = "src";
 const files = [];
+// Helpers that pick a hint id, e.g. hintFor() choosing the explanation that
+// matches the state a task is in. Scanned separately from the components: they
+// can mark an id as used, but they contain no controls to police.
+const helpers = [];
 (function walk(dir) {
   for (const e of readdirSync(dir)) {
     const p = join(dir, e);
     if (statSync(p).isDirectory()) walk(p);
     else if (p.endsWith(".svelte")) files.push(p);
+    else if (p.endsWith(".ts") && !p.endsWith("hints.ts")) helpers.push(p);
   }
 })(SRC);
 
@@ -48,6 +53,16 @@ for (const f of files) {
     if (idMatch && src.includes(`<label for="${idMatch[1]}"`)) return;
     problems.push(`${f}:${i + 1}  control with no explanation: ${line.trim().slice(0, 70)}`);
   });
+}
+
+// A helper counts as showing an id only when the string it contains is one the
+// dictionary actually defines. Matching any quoted string would let a typo pass
+// as usage, which is the one thing this script exists to catch.
+for (const f of helpers) {
+  const src = readFileSync(f, "utf8");
+  for (const m of src.matchAll(/"([a-z0-9_]+\.[a-z0-9._]+)"/g)) {
+    if (defined.has(m[1])) used.add(m[1]);
+  }
 }
 
 for (const id of used) if (!defined.has(id)) problems.push(`unknown hint id used: ${id}`);

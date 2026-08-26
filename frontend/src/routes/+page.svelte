@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { api, when, type Task, ApiError } from "$lib/api";
-  import { headlineFor, subline, isLive } from "$lib/taskState";
+  import { headlineFor, hintFor, subline, isLive } from "$lib/taskState";
   import Hint from "$lib/components/Hint.svelte";
   import SitesEditor from "$lib/components/SitesEditor.svelte";
 
@@ -104,7 +104,7 @@
                   <span class="pill" title={t.next_run_at}>runs {when(t.next_run_at)}</span>
                 </Hint>
               {/if}
-              <Hint id="task.status">
+              <Hint id={hintFor(t, t.last_run)}>
                 <span class="pill {h.cls}">
                   {#if isLive(t.last_run)}<span class="live"></span>{/if}{h.text}
                 </span>

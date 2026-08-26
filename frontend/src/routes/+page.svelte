@@ -41,6 +41,10 @@
       // the time the honest answer is a line or two and then they move on.
       setUp = t.set_up ?? [];
       setUpFor = t.name;
+      // Start the job. Making a task and then asking somebody to press a
+      // second button is the ceremony this is meant to be free of: they have
+      // just described a job, and the answer is what they came for.
+      try { await api.run(t.id); } catch { /* the task page will say why */ }
       await load();
       if (setUp.length === 0) location.href = `/task/${t.id}`;
     } catch (e) {
@@ -53,7 +57,7 @@
 </script>
 
 <h1>Tasks</h1>
-<p class="deck">Jobs you have handed to Errand. Each one runs on its own once you have taught it.</p>
+<p class="deck">Jobs you have handed to Errand. Describe one and it works out how to do it, does it, and shows you what came back.</p>
 
 {#if problem}
   <div class="err"><h3>Something is not right</h3><div>{problem}</div></div>
@@ -84,7 +88,7 @@
     <div class="row" style="margin-top:12px">
       <Hint id="task.create">
         <button class="primary" disabled={working || !description.trim()} onclick={create}>
-          {working ? "Setting it up…" : "Create"}
+          {working ? "Setting it up…" : "Create and do it"}
         </button>
       </Hint>
       <button onclick={() => (creating = false)} data-hint-exempt="cancels the form above, changes nothing">Cancel</button>
@@ -94,7 +98,7 @@
 
 {#if setUp.length}
   <div class="card" style="margin-top:14px">
-    <strong>{setUpFor} is ready. Errand set this up for you:</strong>
+    <strong>{setUpFor} is running now. Errand set this up for you:</strong>
     <ul class="setup">
       {#each setUp as n}
         <li>{n.what} <span class="muted">because {n.because}</span></li>

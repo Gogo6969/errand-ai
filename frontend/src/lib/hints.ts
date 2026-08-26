@@ -95,6 +95,18 @@ export const hints = {
       "The steps appear as they happen. If the count on this card has stopped moving, the run " +
       "itself says what it was in the middle of.",
   },
+  "task.directive": {
+    short: "Change what you asked for, in your own words.",
+    long:
+      "This text is the task. It is what the agent reads and the only thing that decides what it \
+       does, so changing it is how you correct an outcome that was not what you meant.",
+  },
+  "task.directive_save": {
+    short: "Saves the new wording and does the job again with it.",
+    long:
+      "Straight away, because the only thing that settles whether the new wording is better is \
+       another outcome. What it learned before is kept until a run replaces it.",
+  },
   "task.settings": {
     short: "How this task works: when it runs, what it may open, which AI, who it tells.",
     long:
@@ -126,22 +138,6 @@ export const hints = {
       "A rehearsal. The agent goes through the task normally, but anything irreversible is " +
       "recorded as what it would have done instead of happening. Nothing is booked, sent or " +
       "deleted.",
-  },
-  "task.teach": {
-    short: "Let it really do the job once while you watch, and write down what worked.",
-    long:
-      "The first run works only from your description, and it does everything for real: if the " +
-      "job books a court or moves your post, this books it and moves it. At the end the agent " +
-      "writes a plan, which you read and approve. Nothing runs on a schedule until you have " +
-      "approved a plan.",
-  },
-  "task.teach_rehearsal": {
-    short: "Let it work the job out while you watch, without anything really happening.",
-    long:
-      "The same first run, rehearsed. The agent works from your description and writes the same " +
-      "plan for you to approve, but anything irreversible is recorded as what it would have done " +
-      "instead of happening: nothing is booked, sent, bought or moved. The plan says it was " +
-      "written by a rehearsal, so you know what you are approving.",
   },
   "task.pause": {
     short: "Skip scheduled runs. Manual runs still work. Nothing is deleted.",

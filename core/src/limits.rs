@@ -41,6 +41,15 @@ fn d_usd() -> f64 {
 fn d_heal() -> i64 {
     2
 }
+/// How many times in a row a task may fail before it stops running itself.
+///
+/// Not a per-run ceiling like the others: this is the one that stops a task
+/// from failing the same way every hour for a week. Three, because two can be
+/// a site having a bad afternoon and three is a pattern. It only stops the
+/// scheduled runs; pressing Run now still works, which is what somebody
+/// fixing it will be doing.
+pub const FAILURES_BEFORE_PAUSING: i64 = 3;
+
 fn d_messages() -> i64 {
     3
 }

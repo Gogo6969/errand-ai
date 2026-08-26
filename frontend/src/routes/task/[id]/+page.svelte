@@ -15,6 +15,8 @@
   // Closed by default, which is the whole point: a task is opened to see what
   // it produced, not to be asked eight questions about how it should work.
   let showSettings = $state(false);
+  let editingDirective = $state(false);
+  let draftDirective = $state("");
   let busy = $state(false);
 
   // Editing state. Nothing is saved until Save is pressed, so a half-typed site
@@ -120,6 +122,39 @@
    */
   const knownIrreversible = $derived((mail?.may_file ?? false) || people.length > 0);
 
+  /// Has this task ever really done the job?
+  ///
+  /// The one thing standing between a task and running while nobody watches.
+  /// A rehearsal does not count: it is told to carry on as though everything
+  /// worked and touches nothing, so it lands as a success having proved
+  /// nothing. The daemon asks the same question of the database; this only
+  /// decides which button to show.
+  const hasEverRun = $derived(
+    runs.some((r) => r.status === "succeeded" && !r.rehearsal && r.mode !== "dry_run"),
+  );
+
+  /// What sort of schedule it has. The task's schedule is untyped JSON on the
+  /// wire, and only its kind matters here.
+  const scheduleKind = $derived(
+    (task?.schedule as { kind?: string } | undefined)?.kind ?? "manual",
+  );
+
+  /// Offer to put it on its schedule once it has been seen working, and only
+  /// while it is not already on one.
+  const canBeScheduled = $derived(
+    hasEverRun && task?.status !== "ready" && scheduleKind !== "manual",
+  );
+
+  /// "every day at 07:00", out of the engine's own words for the schedule, so
+  /// the button says what it will actually do.
+  const scheduleClause = $derived(
+    (task?.schedule_describes ?? "")
+      .split(".")[0]
+      .replace(/^Every /, "every ")
+      .replace(/^On the schedule.*/, "on its schedule")
+      .trim(),
+  );
+
 
   async function countSteps(runId: string) {
     try {
@@ -221,6 +256,27 @@
     if (!pending) return;
     mustConfirm = null;
     if (await save({ ...pending.patch, acknowledge_repeat: true })) editingSchedule = false;
+  }
+
+  function startEditingDirective() {
+    draftDirective = task?.description ?? "";
+    editingDirective = true;
+  }
+
+  /// Save the new wording and do the job again with it.
+  ///
+  /// Running it straight away is the point. Somebody changing the directive is
+  /// answering "that was not what I meant", and the only thing that settles
+  /// whether the new wording is better is another outcome.
+  async function saveDirective() {
+    const text = draftDirective.trim();
+    if (!text || text === task?.description) {
+      editingDirective = false;
+      return;
+    }
+    if (!(await save({ description: text }))) return;
+    editingDirective = false;
+    await act(() => api.run(id));
   }
 
   async function saveSchedule() {
@@ -334,7 +390,28 @@
       </Hint>
     </div>
   </div>
-  <p class="deck">{task.description}</p>
+  <!-- The directive itself, editable in place.
+       Reading the outcome and wanting to change what you asked for is one
+       thought, not two, and it should not need a settings screen: what the
+       task says is the task, and everything else on this page is machinery. -->
+  {#if editingDirective}
+    <textarea class="directive" rows="4" bind:value={draftDirective} data-hint-exempt="the task's own words being edited; nothing happens until you save"></textarea>
+    <div class="row" style="margin-top:8px">
+      <Hint id="task.directive_save">
+        <button class="primary" disabled={busy || !draftDirective.trim()} onclick={saveDirective}>
+          Save and run it again
+        </button>
+      </Hint>
+      <button disabled={busy} onclick={() => (editingDirective = false)} data-hint-exempt="closes the editor above, changes nothing">Cancel</button>
+    </div>
+  {:else}
+    <p class="deck">
+      {task.description}
+      <Hint id="task.directive">
+        <button class="linkish" onclick={startEditingDirective}>Change what you asked for</button>
+      </Hint>
+    </p>
+  {/if}
 
   <!-- Before anything else this page has to answer two questions: is it doing
        anything, and if it has stopped, what happened. Neither should need
@@ -390,36 +467,36 @@
     </div>
   {/if}
 
+  <!-- One button that does the job.
+       There used to be two here for a task that had never run, "Teach it once,
+       for real" beside "Teach it as a rehearsal", and the job would then stop
+       and wait for somebody to read a document and approve it. Teaching was
+       never a different kind of run: it does the job for real and writes down
+       how afterwards. So it is just doing the job, and what it writes down
+       becomes the way the job is done. -->
   <div class="row" style="flex-wrap:wrap; gap:8px">
-    {#if !plan?.active}
-      <Hint id="task.teach">
-        <button class="primary" disabled={busy} onclick={() => act(() => api.teach(id))}>
-          Teach it once, for real
-        </button>
-      </Hint>
-      <Hint id="task.teach_rehearsal">
-        <button disabled={busy} onclick={() => act(() => api.teach(id, true))}>
-          Teach it as a rehearsal
-        </button>
-      </Hint>
-    {:else}
-      <Hint id="task.run_now">
-        <button class="primary" disabled={busy} onclick={() => act(() => api.run(id))}>Run now</button>
-      </Hint>
-      <Hint id="task.dry_run">
-        <button disabled={busy} onclick={() => act(() => api.run(id, true))}>Rehearse</button>
-      </Hint>
-      {#if task.status === "paused"}
-        <Hint id="task.resume">
-          <button disabled={busy} onclick={() => act(() => api.resume(id))}>Resume</button>
-        </Hint>
-      {:else}
-        <Hint id="task.pause">
-          <button disabled={busy} onclick={() => act(() => api.pause(id))}>Pause</button>
-        </Hint>
-      {/if}
+    <Hint id="task.run_now">
+      <button class="primary" disabled={busy} onclick={() => act(() => api.run(id))}>
+        {plan?.active ? "Run it now" : "Do it now"}
+      </button>
+    </Hint>
+    <Hint id="task.dry_run">
+      <button disabled={busy} onclick={() => act(() => api.run(id, true))}>Rehearse it first</button>
+    </Hint>
+    {#if canBeScheduled}
       <Hint id="task.activate">
-        <button disabled={busy} onclick={() => act(() => api.activate(id))}>Put on a schedule</button>
+        <button disabled={busy} onclick={() => act(() => api.activate(id))}>
+          {task.schedule_describes ? `Run it ${scheduleClause}` : "Put it on a schedule"}
+        </button>
+      </Hint>
+    {/if}
+    {#if task.status === "paused"}
+      <Hint id="task.resume">
+        <button disabled={busy} onclick={() => act(() => api.resume(id))}>Resume</button>
+      </Hint>
+    {:else if task.status === "ready"}
+      <Hint id="task.pause">
+        <button disabled={busy} onclick={() => act(() => api.pause(id))}>Pause</button>
       </Hint>
     {/if}
   </div>
@@ -428,16 +505,15 @@
        The first run of a task is the only run nobody has watched before, and
        until now it was always for real, so which button to press is the whole
        decision being made here. -->
-  {#if !plan?.active}
-    <p class="muted" style="margin:8px 0 0; max-width:60ch">
+  {#if !hasEverRun}
+    <p class="muted" style="margin:8px 0 0; max-width:62ch">
       {#if knownIrreversible}
-        This task can already do something it cannot take back, so rehearse it first. A rehearsal
-        goes through the whole job and writes the same plan for you to approve, with anything
-        irreversible recorded instead of done.
+        This job can do something it cannot take back, so it is worth rehearsing once first: a
+        rehearsal goes through the whole thing and records anything irreversible instead of doing
+        it.
       {:else}
-        If this job books, sends, buys or moves anything, rehearse it first. A rehearsal goes
-        through the whole job and writes the same plan for you to approve, with anything
-        irreversible recorded instead of done.
+        It works the job out and does it. If it goes wrong it tries another way, and it stops
+        itself rather than going round for ever.
       {/if}
     </p>
   {/if}
@@ -749,8 +825,12 @@
       {/if}
     </div>
   {/if}
-  {/if}
 
+  <!-- How it does the job: mechanics, and mechanics belong behind the gear.
+       It is here rather than on the front of the page because a person opens a
+       task to see what it produced. This is where to look when the outcome was
+       not what they meant and they want to change how it is done rather than
+       what they asked for. -->
   <h2>How it does this job</h2>
   {#if plan?.active}
     <Hint id="playbook.what">
@@ -797,6 +877,7 @@
       </p>
     </div>
   {/if}
+  {/if}
 
   <h2>Runs</h2>
   {#if runs.length === 0}
@@ -826,6 +907,24 @@
 {/if}
 
 <style>
+  .directive {
+    width: 100%;
+    font: inherit;
+    line-height: 1.5;
+  }
+  /* A control that reads as part of the sentence it follows, because that is
+     what it is: a way to change the words above it. */
+  .linkish {
+    background: none;
+    border: 0;
+    padding: 0 0 0 6px;
+    color: var(--ink-soft);
+    text-decoration: underline;
+    font-size: 13px;
+    cursor: pointer;
+  }
+  .linkish:hover { color: var(--ink); }
+
   /* A quiet control. It sits beside the status because that is where the eye
      already is when the page opens, and it must not compete with the answer. */
   .gear {

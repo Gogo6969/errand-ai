@@ -1156,6 +1156,110 @@ pub async fn record_audit(pool: &Pool, e: AuditEntry<'_>) -> Result<()> {
 
 /// Pause a task because the system decided to, not because the user did.
 /// Distinguished from a user pause in the UI so the reason is visible.
+/// How many of this task's most recent finished runs failed, one after another.
+///
+/// The loop nothing bounded. Every ceiling in the app is a ceiling on ONE run:
+/// steps, minutes, money, heal cycles, turns. A task on an hourly schedule
+/// whose site has changed fails inside every one of those ceilings and then
+/// does it again in an hour, for ever, and each failure is individually
+/// well behaved.
+///
+/// Counts backwards from the newest and stops at the first run that did not
+/// fail, so one success genuinely clears the count rather than merely diluting
+/// it. Runs still in flight are not counted: an unfinished run has not failed.
+/// Make the plan a run just wrote the one this task follows, where that is safe.
+///
+/// The rule, which is narrower than it looks and deliberately so: a playbook a
+/// run wrote becomes active only when the task had none at all, the run was
+/// real rather than a rehearsal, and the run succeeded.
+///
+/// The narrowness is the point. A playbook is distilled from pages written by
+/// strangers and then handed back to the agent as trusted instruction;
+/// scrubbing removes secrets, not instructions. Letting a later run replace a
+/// plan that is already in force would turn one run against a changed or
+/// hostile page into standing orders for every unattended run afterwards. A
+/// revision therefore waits, and a person reads it: revising a document
+/// somebody already relied on is exactly the case where review is worth
+/// something.
+///
+/// Returns the version that became active, if any.
+pub async fn adopt_plan_written_by(
+    pool: &Pool,
+    task_id: &str,
+    run_id: &str,
+) -> Result<Option<i64>> {
+    let Some(task) = get_task(pool, task_id).await? else {
+        return Ok(None);
+    };
+    if task.playbook_version.is_some() {
+        return Ok(None);
+    }
+    let row = sqlx::query(
+        "SELECT version FROM playbook_versions
+         WHERE task_id = ? AND created_by_run_id = ?
+         ORDER BY version DESC LIMIT 1",
+    )
+    .bind(task_id)
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    let version: i64 = row.try_get("version")?;
+    set_active_playbook(pool, task_id, version).await?;
+    Ok(Some(version))
+}
+
+/// Has this task ever really done the job?
+///
+/// The evidence that replaced "a person approved a plan" as the thing standing
+/// between a task and an unattended schedule. Proven beats reviewed, but only
+/// if the proof was real: a rehearsal is told to carry on as though everything
+/// worked and lands in the same 'succeeded' column having touched nothing, so
+/// it is excluded here by the same predicate the run reader uses. The mode
+/// clause catches rows written before the flag existed, and a teach run that
+/// was also a rehearsal stores mode 'teach' with the flag set, which is why
+/// both halves are needed.
+pub async fn has_really_worked_once(pool: &Pool, task_id: &str) -> Result<bool> {
+    let row = sqlx::query(
+        "SELECT 1 FROM runs
+         WHERE task_id = ? AND status = 'succeeded'
+           AND rehearsal = 0 AND mode <> 'dry_run'
+         LIMIT 1",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+pub async fn consecutive_failures(pool: &Pool, task_id: &str) -> Result<i64> {
+    // Only runs that actually tried. The scheduler manufactures 'skipped' runs
+    // of its own for a task that was still running, collided with a catch-up,
+    // or missed its window, and a task on a short cron produces those between
+    // its failures. Counting them as "not a failure" would silently reset the
+    // count on exactly the tasks that fire most often, which is to say the ones
+    // this ceiling exists for. 'cancelled' is left out for the same reason: a
+    // person stopping a run is not the task working.
+    let rows = sqlx::query(
+        "SELECT status FROM runs
+         WHERE task_id = ? AND status IN ('succeeded','failed')
+         ORDER BY created_at DESC, id DESC
+         LIMIT 50",
+    )
+    .bind(task_id)
+    .fetch_all(pool)
+    .await?;
+    let mut n = 0i64;
+    for r in rows {
+        if r.try_get::<String, _>("status")? == "failed" {
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    Ok(n)
+}
+
 pub async fn auto_pause_task(pool: &Pool, task_id: &str, reason: &str) -> Result<()> {
     sqlx::query(
         "UPDATE tasks SET status = 'paused', auto_paused = 1, paused_reason = ?, updated_at = ?
@@ -1892,6 +1996,25 @@ pub async fn recent_commit_of_any_scope(
         ))),
         None => Ok(None),
     }
+}
+
+/// Let a task run itself again, after a run of it worked.
+///
+/// Only ever clears a pause Errand set for itself. A pause somebody set by hand
+/// means "stop doing this", and a task quietly starting again because one run
+/// happened to work would be the program overruling them.
+///
+/// Returns whether anything changed, so the caller can say so.
+pub async fn clear_auto_pause(pool: &Pool, task_id: &str) -> Result<bool> {
+    let res = sqlx::query(
+        "UPDATE tasks SET status = 'ready', auto_paused = 0, paused_reason = NULL, updated_at = ?
+         WHERE id = ? AND auto_paused = 1 AND status = 'paused'",
+    )
+    .bind(crate::now_iso())
+    .bind(task_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 /// Move a task from draft to ready so the scheduler will consider it.
@@ -2696,6 +2819,201 @@ pub async fn revoke_token(pool: &Pool, id: &str) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_plan_a_run_wrote_becomes_the_way_the_job_is_done() {
+        // Nobody is asked to read and approve a document before the task may
+        // be used. It has just been watched doing the job, which is better
+        // evidence than a reading of a plan.
+        let pool = open_memory().await.unwrap();
+        let task = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        let run = create_run(&pool, &task.id, "occ-1", "manual", crate::models::RunMode::NORMAL, None)
+            .await
+            .unwrap();
+
+        let pb = crate::playbook::Playbook {
+            version: next_playbook_version(&pool, &task.id).await.unwrap(),
+            goal: "Book a court.".into(),
+            sites: vec!["example.com".into()],
+            preconditions: vec![],
+            steps: vec![crate::playbook::Step {
+                intent: "Open the grid.".into(),
+                hint: None,
+                decision: None,
+            }],
+            success: vec![],
+            known_failures: vec![],
+            never: vec![],
+        };
+        add_playbook_version(
+            &pool,
+            &task.id,
+            &pb,
+            crate::playbook::Source::Teach,
+            Some(&run.id),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            adopt_plan_written_by(&pool, &task.id, &run.id).await.unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            get_task(&pool, &task.id).await.unwrap().unwrap().playbook_version,
+            Some(1),
+            "the task is not following the plan its own run wrote"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_run_cannot_quietly_replace_a_plan_already_in_force() {
+        // A playbook is distilled from pages written by strangers and handed
+        // back to the agent as trusted instruction. Scrubbing removes secrets,
+        // not instructions. One run against a changed page must not become
+        // standing orders for every unattended run after it.
+        let pool = open_memory().await.unwrap();
+        let task = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+
+        for (occ, adopted) in [("occ-1", Some(1)), ("occ-2", None)] {
+            let run =
+                create_run(&pool, &task.id, occ, "manual", crate::models::RunMode::NORMAL, None)
+                    .await
+                    .unwrap();
+            let pb = crate::playbook::Playbook {
+                version: next_playbook_version(&pool, &task.id).await.unwrap(),
+                goal: "Book a court.".into(),
+                sites: vec![],
+                preconditions: vec![],
+                steps: vec![crate::playbook::Step {
+                    intent: "Open the grid.".into(),
+                    hint: None,
+                    decision: None,
+                }],
+                success: vec![],
+                known_failures: vec![],
+                never: vec![],
+            };
+            add_playbook_version(
+                &pool,
+                &task.id,
+                &pb,
+                crate::playbook::Source::Refine,
+                Some(&run.id),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                adopt_plan_written_by(&pool, &task.id, &run.id).await.unwrap(),
+                adopted,
+                "at {occ}"
+            );
+        }
+        // Still following the first, with the second waiting to be read.
+        assert_eq!(
+            get_task(&pool, &task.id).await.unwrap().unwrap().playbook_version,
+            Some(1)
+        );
+        assert_eq!(list_playbook_versions(&pool, &task.id).await.unwrap().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_task_that_only_ever_fails_stops_running_itself() {
+        // The loop nothing bounded. Every ceiling in this program bounds one
+        // run: steps, minutes, money, heal cycles, turns. A task on an hourly
+        // schedule whose site has changed fails inside all of them and then
+        // does it again in an hour, for ever, each failure perfectly well
+        // behaved.
+        let pool = open_memory().await.unwrap();
+        let task = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        set_task_status(&pool, &task.id, "ready").await.unwrap();
+
+        for i in 0..crate::limits::FAILURES_BEFORE_PAUSING {
+            let r = create_run(
+                &pool,
+                &task.id,
+                &format!("occ-{i}"),
+                "schedule",
+                crate::models::RunMode::NORMAL,
+                None,
+            )
+            .await
+            .unwrap();
+            finish_run_failed(&pool, &r.id, "target_unavailable", "The site is gone.", None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            consecutive_failures(&pool, &task.id).await.unwrap(),
+            crate::limits::FAILURES_BEFORE_PAUSING
+        );
+
+        // A run the scheduler skipped is not the task working. It manufactures
+        // those for a task that was still running or missed its window, so on a
+        // short cron they land between the failures, and counting them would
+        // reset the ceiling on exactly the tasks it exists for.
+        let skipped = create_run(
+            &pool,
+            &task.id,
+            "occ-skipped",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
+        finish_run_skipped(&pool, &skipped.id, "it was still running", "")
+            .await
+            .unwrap();
+        assert_eq!(
+            consecutive_failures(&pool, &task.id).await.unwrap(),
+            crate::limits::FAILURES_BEFORE_PAUSING,
+            "a skipped run reset the count that stops a task failing for ever"
+        );
+
+        // One success clears the count outright rather than diluting it, or a
+        // task that works four times out of five would creep up to the ceiling
+        // and stop for no reason.
+        let ok = create_run(
+            &pool,
+            &task.id,
+            "occ-good",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
+        finish_run_ok(&pool, &ok.id, "Done.", Some("Here it is."))
+            .await
+            .unwrap();
+        assert_eq!(consecutive_failures(&pool, &task.id).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_pause_somebody_set_by_hand_is_never_undone_by_a_run_that_worked() {
+        // Errand may undo its own guess. It may not overrule a person who
+        // said stop.
+        let pool = open_memory().await.unwrap();
+        let task = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        // Only a task that runs itself can be stopped from running itself; a
+        // draft was never going to.
+        set_task_status(&pool, &task.id, "ready").await.unwrap();
+
+        auto_pause_task(&pool, &task.id, "it kept failing").await.unwrap();
+        assert!(clear_auto_pause(&pool, &task.id).await.unwrap(), "its own pause should lift");
+
+        set_task_status(&pool, &task.id, "paused").await.unwrap();
+        assert!(
+            !clear_auto_pause(&pool, &task.id).await.unwrap(),
+            "a person's pause was overruled by a successful run"
+        );
+        assert_eq!(get_task(&pool, &task.id).await.unwrap().unwrap().status, "paused");
+    }
 
     #[tokio::test]
     async fn migrations_apply_and_quick_check_passes() {

@@ -764,12 +764,17 @@ pub(crate) fn truncate(s: &str, n: usize) -> String {
 /// Repeating a whole run is only safe because of the side-effect fence. Anything
 /// irreversible the failed attempt committed is refused the second time round.
 pub async fn run_to_completion(state: AppState, run_id: String) {
-    let task_id = errand_core::db::get_run(state.pool(), &run_id)
+    let this_run = errand_core::db::get_run(state.pool(), &run_id)
         .await
         .ok()
-        .flatten()
-        .map(|r| r.task_id)
+        .flatten();
+    let task_id = this_run
+        .as_ref()
+        .map(|r| r.task_id.clone())
         .unwrap_or_default();
+    // Read once, here, rather than asked again in the success arm: a rehearsal
+    // proves nothing, and what it may not do afterwards depends on knowing it.
+    let run_is_rehearsal = this_run.as_ref().is_some_and(|r| r.is_rehearsal());
 
     let limits = errand_core::db::get_task(state.pool(), &task_id)
         .await
@@ -829,6 +834,50 @@ pub async fn run_to_completion(state: AppState, run_id: String) {
                 // can never be armed, so the plan is written from the journal
                 // instead. Unapproved either way: a person still reads it.
                 crate::planner::distil_if_missing(&state, &run_id).await;
+
+                // The plan this run wrote becomes the way the job is done,
+                // where that is safe. Nobody is asked to read and approve a
+                // document before the task may be used: it has just been
+                // watched doing the job, which is better evidence than a
+                // reading of a plan. A rehearsal proves nothing and a revision
+                // to a plan already in force still waits, both for reasons
+                // spelled out at db::adopt_plan_written_by.
+                if !run_is_rehearsal {
+                    match errand_core::db::adopt_plan_written_by(state.pool(), &task_id, &run_id)
+                        .await
+                    {
+                        Ok(Some(v)) => {
+                            let _ = journal_note(
+                                &state,
+                                &run_id,
+                                &format!(
+                                    "This is how it will do the job from now on, as version {v}. \
+                                     Change it under the gear if it should be done differently."
+                                ),
+                            )
+                            .await;
+                        }
+                        Ok(None) => {}
+                        Err(e) => tracing::warn!(run_id, "could not adopt the plan: {e}"),
+                    }
+                }
+                // A run that worked undoes a pause Errand gave itself. The
+                // three failures that stopped it were a guess that the task was
+                // broken; one success is better evidence than that guess, and
+                // leaving it stopped would make a person go and switch it on
+                // for no reason.
+                match errand_core::db::clear_auto_pause(state.pool(), &task_id).await {
+                    Ok(true) => {
+                        let _ = journal_note(
+                            &state,
+                            &run_id,
+                            "This worked, so Errand has started running it on its own again.",
+                        )
+                        .await;
+                    }
+                    Ok(false) => {}
+                    Err(e) => tracing::warn!(task_id, "could not un-pause after a success: {e}"),
+                }
                 state.emit(Event::RunFinished {
                     run_id: run_id.clone(),
                     task_id: task_id.clone(),
@@ -1017,6 +1066,42 @@ async fn finish_failed_fully(
         task_id: task_id.to_string(),
         failure_code: parse_failure_code(code),
         failure_human: human.to_string(),
+    });
+    stop_a_task_that_only_fails(state, task_id).await;
+}
+
+/// Take a task off its schedule once it has failed enough times in a row.
+///
+/// Every other ceiling in this program bounds a single run. None of them bound
+/// a task that fails inside those ceilings and is then started again by the
+/// scheduler an hour later, for ever. This is that bound, and it is the answer
+/// to "it cannot land in an endless loop": the loop that had none was the one
+/// made of well behaved runs.
+///
+/// Pausing stops the scheduled runs only. Pressing Run now still works, which
+/// is what somebody looking into it will be doing.
+async fn stop_a_task_that_only_fails(state: &AppState, task_id: &str) {
+    let n = match errand_core::db::consecutive_failures(state.pool(), task_id).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(task_id, "could not count failures in a row: {e}");
+            return;
+        }
+    };
+    if n < errand_core::limits::FAILURES_BEFORE_PAUSING {
+        return;
+    }
+    let reason = format!(
+        "It failed {n} times in a row, so Errand stopped running it on its own. Fix what it is \
+         stuck on and press Run now; it starts again by itself once one run works."
+    );
+    if let Err(e) = errand_core::db::auto_pause_task(state.pool(), task_id, &reason).await {
+        tracing::warn!(task_id, "could not pause a task that only fails: {e}");
+        return;
+    }
+    tracing::info!(task_id, failures = n, "paused a task that only fails");
+    state.emit(Event::TaskUpdated {
+        task_id: task_id.to_string(),
     });
 }
 

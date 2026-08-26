@@ -66,6 +66,30 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **A new task does the job instead of asking to be taught.** Creating one used to leave it
+  waiting: press "Teach it once", read the plan it wrote, approve that, and only then could it
+  run. The gate read like a safety check and was not one. Teaching has never been a different kind
+  of run, and the endpoint that started one had no gate at all, so a brand new task could already
+  book, buy, file and message on its first run; all the check did was force that run to be called
+  teaching and make somebody read a document first. What protects a run is the side-effect fence,
+  the holds, the site allowlist and the budgets, and none of those reads a playbook. So the job
+  just gets done, and the plan the run writes becomes the way the job is done.
+  The gate that was worth keeping is still there, one step later and asking a better question:
+  nothing runs unattended until it has really done the job once. Not "somebody approved a plan"
+  but "it worked", and a rehearsal does not count, because a rehearsal is told to carry on as
+  though everything worked and touches nothing.
+  A plan is adopted only when the task had none. A revision to a plan already in force still waits
+  for a person, because a playbook is distilled from pages written by strangers and handed back to
+  the agent as trusted instruction: scrubbing removes secrets, not instructions.
+- **A task stops itself rather than failing for ever.** Every ceiling in Errand bounded a single
+  run: steps, minutes, money, heal cycles, turns. A task on an hourly schedule whose site has
+  changed fails inside every one of them and then does it again in an hour, for ever, each failure
+  perfectly well behaved. Three failures in a row now takes it off its own schedule, saying so;
+  pressing Run now still works, which is what somebody looking into it will be doing, and one run
+  that works puts it back. Runs the scheduler skipped do not count as the task working.
+- **The task page is the outcome and nothing else.** What you asked for, editable in place so
+  correcting it is one thought rather than a trip to a settings screen; what came back; and the
+  history. How it does the job moved behind the gear with the rest of the mechanics.
 - **A failure is one line and one thing to do.** It used to arrive as three questions glued
   together with their headings written in as markdown that nothing rendered, so a person whose
   task could not find a website met `**What I was doing:**` in raw asterisks and three paragraphs

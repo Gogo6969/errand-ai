@@ -133,9 +133,10 @@ const PREVIEW_COUNT: usize = 3;
 /// differently, a person meeting the second would think they had hit a
 /// different problem.
 const NOT_TAUGHT: &str =
-    "This task has no approved playbook, so putting it on a schedule would send an unattended \
-     agent at a site with no agreed way of doing the job. Teach it once and approve what it \
-     wrote first.";
+    "This task has never actually done the job, so putting it on a schedule would send an \
+     unattended agent at a site having never once seen it work. Press Run now and let it \
+     finish first. A rehearsal does not count, because a rehearsal is told to carry on as \
+     though everything worked and touches nothing.";
 
 /// A task, plus its schedule said in words and the next few times it will run.
 ///
@@ -612,10 +613,9 @@ async fn patch_task(
         // one thing that gate exists to prevent.
         if spec.is_scheduled()
             && matches!(task.status.as_str(), "ready" | "paused")
-            && errand_core::db::active_playbook(state.pool(), &id)
+            && !errand_core::db::has_really_worked_once(state.pool(), &id)
                 .await
                 .map_err(ApiError::from)?
-                .is_none()
         {
             return Err(ApiError::conflict("task_not_taught", NOT_TAUGHT));
         }
@@ -878,11 +878,12 @@ async fn activate_task(
         .map_err(|e| ApiError::bad_request(e.to_string()))?
         .map(|occurrence| crate::scheduler::start_instant(&task, &spec, occurrence));
 
+    // The gate that is worth keeping: nothing runs unattended until it has
+    // really done the job once with somebody there.
     if spec.is_scheduled()
-        && errand_core::db::active_playbook(state.pool(), &id)
+        && !errand_core::db::has_really_worked_once(state.pool(), &id)
             .await
             .map_err(ApiError::from)?
-            .is_none()
     {
         return Err(ApiError::conflict("task_not_taught", NOT_TAUGHT));
     }
@@ -2290,10 +2291,11 @@ async fn get_playbook(
                 .map(|p| p.to_markdown()),
         })).collect::<Vec<_>>(),
         "note": if active.is_none() {
-            "Nothing is approved yet, so scheduled runs will not start. Teach the task once, \
-             read what it wrote, then approve it."
+            "It has not worked out how to do this yet. Press Run now: it works the job out, does \
+             it, and writes down what worked."
         } else {
-            "Runs follow the approved version."
+            "This is how it does the job. A run wrote it after doing the job successfully, and a \
+             later run cannot replace it without you reading the new one first."
         }
     })))
 }
@@ -2493,20 +2495,17 @@ async fn run_task(
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found(format!("No task with id {id}.")))?;
 
-    // The single gate between "the agent tried this once" and "the agent does
-    // this alone". A task with no approved playbook may only be taught.
-    if errand_core::db::active_playbook(state.pool(), &id)
-        .await
-        .map_err(ApiError::from)?
-        .is_none()
-    {
-        return Err(ApiError::conflict(
-            "task_not_taught",
-            "This task has no approved playbook, so there is nothing to follow yet. Teach it \
-             once with POST /v1/tasks/{id}/teach, read what it wrote down, and approve that \
-             before it runs on its own.",
-        ));
-    }
+    // No gate here on purpose.
+    //
+    // This used to refuse a run on a task with no approved playbook, which
+    // read as a safety check and was not one: teach_task has never had such a
+    // gate and a teach run does the job for real, so a brand new task could
+    // already book, buy, file and message on its first run. All the check did
+    // was force that first run to be called "teach" and make somebody read a
+    // document first. Somebody pressing Run is watching; what protects them is
+    // the side-effect fence, the holds, the domain allowlist and the budgets,
+    // and none of those reads a playbook. The gate that matters is the one on
+    // getting onto a schedule, which is still there.
 
     // Refuse to start a second agent on a task that is already running one.
     // Two agents on the same task can each book the same slot, and the unique
@@ -3798,7 +3797,7 @@ mod tests {
             body["detail"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("Teach it once"),
+                .contains("Press Run now"),
             "the refusal must say what to do about it: {body}"
         );
 
@@ -3883,23 +3882,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_task_taught_as_a_rehearsal_still_has_to_be_taught_before_it_runs() {
+    async fn a_rehearsal_does_not_open_the_gate_to_running_unattended() {
         // A rehearsal writes a plan, and that plan still waits for a person.
-        // Nothing about asking for a rehearsal opens the gate early.
+        // A rehearsal is told to carry on as though everything worked and
+        // touches nothing, so it lands in the same 'succeeded' column having
+        // proved nothing. Rehearse, then put it on a schedule, would otherwise
+        // arm a live cron on the strength of a run that did not happen.
         let api = testkit::start().await;
         let id = a_task(
             &api,
             json!({ "name": "Court", "description": "Book the usual court." }),
         )
         .await;
-        let (code, body) = api
-            .post(&format!("/v1/tasks/{id}/teach"), json!({ "dry_run": true }))
-            .await;
-        assert_eq!(code, 200, "{body}");
+        // A rehearsal that finished perfectly, recorded the way one really is.
+        let run = errand_core::db::create_run(
+            &api.pool,
+            &id,
+            "rehearsal/1",
+            "manual",
+            errand_core::models::RunMode::REHEARSAL,
+            None,
+        )
+        .await
+        .expect("a rehearsal run");
+        errand_core::db::finish_run_ok(
+            &api.pool,
+            &run.id,
+            "Rehearsed it.",
+            Some("This is what it would have found."),
+        )
+        .await
+        .expect("finishing the rehearsal");
 
-        let (code, body) = api.post(&format!("/v1/tasks/{id}/run"), json!({})).await;
-        assert_eq!(code, 409, "{body}");
+        let (code, body) = api
+            .patch(
+                &format!("/v1/tasks/{id}"),
+                json!({ "schedule": { "kind": "cron", "expr": EVERY_MINUTE, "tz": "UTC" } }),
+            )
+            .await;
+        assert_eq!(code, 200, "a draft may carry a schedule; it just cannot run: {body}");
+
+        // Arming it is the moment that matters, and that is where the refusal
+        // has to come.
+        let (code, body) = api.post(&format!("/v1/tasks/{id}/activate"), json!({})).await;
+        assert_eq!(code, 409, "a rehearsal armed a live schedule: {body}");
         assert_eq!(body["code"], "task_not_taught");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("rehearsal does not count"),
+            "somebody who rehearsed successfully has to be told why it did not count: {body}"
+        );
     }
 
     // ------------------------------------- doing something twice by moving the clock --

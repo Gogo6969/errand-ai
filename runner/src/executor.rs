@@ -861,6 +861,10 @@ pub async fn run_to_completion(state: AppState, run_id: String) {
                         Err(e) => tracing::warn!(run_id, "could not adopt the plan: {e}"),
                     }
                 }
+                // A teach run that worked must not leave the task saying it is
+                // still learning. It used to mean "waiting for somebody to
+                // approve what it wrote", and there is nothing to approve.
+                stop_saying_it_is_learning(&state, &run_id, &task_id).await;
                 // A run that worked undoes a pause Errand gave itself. The
                 // three failures that stopped it were a guess that the task was
                 // broken; one success is better evidence than that guess, and

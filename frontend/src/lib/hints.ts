@@ -20,6 +20,13 @@ export interface Hint {
 
 export const hints = {
   // ---------------------------------------------------------------- tasks --
+  "app.retry": {
+    short: "Asks Errand's background service again.",
+    long:
+      "The service starts by itself and is briefly unreachable after an update or when the Mac \
+       wakes. This retries on its own a few times; the button is for when you would rather not \
+       wait. Nothing is lost while it is unreachable: your tasks are on disk.",
+  },
   "task.new": {
     short: "Describe a job in your own words. Errand works out how to do it.",
     long:
@@ -28,22 +35,21 @@ export const hints = {
       "job on its own.",
   },
   "task.create": {
-    short: "Save this as a draft. Nothing runs yet.",
+    short: "Sets it up and does the job.",
     long:
-      "Creating only saves what you wrote. The task cannot run, even once, until you teach it on " +
-      "its page, either for real or as a rehearsal, and it cannot run on a schedule until you " +
-      "have approved what it learned.",
+      "Errand reads what you wrote, works out what the job needs, and does it. It cannot run on " +
+      "a schedule until you have seen it work once.",
   },
   // One per state, because a single sentence covering all of them explains the
   // one the reader is looking at least of all. The pill says what the task is;
   // these say what that means and what it is waiting for.
   "task.state.draft": {
-    short: "Written down, but never tried. It cannot run yet.",
+    short: "Written down, but never tried.",
     long:
-      "Teach it once to watch it attempt the job from your description. If the job books, sends " +
-      "or moves anything, teach it as a rehearsal, so you can watch the whole thing with none of " +
-      "it really happening. Nothing runs on a schedule until you have read and approved what it " +
-      "works out.",
+      "Press Do it now and it works the job out from your description and does it. If the job " +
+      "books, sends, buys or moves anything, rehearse it once first: it goes through the whole " +
+      "thing with none of it really happening. Nothing runs while you are not watching until it " +
+      "has really done the job once.",
   },
   "task.state.teaching": {
     short: "Trying the job for the first time, from your description alone.",
@@ -52,10 +58,11 @@ export const hints = {
       "step as it happens.",
   },
   "task.state.awaiting_approval": {
-    short: "It finished, and wrote down how it did the job. That needs your approval.",
+    short: "It finished and wrote down how it did the job.",
     long:
-      "What it wrote is what future runs will follow while you are not watching, so it is worth " +
-      "reading. Until you approve it, this task will not run on its own.",
+      "What it wrote is what it will follow next time. You do not have to approve it: it just " +
+      "did the job that way and it worked. Read it under the gear if you want to change how it " +
+      "goes about it.",
   },
   "task.state.teach_failed": {
     short: "It tried the job and could not finish. The run says why.",
@@ -71,8 +78,8 @@ export const hints = {
   "task.state.ready": {
     short: "Armed. It will run on its schedule, or whenever you ask.",
     long:
-      "A plan has been approved, so it knows how to do the job. If it has no schedule it runs " +
-      "only when you press Run now.",
+      "It has done the job at least once, so it knows how. If it has no schedule it runs only " +
+      "when you ask.",
   },
   "task.state.paused": {
     short: "You paused it. Scheduled runs are skipped; nothing has been deleted.",
@@ -154,7 +161,9 @@ export const hints = {
   },
   "task.activate": {
     short: "Let this run on its own schedule from now on.",
-    long: "Only possible once a plan has been approved, so an unattended run always has an agreed way of doing the job.",
+    long:
+      "Only offered once it has really done the job with you there. Proven, rather than approved: " +
+      "a rehearsal does not count, because a rehearsal touches nothing.",
   },
   "task.allowed_sites": {
     short: "The only websites this task may open.",
@@ -199,10 +208,11 @@ export const hints = {
       "last time, because sites move buttons and intentions do not change.",
   },
   "playbook.approve": {
-    short: "Agree that this is how the job should be done.",
+    short: "Use this way of doing the job instead of the current one.",
     long:
-      "This is the line between the agent having tried something once and the agent doing it " +
-      "alone while you are asleep. Nothing follows a plan until you approve it.",
+      "The first plan is adopted by itself, because the run that wrote it had just done the job. " +
+      "A later one waits for you: a plan is written from pages by strangers and then followed as " +
+      "instructions, so replacing one that already works is worth a look first.",
   },
 
   // ------------------------------------------------------------------ run --

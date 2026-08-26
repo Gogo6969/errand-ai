@@ -17,17 +17,45 @@
   let setUp = $state<{ what: string; because: string }[]>([]);
   let setUpFor = $state<string | null>(null);
 
-  async function load() {
+  /// How long to keep trying to reach the daemon before giving up quietly.
+  ///
+  /// The window opens before the background service is listening often enough
+  /// to matter: after an update, after a restart, after the Mac wakes. One
+  /// failed fetch used to leave an empty list under a red banner, with the only
+  /// way out being to quit the app and open it again. It was even telling the
+  /// truth at that instant, which is what made it so bad: the tasks were all
+  /// there and the screen said "Nothing here yet".
+  const RETRY_MS = [400, 800, 1500, 2500, 4000];
+  let attempt = 0;
+  let retrying = $state(false);
+  let retryTimer: ReturnType<typeof setTimeout> | undefined;
+
+  async function load(manual = false) {
+    if (manual) attempt = 0;
     try {
       tasks = await api.tasks();
       problem = null;
+      attempt = 0;
+      retrying = false;
     } catch (e) {
       problem = e instanceof ApiError ? e.message : String(e);
+      const wait = RETRY_MS[attempt];
+      if (wait !== undefined) {
+        attempt += 1;
+        retrying = true;
+        clearTimeout(retryTimer);
+        retryTimer = setTimeout(() => load(), wait);
+      } else {
+        retrying = false;
+      }
     } finally {
       loading = false;
     }
   }
-  onMount(load);
+  onMount(() => {
+    load();
+    return () => clearTimeout(retryTimer);
+  });
 
   let working = $state(false);
 
@@ -60,7 +88,20 @@
 <p class="deck">Jobs you have handed to Errand. Describe one and it works out how to do it, does it, and shows you what came back.</p>
 
 {#if problem}
-  <div class="err"><h3>Something is not right</h3><div>{problem}</div></div>
+  <div class="err">
+    <h3>Something is not right</h3>
+    <div>{problem}</div>
+    <div class="row" style="margin-top:10px; align-items:center; gap:10px">
+      <Hint id="app.retry">
+        <button disabled={retrying} onclick={() => load(true)}>
+          {retrying ? "Trying again…" : "Try again"}
+        </button>
+      </Hint>
+      {#if retrying}
+        <span class="muted">It usually comes back on its own.</span>
+      {/if}
+    </div>
+  </div>
 {/if}
 
 {#if !creating}
@@ -113,11 +154,16 @@
 
 {#if loading}
   <p class="muted" style="margin-top:20px">Loading…</p>
+{:else if problem}
+  <!-- Nothing is said about the list here on purpose. "Nothing here yet" under
+       a failed fetch is a lie with a red banner above it, and it is the lie
+       that reads first. -->
 {:else if tasks.length === 0}
   <div class="card" style="margin-top:20px">
     <strong>Nothing here yet.</strong>
     <p class="muted" style="margin:6px 0 0">
-      Create a task, teach it once while you watch, and approve what it learned. After that it runs on its own.
+      Describe a job in your own words. Errand works out what it needs, does it, and shows you
+      what came back. Once you have seen it work you can put it on a schedule.
     </p>
   </div>
 {:else}

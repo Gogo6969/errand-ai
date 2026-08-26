@@ -264,7 +264,11 @@ async fn get_task(
 
 #[derive(Deserialize)]
 struct CreateTask {
-    name: String,
+    /// Optional. A person describing a job has already said what it is, and
+    /// making them name it too is asking for the same thing twice. When it is
+    /// left out, one is worked out from the description.
+    #[serde(default)]
+    name: Option<String>,
     description: String,
     emoji: Option<String>,
     #[serde(default)]
@@ -283,16 +287,45 @@ async fn create_task(
     Json(body): Json<CreateTask>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require(&caller, Scope::Manage)?;
-    if body.name.trim().is_empty() {
-        return Err(ApiError::bad_request("A task needs a name."));
-    }
     if body.description.trim().is_empty() {
         return Err(ApiError::bad_request(
             "A task needs a description. That description is what the agent actually reads, \
              so write it the way you would explain the job to a person.",
         ));
     }
-    let schedule = body.schedule.unwrap_or_else(|| json!({ "kind": "manual" }));
+    // Work out what the job needs before anything is stored.
+    //
+    // Two halves. What the description says outright, which is exact and free;
+    // and what it does not, which a model is asked about. "Show me the latest
+    // Bitcoin news" names no site, and a task written that way used to fail on
+    // its first run saying it had no approved websites, while the same agent
+    // listed three it would have used. It knew. It had no way to say so in
+    // time.
+    let read = errand_core::setup::infer(&body.description);
+    let given_name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string);
+    let suggested = crate::setup::suggest(
+        &state,
+        &body.description,
+        given_name.is_none(),
+        read.mail.is_some(),
+    )
+    .await;
+    let name = given_name
+        .or(suggested.name)
+        .unwrap_or_else(|| crate::setup::name_from_description(&body.description));
+
+    // A schedule the caller gave always wins; one read out of the words is
+    // only used where they said nothing.
+    let inferred_schedule = body.schedule.is_none() && read.schedule.is_some();
+    let schedule = body
+        .schedule
+        .or(read.schedule.clone())
+        .unwrap_or_else(|| json!({ "kind": "manual" }));
     errand_core::schedule::ScheduleSpec::from_json(&schedule)
         .and_then(|s| s.validate())
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -307,10 +340,32 @@ async fn create_task(
         None => (None, vec![]),
     };
 
+    // Sites worked out for them, only where they listed none of their own.
+    //
+    // Never merged into a list somebody typed: the first entry decides which
+    // browser profile a run uses, and that profile is where its saved logins
+    // live. Quietly putting a guess at the front of that list would hand a run
+    // a different signed-in identity than the one they meant.
+    let found_sites: Vec<String> = if domains.as_ref().is_some_and(|d| !d.is_empty()) {
+        vec![]
+    } else {
+        let mut all = read.domains.clone();
+        for s in &suggested.sites {
+            if !all.contains(s) {
+                all.push(s.clone());
+            }
+        }
+        all
+    };
+    let domains = match (&domains, found_sites.is_empty()) {
+        (Some(_), _) | (None, true) => domains,
+        (None, false) => Some(found_sites.clone()),
+    };
+
     let task = errand_core::db::create_task(
         state.pool(),
         errand_core::db::NewTask {
-            name: body.name,
+            name,
             description: body.description,
             emoji: body.emoji,
             schedule,
@@ -339,6 +394,14 @@ async fn create_task(
         task
     };
 
+    // Reaching into somebody's mail is the one inferred setting that is a
+    // permission, so it is granted only as far as the words go: reading when
+    // the job is about the mailbox, moving only when it asks for moving and
+    // nothing in the same description forbids it.
+    if let Some(mail) = read.mail {
+        let _ = errand_core::db::grant_mail(state.pool(), &task.id, mail.may_file).await;
+    }
+
     state.emit(Event::TaskUpdated {
         task_id: task.id.clone(),
     });
@@ -350,6 +413,28 @@ async fn create_task(
         .map_err(ApiError::from)?;
     let mut out = task_json(&task, holds, latest.get(&task.id));
     out["warnings"] = json!(warnings);
+
+    // What was decided for them, in the fewest lines that still explain
+    // themselves. Only what differs from a bare task appears here: a list that
+    // repeats the defaults is a list nobody reads twice.
+    let mut set_up: Vec<serde_json::Value> = vec![];
+    if !found_sites.is_empty() && !suggested.sites.is_empty() {
+        set_up.push(json!({
+            "what": format!("It may open {}", found_sites.join(", ")),
+            "because": "the job needs a website and you did not name one",
+        }));
+    }
+    for n in &read.notes {
+        // The sites line is already said above when they were worked out.
+        if n.what.starts_with("It may open") && !found_sites.is_empty() {
+            continue;
+        }
+        set_up.push(json!({ "what": n.what, "because": n.because }));
+    }
+    if !inferred_schedule {
+        set_up.retain(|n| n["what"] != json!("It runs on a schedule"));
+    }
+    out["set_up"] = json!(set_up);
     Ok(Json(out))
 }
 

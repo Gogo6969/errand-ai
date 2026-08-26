@@ -230,8 +230,20 @@ export const api = {
   health: () => call<Health>("GET", "/v1/health/detail"),
   tasks: () => call<{ items: Task[] }>("GET", "/v1/tasks").then((r) => r.items),
   task: (id: string) => call<Task>("GET", `/v1/tasks/${id}`),
+  /**
+   * Create a task. The name is optional: leave it empty and Errand works one
+   * out from the description, the same way it works out which sites the job
+   * needs. The reply carries `set_up`, which is what it decided and why.
+   */
   createTask: (name: string, description: string, emoji?: string, allowed_domains?: string[]) =>
-    call<Task>("POST", "/v1/tasks", { name, description, emoji, allowed_domains }),
+    call<Task & { set_up?: { what: string; because: string }[] }>("POST", "/v1/tasks", {
+      name: name.trim() || undefined,
+      description,
+      emoji,
+      // Sent only when the person named some, so an empty list is not mistaken
+      // for "this task may open nothing".
+      allowed_domains: allowed_domains?.length ? allowed_domains : undefined,
+    }),
   teach: (id: string, rehearse = false) =>
     call<Run>("POST", `/v1/tasks/${id}/teach`, { dry_run: rehearse }),
   run: (id: string, dryRun = false) => call<Run>("POST", `/v1/tasks/${id}/run`, { dry_run: dryRun }),

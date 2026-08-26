@@ -29,6 +29,7 @@ mod planner;
 mod redact;
 mod scheduler;
 mod secrets;
+mod setup;
 mod state;
 mod webhooks;
 

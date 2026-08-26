@@ -14,6 +14,7 @@ pub mod paths;
 pub mod playbook;
 pub mod providers;
 pub mod schedule;
+pub mod setup;
 
 /// Bundle identifier of the app. Data directory derives from this.
 pub const APP_ID: &str = "com.errandai.app";

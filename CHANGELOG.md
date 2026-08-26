@@ -8,6 +8,19 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **A task sets itself up.** Creating one used to mean filling in a name, a schedule, a list of
+  sites and a permission or two before anything could run, and the panels were the first thing a
+  person saw. Now the description is read for what it says outright, and a model is asked about
+  what it does not: "Show me the latest important Bitcoin news with links, every morning at 7am"
+  arrives named, pointed at two news sites, and on a seven o'clock schedule in the writer's own
+  timezone. What was decided is shown back in a few lines, each naming the words that decided it,
+  and only where it differs from a bare task. A name is now optional, because a person describing
+  a job has already said what it is.
+  Nothing here can grant what a sentence should not: signing in, messaging a person, spending, and
+  being told when a task fails are all left alone on purpose, and a prohibition always beats a
+  request, so "clean my mailbox but never delete anything" is allowed to read and refused the
+  moving. Sites a person named themselves are never merged with sites Errand found, because the
+  first entry decides which saved logins a run gets.
 - **A run has an answer, separate from what it did.** A task exists to produce an outcome, and
   there was nowhere to put one: a run stored a one-line summary of the work and a step journal,
   so a task told to "look at my inbox and tell me who each message is from" reported that it had

@@ -13,6 +13,9 @@
   let newSites = $state<string[]>([]);
   let name = $state("");
   let description = $state("");
+  // What Errand worked out for itself, shown once, right after creating.
+  let setUp = $state<{ what: string; because: string }[]>([]);
+  let setUpFor = $state<string | null>(null);
 
   async function load() {
     try {
@@ -26,13 +29,24 @@
   }
   onMount(load);
 
+  let working = $state(false);
+
   async function create() {
+    working = true;
     try {
       const t = await api.createTask(name.trim(), description.trim(), undefined, newSites);
-      name = ""; description = ""; creating = false;
-      location.href = `/task/${t.id}`;
+      name = ""; description = ""; newSites = []; creating = false;
+      // Shown here rather than on the task, because this is the moment a
+      // person wants to know what was decided for them, and because most of
+      // the time the honest answer is a line or two and then they move on.
+      setUp = t.set_up ?? [];
+      setUpFor = t.name;
+      await load();
+      if (setUp.length === 0) location.href = `/task/${t.id}`;
     } catch (e) {
       problem = e instanceof ApiError ? e.message : String(e);
+    } finally {
+      working = false;
     }
   }
 
@@ -51,8 +65,8 @@
   </Hint>
 {:else}
   <div class="card">
-    <label for="n">What should it be called?</label>
-    <input id="n" bind:value={name} placeholder="Book the Wednesday court" />
+    <label for="n">What should it be called? <span class="muted">Optional</span></label>
+    <input id="n" bind:value={name} placeholder="Left blank, Errand names it from the job" />
     <label for="d">Describe the job the way you would to a person</label>
     <textarea id="d" rows="4" bind:value={description}
       placeholder="Go to the club website, sign in, and book the Wednesday 19:00 court. Tell me the confirmation number."></textarea>
@@ -63,15 +77,33 @@
       <SitesEditor bind:sites={newSites} suggestions={suggestFromText(description)} creating />
     </div>
     <p class="muted">
-      A task with no sites cannot browse at all, so this is worth getting right now rather than
-      after it has tried once. You can change it later.
+      Leave this empty and Errand works out which sites the job needs. Name one yourself and it
+      uses yours and adds nothing, because the first site decides which saved logins the task
+      gets. You can change it either way later.
     </p>
     <div class="row" style="margin-top:12px">
       <Hint id="task.create">
-        <button class="primary" disabled={!name.trim() || !description.trim()} onclick={create}>Create</button>
+        <button class="primary" disabled={working || !description.trim()} onclick={create}>
+          {working ? "Setting it up…" : "Create"}
+        </button>
       </Hint>
       <button onclick={() => (creating = false)} data-hint-exempt="cancels the form above, changes nothing">Cancel</button>
     </div>
+  </div>
+{/if}
+
+{#if setUp.length}
+  <div class="card" style="margin-top:14px">
+    <strong>{setUpFor} is ready. Errand set this up for you:</strong>
+    <ul class="setup">
+      {#each setUp as n}
+        <li>{n.what} <span class="muted">because {n.because}</span></li>
+      {/each}
+    </ul>
+    <p class="muted" style="margin:8px 0 0">
+      Change any of it with the gear on the task. It cannot sign in anywhere, message anybody or
+      spend anything: those are yours to switch on.
+    </p>
   </div>
 {/if}
 

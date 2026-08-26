@@ -354,6 +354,13 @@ export const hints = {
       "Enter the plain site, such as example.com. Subdomains are included automatically, and " +
       "there are no wildcards: a * looks reasonable, saves happily, and then matches nothing.",
   },
+  "task.suggested_site": {
+    short: "Errand spotted this address in what you wrote. Add it with one click.",
+    long:
+      "Only addresses actually written in your description are offered. Errand will not guess a " +
+      "company's website from its name, because a guess that lands on the wrong site is a task " +
+      "pointed somewhere you never meant, possibly carrying a login.",
+  },
   "task.remove_site": {
     short: "Stop this task from opening that site.",
   },

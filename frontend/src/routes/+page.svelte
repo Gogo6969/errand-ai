@@ -4,6 +4,7 @@
   import { headlineFor, hintFor, subline, isLive } from "$lib/taskState";
   import Hint from "$lib/components/Hint.svelte";
   import SitesEditor from "$lib/components/SitesEditor.svelte";
+  import { suggestFromText } from "$lib/sites";
 
   let tasks = $state<Task[]>([]);
   let loading = $state(true);
@@ -59,7 +60,7 @@
 
     <label for="sites-block">Which websites may it open?</label>
     <div id="sites-block">
-      <SitesEditor bind:sites={newSites} />
+      <SitesEditor bind:sites={newSites} suggestions={suggestFromText(description)} creating />
     </div>
     <p class="muted">
       A task with no sites cannot browse at all, so this is worth getting right now rather than

@@ -14,7 +14,19 @@
 <script lang="ts">
   import Hint from "$lib/components/Hint.svelte";
 
-  let { sites = $bindable() }: { sites: string[] } = $props();
+  let {
+    sites = $bindable(),
+    /** Addresses found in what the person wrote, offered rather than assumed. */
+    suggestions = [],
+    /**
+     * True while a task is still being written. An empty list is then simply
+     * unfinished, not broken, and saying "it cannot open anything" reads as
+     * telling somebody off for a box they are in the middle of filling.
+     */
+    creating = false,
+  }: { sites: string[]; suggestions?: string[]; creating?: boolean } = $props();
+
+  const offered = $derived(suggestions.filter((s) => !sites.includes(s)));
 
   let entry = $state("");
   let localProblem = $state<string | null>(null);
@@ -52,9 +64,22 @@
 </script>
 
 <div class="sites">
-  {#if sites.length === 0}
+  {#if sites.length === 0 && !creating}
     <div class="warnbox">
       This task has no sites yet, so it cannot open anything. Add the site it needs to visit.
+    </div>
+  {/if}
+
+  {#if offered.length}
+    <div class="offer">
+      <span class="muted">Found in your description:</span>
+      {#each offered as o}
+        <Hint id="task.suggested_site">
+          <button type="button" class="chip" onclick={() => (sites = [...sites, o])}>
+            + {o}
+          </button>
+        </Hint>
+      {/each}
     </div>
   {/if}
 
@@ -93,8 +118,13 @@
   {#if localProblem}<div class="warnbox">{localProblem}</div>{/if}
 
   <div class="muted">
-    Subdomains are included: booking.example.com is covered by example.com. Anything not listed is
-    refused, including a redirect from a site that is listed.
+    {#if sites.length === 0 && creating && offered.length === 0}
+      Errand needs the address of the site, such as example.com, because naming a company is not
+      enough to know which site is really theirs. It will only ever open the ones you list here.
+    {:else}
+      Subdomains are included: booking.example.com is covered by example.com. Anything not listed
+      is refused, including a redirect from a site that is listed.
+    {/if}
   </div>
 </div>
 
@@ -109,6 +139,14 @@
     background: none; border: none; padding: 0; color: var(--accent);
     cursor: pointer; font-size: 12px;
   }
+  .offer { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .chip {
+    background: var(--surface-2); color: var(--accent);
+    border: 1px solid var(--rule); border-radius: 999px;
+    padding: 2px 9px; font-size: 12px; cursor: pointer;
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  }
+  .chip:hover { border-color: var(--accent); }
   .warnbox {
     background: var(--warn-bg); color: var(--warn);
     padding: 8px 10px; border-radius: 6px; font-size: 12.5px;

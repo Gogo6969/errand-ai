@@ -1,0 +1,14 @@
+-- What a person can do about a failure, kept apart from what went wrong.
+--
+-- A failure used to arrive as one blob answering three questions, with the
+-- headings written into the text as markdown that nothing rendered:
+--
+--     **What I was doing:** Trying to browse Bitcoin news sites to gather ...
+--     **Why I could not finish:** This task has no approved websites ...
+--     **What you can do:** Add one or more Bitcoin/crypto news sites ...
+--
+-- Three paragraphs of asterisks where a person wanted one line and a button.
+-- "What I was doing" is the run timeline's job and is gone; what is left is
+-- what stopped it and what to do, and they are two fields because the screen
+-- shows them differently.
+ALTER TABLE runs ADD COLUMN failure_fix TEXT;

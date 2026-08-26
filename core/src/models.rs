@@ -398,7 +398,13 @@ pub struct Task {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Failure {
     pub code: String,
+    /// One line: what stopped it. Written for a person, and short enough to
+    /// read in a list without opening anything.
     pub plain_reason: String,
+    /// One line: what they can do about it. Absent when there is nothing to
+    /// do, which is better than inventing something.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fix: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub technical: Option<String>,
 }

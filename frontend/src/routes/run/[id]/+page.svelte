@@ -124,9 +124,16 @@
   {#if run.failure}
     <div class="err">
       <h3>It could not finish</h3>
+      <!-- One line, then the one thing to do. This used to be three paragraphs
+           whose headings were markdown that nothing rendered, so a person met
+           "**What I was doing:**" in raw asterisks before reaching anything
+           they could act on. -->
       <Hint id="run.failure">
         <div style="white-space:pre-wrap">{run.failure.plain_reason}</div>
       </Hint>
+      {#if run.failure.fix}
+        <div class="fix">{run.failure.fix}</div>
+      {/if}
       {#if run.failure.technical}
         <details style="margin-top:10px">
           <summary class="muted" data-hint-exempt="discloses technical detail, labelled by its text">
@@ -181,6 +188,10 @@
 {/if}
 
 <style>
+  /* The thing to do, set apart from the thing that went wrong: a person
+     scanning a failure is looking for this line. */
+  .fix { margin-top: 8px; font-weight: 500; }
+
   /* Set to be read. pre-wrap rather than rendered Markdown: this text is
      written by a model and often quotes a page, and {@html} over that inside
      the app's own webview is a bad trade for a few bold words. */

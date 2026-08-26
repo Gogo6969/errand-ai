@@ -183,9 +183,8 @@ pub async fn run_with_tools(
         if turn.tool_calls.is_empty() {
             if nudged {
                 return Err(ExecError::NoModel(format!(
-                    "{model} kept replying with words instead of using the tools it was given, so \
-                     nothing was actually done. That model cannot carry out tasks. Pick a \
-                     different one for \"Doing the task\" in Settings."
+                    "{model} replies with words instead of using its tools, so it cannot carry \
+                     out a task. Choose a different model."
                 )));
             }
             nudged = true;
@@ -210,10 +209,8 @@ pub async fn run_with_tools(
         }
         if repeats >= SAME_CALL_STOP {
             return Err(ExecError::NoModel(format!(
-                "{model} asked for exactly the same thing {} times in a row without doing \
-                 anything with the answer, so the task was not carried out. That usually means \
-                 the model is not able to follow a task of this shape. Choose a different one \
-                 for \"Doing the task\", either in Settings or on this task.",
+                "{model} asked for the same thing {} times over and got no further. Choose a \
+                 different model for this task.",
                 repeats + 1
             )));
         }
@@ -644,8 +641,12 @@ mod tests {
             .to_string();
 
         assert!(
-            e.contains("qwen3.5-27b") && e.contains("Settings"),
+            e.contains("qwen3.5-27b") && e.contains("different model"),
             "the failure must name the model and say what to do: {e}"
+        );
+        assert!(
+            e.lines().count() == 1 && !e.contains("**"),
+            "a failure is one plain line, not a formatted paragraph: {e}"
         );
         assert!(
             server.times_asked() <= 2,

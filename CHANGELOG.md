@@ -66,6 +66,14 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **A failure is one line and one thing to do.** It used to arrive as three questions glued
+  together with their headings written in as markdown that nothing rendered, so a person whose
+  task could not find a website met `**What I was doing:**` in raw asterisks and three paragraphs
+  before reaching anything they could act on. "What I was doing" is gone entirely, because the
+  timeline beside it answers that better than a sentence written from memory; what is left is what
+  stopped it and, where there is anything, the single thing to do, kept in separate fields because
+  the screen shows them differently. A failure with nothing to be done about it now says nothing
+  rather than padding. The same wording rule applies to the failures Errand writes itself.
 - **Task settings live behind a gear.** A task page opened onto eight panels of configuration
   with the result somewhere below them. When it runs, what it may open, which AI, who it tells
   and reading your mail are now one click away instead of in the way; the answer, what the task

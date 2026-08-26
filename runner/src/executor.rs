@@ -210,7 +210,9 @@ pub(crate) fn system_prompt(has_playbook: bool) -> String {
          How to work:\n\
          - Call read_brief first. The description you find there is the source of truth.\n\
          - Call journal as you go, one short plain sentence per meaningful step or decision. \
-         Write for the person, not for a log file.\n\
+         Write for the person, not for a log file. Never write the same thing twice, and never \
+         restate at the end what you are about to put in finish or fail: the person reads that \
+         first and the journal second.\n\
          - End by calling finish with what you achieved, or fail if you could not.\n\n\
          What you can do, beyond browsing:\n\
          - save_note writes into their Apple Notes. save_file writes a text file into their \
@@ -800,14 +802,17 @@ pub async fn run_to_completion(state: AppState, run_id: String) {
         // A run that spent more than it was allowed stops here, whatever it was
         // in the middle of, and says which ceiling it hit.
         if let Some(breach) = over_budget(&state, &run_id, &limits).await {
-            let human = format!(
-                "**What I was doing:** Working on this task.\n\
-                 **Why I could not finish:** It reached a limit set for this task, so it was \
-                 stopped before finishing.\n\
-                 **What you can do:** {}",
-                breach.explain(&limits)
-            );
-            finish_failed(&state, &run_id, &task_id, "budget_exceeded", &human, None).await;
+            finish_failed_fully(
+                &state,
+                &run_id,
+                &task_id,
+                "budget_exceeded",
+                "It reached a limit set for this task and was stopped.",
+                Some(&breach.explain(&limits)),
+                None,
+                None,
+            )
+            .await;
             break;
         }
 
@@ -839,6 +844,7 @@ pub async fn run_to_completion(state: AppState, run_id: String) {
                 ..
             }) => {
                 let human = o.failure_human().unwrap_or_default();
+                let fix = o.failure_fix();
                 let parsed = parse_failure_code(code);
 
                 // Auth failures pause the task rather than failing the same way
@@ -898,12 +904,13 @@ pub async fn run_to_completion(state: AppState, run_id: String) {
                 // mail and only then found it could not write the note the
                 // task asked for has really failed, and has really done the
                 // reading; throwing that away sends a person to do it again.
-                finish_failed_keeping(
+                finish_failed_fully(
                     &state,
                     &run_id,
                     &task_id,
                     code,
                     &human,
+                    fix.as_deref(),
                     None,
                     answer.as_deref(),
                 )
@@ -929,21 +936,19 @@ pub async fn run_to_completion(state: AppState, run_id: String) {
                         "Fix the problem above, then press Run now.",
                     ),
                 };
-                let human = format!(
-                    "**What I was doing:** Starting this task.\n\
-                     **Why I could not finish:** {e}\n\
-                     **What you can do:** {next}"
-                );
+                let human = e.to_string();
                 if code == "containment_breach" {
                     let _ = errand_core::db::auto_pause_task(state.pool(), &task_id, code).await;
                 }
-                finish_failed(
+                finish_failed_fully(
                     &state,
                     &run_id,
                     &task_id,
                     code,
                     &human,
+                    Some(next),
                     Some(&e.to_string()),
+                    None,
                 )
                 .await;
                 break;
@@ -976,35 +981,30 @@ pub async fn run_to_completion(state: AppState, run_id: String) {
     state.clear_run_token(&run_id);
 }
 
-async fn finish_failed(
-    state: &AppState,
-    run_id: &str,
-    task_id: &str,
-    code: &str,
-    human: &str,
-    technical: Option<&str>,
-) {
-    finish_failed_keeping(state, run_id, task_id, code, human, technical, None).await;
-}
 
-/// The same, for a failure that still produced something worth keeping.
+
+/// Close a failed run with everything there is to say about it.
 ///
-/// Split rather than given a seventh argument, because six of the seven callers
-/// have nothing to keep and would all have to grow a `None`.
-async fn finish_failed_keeping(
+/// One line for what stopped it, one for what to do, and the rest of the
+/// arguments for the two cases that have more. Grouped rather than passed
+/// separately at seven call sites, most of which have nothing to add.
+#[allow(clippy::too_many_arguments)]
+async fn finish_failed_fully(
     state: &AppState,
     run_id: &str,
     task_id: &str,
     code: &str,
     human: &str,
+    fix: Option<&str>,
     technical: Option<&str>,
     answer: Option<&str>,
 ) {
-    let _ = errand_core::db::finish_run_failed_with_answer(
+    let _ = errand_core::db::finish_run_failed_fully(
         state.pool(),
         run_id,
         code,
         human,
+        fix,
         technical,
         answer,
     )
@@ -1278,12 +1278,14 @@ mod tests {
         let api = crate::api::testkit::start().await;
         let (task_id, run) = a_task_being_taught(&api, RunMode::TEACH, "teach").await;
 
-        finish_failed(
+        finish_failed_fully(
             &api.state,
             &run.id,
             &task_id,
             "provider_error",
             "It could not finish.",
+            None,
+            None,
             None,
         )
         .await;
@@ -1301,12 +1303,14 @@ mod tests {
         let api = crate::api::testkit::start().await;
         let (task_id, run) = a_task_being_taught(&api, RunMode::NORMAL, "schedule").await;
 
-        finish_failed(
+        finish_failed_fully(
             &api.state,
             &run.id,
             &task_id,
             "provider_error",
             "It could not finish.",
+            None,
+            None,
             None,
         )
         .await;
@@ -1325,12 +1329,14 @@ mod tests {
             .await
             .expect("pausing it");
 
-        finish_failed(
+        finish_failed_fully(
             &api.state,
             &run.id,
             &task_id,
             "auth_expired",
             "It could not log in.",
+            None,
+            None,
             None,
         )
         .await;

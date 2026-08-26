@@ -376,6 +376,9 @@
           <span class="muted"> · {when(finishedRun.finished_at ?? finishedRun.created_at)}</span>
           {#if finishedRun.failure}
             <div style="margin-top:6px">{finishedRun.failure.plain_reason}</div>
+            {#if finishedRun.failure.fix}
+              <div style="margin-top:4px; font-weight:500">{finishedRun.failure.fix}</div>
+            {/if}
           {:else if finishedRun.summary}
             <div class="muted" style="margin-top:6px">{finishedRun.summary.split("\n")[0]}</div>
           {/if}

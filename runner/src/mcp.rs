@@ -110,8 +110,10 @@ pub(crate) fn tool_definitions() -> Value {
             "name": "fail",
             "description":
                 "Stop the run because you cannot complete it. Never guess your way past a \
-                 blocker, and never pretend a job was done. Answer all three questions plainly: \
-                 what you were doing, why you could not finish, and what the person can do next.",
+                 blocker, and never pretend a job was done. Say it the way you would to \
+                 somebody standing next to you who has ten seconds: what stopped you, and what \
+                 they can do. Do not describe what you were doing, do not apologise, and do not \
+                 explain your reasoning: the timeline beside this already shows all three.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -122,11 +124,22 @@ pub(crate) fn tool_definitions() -> Value {
                                  "needs_human_decision", "provider_error"],
                         "description": "Which kind of blocker this is."
                     },
-                    "attempting": { "type": "string", "description": "What you were doing." },
-                    "because": { "type": "string", "description": "Why you could not finish." },
-                    "next_steps": { "type": "string", "description": "What the person can do." }
+                    "problem": {
+                        "type": "string",
+                        "description":
+                            "One sentence: what stopped you. Name the thing, not the feeling. \
+                             'The club site wants a code from your phone.' 'This task has no \
+                             websites it may open.' Plain text, no formatting, no headings."
+                    },
+                    "fix": {
+                        "type": "string",
+                        "description":
+                            "One short sentence: the single thing the person should do. Leave \
+                             it out entirely if there is nothing they can do, rather than \
+                             padding it. No formatting."
+                    }
                 },
-                "required": ["code", "attempting", "because", "next_steps"],
+                "required": ["code", "problem"],
                 "additionalProperties": false
             }
         }        ,
@@ -579,9 +592,10 @@ pub enum Outcome {
     },
     Failed {
         code: String,
-        attempting: String,
-        because: String,
-        next_steps: String,
+        /// One line: what stopped it.
+        problem: String,
+        /// One line: what the person can do, where there is anything.
+        fix: Option<String>,
         /// A failed run often still found the answer.
         ///
         /// The common shape is not exotic: read the mail, work out the summary,
@@ -593,20 +607,24 @@ pub enum Outcome {
 }
 
 impl Outcome {
-    /// The three-question explanation the plan requires of every terminal
-    /// failure, assembled into the text the user actually reads.
+    /// What stopped it, in one line.
+    ///
+    /// This used to assemble three questions into a blob with its headings
+    /// written in as markdown that nothing rendered, so a person met three
+    /// paragraphs of asterisks where they wanted a sentence. "What I was
+    /// doing" went entirely: the timeline next to this is a better answer to
+    /// that question than a sentence written from memory.
     pub fn failure_human(&self) -> Option<String> {
         match self {
-            Outcome::Failed {
-                attempting,
-                because,
-                next_steps,
-                ..
-            } => Some(format!(
-                "**What I was doing:** {attempting}\n\
-                 **Why I could not finish:** {because}\n\
-                 **What you can do:** {next_steps}"
-            )),
+            Outcome::Failed { problem, .. } => Some(problem.clone()),
+            Outcome::Finished { .. } => None,
+        }
+    }
+
+    /// What the person can do about it, where there is anything.
+    pub fn failure_fix(&self) -> Option<String> {
+        match self {
+            Outcome::Failed { fix, .. } => fix.clone(),
             Outcome::Finished { .. } => None,
         }
     }
@@ -838,16 +856,11 @@ pub(crate) async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &
                     run_id,
                     Outcome::Failed {
                         code: "needs_human_decision".into(),
-                        // What it was doing, not what it produced. Those were
-                        // the same string once, which put the run's answer
-                        // under the heading "What I was doing".
-                        attempting: summary,
+                        problem: blocked,
+                        fix: Some("Press Enable next to that app in Errand's settings.".into()),
+                        // Kept whatever else failed, and shown above the
+                        // failure, so nobody redoes work that was already done.
                         answer: Some(answer),
-                        because: blocked,
-                        next_steps: "Press Enable next to that app on Errand's settings screen, \
-                                     then run this task again. Anything this run saved somewhere \
-                                     else is still where it put it."
-                            .into(),
                     },
                 );
                 return text_result(
@@ -868,18 +881,15 @@ pub(crate) async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &
                     .trim()
                     .to_string()
             };
-            let (code, attempting, because, next_steps) = (
-                get("code"),
-                get("attempting"),
-                get("because"),
-                get("next_steps"),
-            );
-            if attempting.is_empty() || because.is_empty() || next_steps.is_empty() {
-                return text_error(
-                    "A failure has to answer all three questions: what you were attempting, \
-                     why you could not finish, and what the person can do next.",
-                );
+            let (code, problem, fix) = (get("code"), get("problem"), get("fix"));
+            if problem.is_empty() {
+                return text_error("fail needs a 'problem': one sentence saying what stopped you.");
             }
+            // Scrubbed like everything else that leaves the run: what stopped
+            // it is often a page, and a page can have a secret on it.
+            let red = state.redactor(run_id);
+            let problem = red.scrub(&problem);
+            let fix = red.scrub(&fix);
             state.set_outcome(
                 run_id,
                 Outcome::Failed {
@@ -888,9 +898,8 @@ pub(crate) async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &
                     } else {
                         code
                     },
-                    attempting,
-                    because,
-                    next_steps,
+                    problem,
+                    fix: Some(fix).filter(|f| !f.trim().is_empty()),
                     // A run that gave up has nothing to hand over. The other
                     // failure path, where macOS refused a write the task asked
                     // for, does, and that one fills this in.
@@ -3281,18 +3290,46 @@ mod tests {
     }
 
     #[test]
-    fn a_failure_answers_all_three_questions() {
+    fn a_failure_is_one_line_and_what_to_do_about_it() {
+        // It used to be three questions glued together with their headings
+        // written in as markdown that nothing rendered, so somebody whose task
+        // could not find a website met three paragraphs of asterisks. What it
+        // was doing went entirely: the timeline beside this answers that
+        // better than a sentence written from memory.
         let o = Outcome::Failed {
             answer: None,
             code: "captcha_or_2fa_needed".into(),
-            attempting: "Booking your Wednesday court".into(),
-            because: "The site now asks for a code sent to your phone".into(),
-            next_steps: "Enter the code once, then press Run now".into(),
+            problem: "The club site wants a code sent to your phone.".into(),
+            fix: Some("Sign in once by hand, then press Run now.".into()),
         };
         let human = o.failure_human().unwrap();
-        assert!(human.contains("What I was doing"));
-        assert!(human.contains("Why I could not finish"));
-        assert!(human.contains("What you can do"));
+        assert_eq!(human, "The club site wants a code sent to your phone.");
+        assert!(!human.contains("**"), "formatting nothing renders: {human}");
+        assert_eq!(human.lines().count(), 1, "more than one line: {human}");
+        assert_eq!(
+            o.failure_fix().as_deref(),
+            Some("Sign in once by hand, then press Run now.")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failure_with_nothing_to_be_done_says_nothing_rather_than_padding() {
+        nothing_touches_the_real_mac();
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
+        let (is_error, text) = errand
+            .call(
+                "fail",
+                json!({ "code": "network", "problem": "The site never answered." }),
+            )
+            .await;
+        assert!(!is_error, "{text}");
+        match errand.api.state.take_outcome(&errand.run.id) {
+            Some(o @ Outcome::Failed { .. }) => {
+                assert_eq!(o.failure_human().as_deref(), Some("The site never answered."));
+                assert_eq!(o.failure_fix(), None, "an empty fix must not be stored");
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     // ------------------------------------------------- messaging a real person --
@@ -4482,9 +4519,8 @@ mod tests {
         match errand.api.state.take_outcome(&errand.run.id) {
             Some(Outcome::Failed {
                 answer,
-                attempting,
-                because,
-                next_steps,
+                problem,
+                fix,
                 ..
             }) => {
                 // The run really did fail: the person asked for a note and
@@ -4495,9 +4531,11 @@ mod tests {
                     answer.as_deref().is_some_and(|a| a.contains("61,400")),
                     "the answer was thrown away with the failure: {answer:?}"
                 );
-                assert!(attempting.contains("Saved the headlines"), "{attempting}");
-                assert!(because.contains("Apple Notes"), "{because}");
-                assert!(next_steps.contains("Enable"), "{next_steps}");
+                assert!(problem.contains("Apple Notes"), "{problem}");
+                assert!(
+                    fix.as_deref().is_some_and(|f| f.contains("Enable")),
+                    "the one thing to do has to be said: {fix:?}"
+                );
             }
             other => panic!(
                 "a run that could not do what was asked was recorded as {other:?}, so nobody \

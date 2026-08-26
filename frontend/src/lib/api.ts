@@ -41,7 +41,10 @@ export interface Task {
 
 export interface Failure {
   code: string;
+  /** One line: what stopped it. */
   plain_reason: string;
+  /** One line: the single thing to do about it, where there is one. */
+  fix?: string | null;
   technical?: string;
 }
 

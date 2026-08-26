@@ -535,6 +535,7 @@ fn run_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<crate::models::Run> {
         (Some(c), Some(h)) => Some(crate::models::Failure {
             code: c,
             plain_reason: h,
+            fix: r.try_get("failure_fix")?,
             technical: r.try_get("failure_technical")?,
         }),
         _ => None,
@@ -859,15 +860,34 @@ pub async fn finish_run_failed_with_answer(
     technical: Option<&str>,
     answer: Option<&str>,
 ) -> Result<()> {
+    finish_run_failed_fully(pool, run_id, code, human, None, technical, answer).await
+}
+
+/// Close a run as failed, with everything a person and a screen need.
+///
+/// `human` is one line about what stopped it and `fix` one line about what to
+/// do. They are separate because the screen shows them differently, and because
+/// a failure with nothing to be done about it should say nothing rather than
+/// pad.
+pub async fn finish_run_failed_fully(
+    pool: &Pool,
+    run_id: &str,
+    code: &str,
+    human: &str,
+    fix: Option<&str>,
+    technical: Option<&str>,
+    answer: Option<&str>,
+) -> Result<()> {
     sqlx::query(
         "UPDATE runs SET status = 'failed', finished_at = ?, failure_code = ?,
-                         failure_human = ?, failure_technical = ?,
+                         failure_human = ?, failure_fix = ?, failure_technical = ?,
                          answer_md = COALESCE(?, answer_md)
          WHERE id = ?",
     )
     .bind(crate::now_iso())
     .bind(code)
     .bind(human)
+    .bind(fix)
     .bind(technical)
     .bind(answer)
     .bind(run_id)

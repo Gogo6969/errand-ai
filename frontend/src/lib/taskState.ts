@@ -45,14 +45,14 @@ export function headlineFor(task: Task | null, run?: Run | null): Headline {
   // approved the plan, so the task is still, technically, "teaching".
   if (task.status === "teaching" && isFinished(run)) {
     return run!.status === "succeeded"
-      ? { text: "Learned, waiting for you", cls: "warn" }
-      : { text: "Learning did not finish", cls: "bad" };
+      ? { text: "Waiting for your approval", cls: "warn" }
+      : { text: "Teaching failed", cls: "bad" };
   }
 
   // A task Errand paused itself is not the same as one you paused, and the
   // difference is the whole point: one is waiting for you to check something.
   if (task.status === "paused" && task.auto_paused) {
-    return { text: "Needs you", cls: "bad" };
+    return { text: "Needs your attention", cls: "bad" };
   }
   const cls =
     task.status === "ready" ? "ok"
@@ -89,7 +89,7 @@ export function subline(task: Task, run?: Run | null): string | null {
     return why ? `${ranHeadline(run)}: ${why}` : ranHeadline(run);
   }
   if (task.status === "teaching" && run.status === "succeeded") {
-    return "Read what it learned and approve it, then it can run on its own.";
+    return "It wrote down how it did the job. Read that and approve it before it runs unattended.";
   }
   return run.summary || null;
 }

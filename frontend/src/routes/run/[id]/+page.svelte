@@ -9,6 +9,7 @@
   let run = $state<any>(null);
   let problem = $state<string | null>(null);
   let retrying = $state(false);
+  let opening = $state<string | null>(null);
   // Screenshots load when their step is opened, not before: a run can take
   // dozens, and most of them nobody looks at.
   let shots = $state<Record<string, string | null>>({});
@@ -33,6 +34,14 @@
       problem = e instanceof ApiError ? e.message : String(e);
       retrying = false;
     }
+  }
+
+  /** Bring up the note or file where this run also left its answer. */
+  async function openCopy(c: { id: string; label: string }) {
+    opening = c.id;
+    try { await api.openAnswerCopy(c.id); problem = null; }
+    catch (e) { problem = e instanceof ApiError ? e.message : String(e); }
+    finally { opening = null; }
   }
 
   async function showShot(artifactId: string) {
@@ -67,11 +76,18 @@
 {#if run}
   <div class="row spread">
     <h1>Run</h1>
-    <Hint id="run.status">
-      <span class="pill {run.status === 'succeeded' ? 'ok' : run.status === 'failed' ? 'bad' : ''}">
-        {statusLabel(run.status)}
-      </span>
-    </Hint>
+    <div class="row" style="gap:6px">
+      <!-- Said next to the status, because somebody reading "it booked the
+           court" needs to know whether it really did. -->
+      {#if run.rehearsal}
+        <Hint id="run.rehearsal"><span class="pill warn">rehearsal</span></Hint>
+      {/if}
+      <Hint id="run.status">
+        <span class="pill {run.status === 'succeeded' ? 'ok' : run.status === 'failed' ? 'bad' : ''}">
+          {statusLabel(run.status)}
+        </span>
+      </Hint>
+    </div>
   </div>
   <p class="deck">
     <a class="plain" href={`/task/${run.task_id}`} data-hint-exempt="link back to the task, labelled by its text">
@@ -80,6 +96,30 @@
     ·
     <Hint id="run.cost"><span class="muted">${run.cost_usd.toFixed(2)}</span></Hint>
   </p>
+
+  <!-- The answer, before anything about the run.
+       Outside the failure/summary chain on purpose: a run that read everything,
+       worked out the answer and only then found the Mac would not let it write
+       the note it was asked for is a failure that still holds the answer, and
+       that is the commonest failure there is. -->
+  {#if run.answer}
+    <div class="card">
+      <Hint id="run.answer"><strong>The answer</strong></Hint>
+      <div class="answer">{run.answer}</div>
+      {#if run.answer_copies?.length}
+        <div class="row" style="margin-top:12px; flex-wrap:wrap; gap:8px">
+          <span class="muted">Also put here, because the task asked for it:</span>
+          {#each run.answer_copies as c}
+            <Hint id="run.answer_copy">
+              <button disabled={opening === c.id} onclick={() => openCopy(c)}>
+                {c.kind === "note" ? "Note" : c.kind === "file" ? "File" : "Message"}: {c.label}
+              </button>
+            </Hint>
+          {/each}
+        </div>
+      {/if}
+    </div>
+  {/if}
 
   {#if run.failure}
     <div class="err">
@@ -101,8 +141,9 @@
         </Hint>
       </div>
     </div>
-  {:else if run.summary}
-    <div class="card"><strong>What it did</strong><div style="margin-top:4px">{run.summary}</div></div>
+  {/if}
+  {#if run.summary}
+    <div class="card muted"><strong>What it did</strong><div style="margin-top:4px">{run.summary}</div></div>
   {/if}
 
   <h2>Step by step</h2>
@@ -140,6 +181,18 @@
 {/if}
 
 <style>
+  /* Set to be read. pre-wrap rather than rendered Markdown: this text is
+     written by a model and often quotes a page, and {@html} over that inside
+     the app's own webview is a bad trade for a few bold words. */
+  .answer {
+    white-space: pre-wrap;
+    color: var(--ink);
+    font-size: 14px;
+    line-height: 1.55;
+    max-width: 72ch;
+    margin-top: 6px;
+  }
+
   .shot {
     display: block; max-width: 100%; margin-top: 8px;
     border: 1px solid var(--rule); border-radius: 6px;

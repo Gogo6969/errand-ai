@@ -71,12 +71,38 @@ pub(crate) fn tool_definitions() -> Value {
         {
             "name": "finish",
             "description":
-                "Finish the run successfully. Provide a one or two sentence summary of what you \
-                 actually achieved, written for the person who asked for it.",
+                "Finish the run successfully. Two separate things are wanted here and they are \
+                 not the same thing. 'answer' is what the person gets: it is the reason they \
+                 set the task up, and it is the part they will actually read. 'summary' is one \
+                 line about the work, for the record. Never leave the answer only in a note, a \
+                 file or a message: those are extra copies, and this is the original.",
             "inputSchema": {
                 "type": "object",
-                "properties": { "summary": { "type": "string" } },
-                "required": ["summary"],
+                "properties": {
+                    "answer": {
+                        "type": "string",
+                        "description":
+                            "What the person asked for, in full, in their own terms. If they \
+                             asked to be told, shown, sent or given something, this is that \
+                             thing, complete: the list, the names, the numbers, the reasons. \
+                             Not a description of it and not a count of it. If they asked you \
+                             to DO something, this is what is now true and the proof of it: \
+                             what was booked, ordered, sent or changed, for when, and the \
+                             confirmation or reference the site gave. If it gave none, say so \
+                             in those words. Never write 'see the note' or 'as above'. Write it \
+                             as plain sentences and plain lists, the way you would write to the \
+                             person: no asterisks for bold, no hashes for headings. It is shown \
+                             exactly as you type it."
+                    },
+                    "summary": {
+                        "type": "string",
+                        "description":
+                            "One line, past tense, about the work itself: where you went and \
+                             what you had to do to get there. Not the answer, and not a repeat \
+                             of it."
+                    }
+                },
+                "required": ["answer", "summary"],
                 "additionalProperties": false
             }
         },
@@ -497,17 +523,72 @@ pub fn qualified_tool_names() -> Vec<String> {
     .collect()
 }
 
+/// Answers that are not answers.
+///
+/// A model that has just written a note reaches for "see the note above", which
+/// is exactly the behaviour this field exists to end: the person opens the task
+/// and finds a pointer to somewhere else. Kept as a plain list rather than a
+/// pattern, the way `browser::classify` reads a page, because there is no regex
+/// crate here and a list is easier to argue with.
+const NOT_AN_ANSWER: &[&str] = &[
+    "see the note",
+    "see above",
+    "as above",
+    "see attached",
+    "see the file",
+    "in the note",
+    "done",
+    "n/a",
+];
+
+/// The shortest thing that could be a real answer.
+///
+/// "Court 4, Wednesday 19:00" is 24 characters. Anything under this is a
+/// gesture at an answer rather than one.
+const SHORTEST_ANSWER: usize = 15;
+
+fn answer_problem(answer: &str) -> Option<String> {
+    let a = answer.trim();
+    if a.is_empty() {
+        return Some(
+            "finish needs an 'answer': the thing the person asked for, in full. If the task was \
+             to do something rather than to find something out, the answer is what is now true \
+             and the proof of it, such as what was booked and any confirmation number."
+                .into(),
+        );
+    }
+    let flat = a.trim_end_matches('.').to_ascii_lowercase();
+    if a.chars().count() < SHORTEST_ANSWER || NOT_AN_ANSWER.contains(&flat.as_str()) {
+        return Some(format!(
+            "That is a pointer, not an answer: {a:?}. Write out the thing itself here, even if \
+             you have already put a copy of it somewhere else. This is the only place the \
+             person is certain to read."
+        ));
+    }
+    None
+}
+
 /// How a run ended, as reported by the agent through the tool surface.
 #[derive(Debug, Clone)]
 pub enum Outcome {
     Finished {
         summary: String,
+        /// What the run produced. See the `finish` tool: this is the thing the
+        /// person asked for, not the story of getting it.
+        answer: String,
     },
     Failed {
         code: String,
         attempting: String,
         because: String,
         next_steps: String,
+        /// A failed run often still found the answer.
+        ///
+        /// The common shape is not exotic: read the mail, work out the summary,
+        /// then discover macOS will not allow the note the task asked for. The
+        /// run failed and the work is still worth keeping, so it travels with
+        /// the failure rather than being thrown away.
+        answer: Option<String>,
     },
 }
 
@@ -719,6 +800,25 @@ pub(crate) async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &
             if summary.trim().is_empty() {
                 return text_error("finish needs a 'summary' describing what you achieved.");
             }
+            let answer = args
+                .get("answer")
+                .and_then(|s| s.as_str())
+                .unwrap_or("")
+                .to_string();
+            if let Some(complaint) = answer_problem(&answer) {
+                return text_error(complaint);
+            }
+            // Scrubbed like everything else that leaves the run.
+            //
+            // The answer is the one field built to carry the contents of a page
+            // back out, and it goes further than anything else here: into the
+            // database, into a webhook to somebody's own program, and onto a
+            // phone. A login typed into a form earlier in the same run is in
+            // this redactor, and an answer quoting the page it was typed into
+            // would carry it to all three.
+            let red = state.redactor(run_id);
+            let answer = red.scrub(&answer);
+            let summary = red.scrub(&summary);
             // Leaving the answer somewhere else when the place they asked for
             // is shut is the right instinct, and the run still did not do what
             // was asked. A green run is one nobody looks at twice, which is how
@@ -738,7 +838,11 @@ pub(crate) async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &
                     run_id,
                     Outcome::Failed {
                         code: "needs_human_decision".into(),
+                        // What it was doing, not what it produced. Those were
+                        // the same string once, which put the run's answer
+                        // under the heading "What I was doing".
                         attempting: summary,
+                        answer: Some(answer),
                         because: blocked,
                         next_steps: "Press Enable next to that app on Errand's settings screen, \
                                      then run this task again. Anything this run saved somewhere \
@@ -752,7 +856,7 @@ pub(crate) async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &
                      There is nothing further to try.",
                 );
             }
-            state.set_outcome(run_id, Outcome::Finished { summary });
+            state.set_outcome(run_id, Outcome::Finished { summary, answer });
             text_result("run recorded as finished")
         }
 
@@ -787,6 +891,10 @@ pub(crate) async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &
                     attempting,
                     because,
                     next_steps,
+                    // A run that gave up has nothing to hand over. The other
+                    // failure path, where macOS refused a write the task asked
+                    // for, does, and that one fills this in.
+                    answer: None,
                 },
             );
             text_result("run recorded as failed, with your explanation")
@@ -897,7 +1005,7 @@ pub(crate) async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &
             // to" is not a guarantee, and a user who trusts a dry run and gets
             // a real booking has been actively misled.
             if let Some(action_kind) = action_kind {
-                if is_dry_run(state, run_id).await {
+                if is_rehearsal(state, run_id).await {
                     let label = described
                         .as_ref()
                         .map(|(_, l)| l.clone())
@@ -1121,22 +1229,34 @@ async fn read_brief(state: &AppState, run_id: &str) -> anyhow::Result<String> {
         });
     }
 
-    let mode_note = match run.mode.as_str() {
-        "dry_run" => {
-            "\nThis is a REHEARSAL. Anything that cannot be undone will be recorded as \
-                      what you would have done, and will not actually happen. That includes \
-                      messages: nothing you send with message_person leaves this machine, and no \
-                      person hears from this run. Work through the task normally and report what \
-                      you would have done.\n"
+    // Two separate notes rather than one choice between them, because a run can
+    // be both. A rehearsed teach is learning the job and doing none of it, and
+    // an agent told only one of those either books the court for real or
+    // finishes without writing the plan the whole run was for.
+    if run.is_rehearsal() {
+        out.push_str(
+            "\nThis is a REHEARSAL. Anything that cannot be undone will be recorded as what you \
+             would have done, and will not actually happen. That includes messages: nothing you \
+             send with message_person leaves this machine, and no person hears from this run. \
+             Work through the task normally and report what you would have done.\n",
+        );
+    }
+    if run.is_teaching() {
+        out.push_str(
+            "\nThis is the first, supervised run of this task. Nobody has approved a way of doing \
+             it yet. Work carefully, journal your reasoning as you go, and near the end call \
+             save_playbook with what actually worked.\n",
+        );
+        if run.is_rehearsal() {
+            out.push_str(
+                "Write that plan even though this was a rehearsal: teaching that ends with no \
+                 plan has taught nobody anything, and the plan is for the real run that comes \
+                 after this one. Be honest in it, and in your summary, about what was recorded \
+                 rather than done: never write down that you booked, sent or moved something \
+                 when you only noted that you would have.\n",
+            );
         }
-        "teach" => {
-            "\nThis is the first, supervised run of this task. Nobody has approved a way \
-                    of doing it yet. Work carefully, journal your reasoning as you go, and near \
-                    the end call save_playbook with what actually worked.\n"
-        }
-        _ => "",
-    };
-    out.push_str(mode_note);
+    }
     out.push_str(&format!("\nTriggered by: {}\n", run.trigger));
     Ok(out)
 }
@@ -1604,7 +1724,7 @@ async fn file_mail(state: &AppState, run_id: &str, args: &Value) -> Value {
     // Before the fence, never after. A rehearsal that armed the fence would use
     // up this occurrence's one move of this message, and the real run would
     // then be refused for something that never happened.
-    if is_dry_run(state, run_id).await {
+    if is_rehearsal(state, run_id).await {
         let described = match crate::mail::describe(id).await {
             Ok(h) => red.scrub(&format!("{}: {:?}", h.sender, h.subject)),
             Err(e) => return text_error(format!("Nothing was moved. {e}.{}", macos_advice(&e))),
@@ -1739,6 +1859,12 @@ async fn guard_filing(
     message_id: &str,
 ) -> anyhow::Result<Guard> {
     use errand_core::db::FenceVerdict;
+    // The id the model holds says where the message was as well as which one it
+    // is, and where it was changes whenever mail arrives. The fence has to key
+    // on the message alone: keyed on the whole id, the same message listed a
+    // minute later would be a different scope, and "never move it twice" would
+    // quietly stop being true.
+    let message_id = &crate::mail::stable_id(message_id);
     let verdict = errand_core::db::arm_side_effect(
         state.pool(),
         &run.id,
@@ -1857,7 +1983,7 @@ async fn save_note(state: &AppState, run_id: &str, args: &Value) -> Value {
         Err(refusal) => return refusal,
     };
 
-    if is_dry_run(state, run_id).await {
+    if is_rehearsal(state, run_id).await {
         let verb = if append { "added to" } else { "written" };
         let _ = journal(
             state,
@@ -1869,7 +1995,7 @@ async fn save_note(state: &AppState, run_id: &str, args: &Value) -> Value {
         .await;
         return text_result(format!(
             "This is a rehearsal, so nothing was written. Noted that you would have {verb} the \
-             note {title:?} in Apple Notes. Carry on as if it had worked, and say in your summary \
+             note {title:?} in Apple Notes. Carry on as if it had worked, and say in your answer \
              what you would have written."
         ));
     }
@@ -1878,11 +2004,19 @@ async fn save_note(state: &AppState, run_id: &str, args: &Value) -> Value {
         Ok(crate::desktop::NoteWrite::Created) => {
             let line = format!("Wrote the note {title:?} in Apple Notes");
             let _ = journal(state, run_id, "act", &line, true).await;
+            // Recorded here, where it actually happened, so the copy offered on
+            // the task page is one that exists.
+            let _ =
+                errand_core::db::record_answer_copy(state.pool(), run_id, "note", &title, &title)
+                    .await;
             text_result(format!("{line}. The person will find it in the Notes app."))
         }
         Ok(crate::desktop::NoteWrite::Appended) => {
             let line = format!("Added today's entry to the note {title:?} in Apple Notes");
             let _ = journal(state, run_id, "act", &line, true).await;
+            let _ =
+                errand_core::db::record_answer_copy(state.pool(), run_id, "note", &title, &title)
+                    .await;
             text_result(format!(
                 "{line}, under today's date, below what previous runs wrote."
             ))
@@ -1934,7 +2068,7 @@ async fn save_file(state: &AppState, run_id: &str, args: &Value) -> Value {
         Err(refusal) => return refusal,
     };
 
-    if is_dry_run(state, run_id).await {
+    if is_rehearsal(state, run_id).await {
         let _ = journal(
             state,
             run_id,
@@ -1962,6 +2096,8 @@ async fn save_file(state: &AppState, run_id: &str, args: &Value) -> Value {
     // file that was not really saved.
     let where_it_is = path.display().to_string();
     let _ = journal(state, run_id, "act", &format!("Saved {where_it_is}"), true).await;
+    let _ =
+        errand_core::db::record_answer_copy(state.pool(), run_id, "file", &name, &where_it_is).await;
 
     if !open_it {
         return text_result(format!("Saved as {where_it_is}."));
@@ -2050,7 +2186,7 @@ async fn show_me(state: &AppState, run_id: &str, args: &Value) -> Value {
         Target::App(a) => format!("the app {a}"),
     };
 
-    if is_dry_run(state, run_id).await {
+    if is_rehearsal(state, run_id).await {
         let _ = journal(
             state,
             run_id,
@@ -2061,7 +2197,7 @@ async fn show_me(state: &AppState, run_id: &str, args: &Value) -> Value {
         .await;
         return text_result(format!(
             "This is a rehearsal, so nothing was opened. Noted that you would have opened \
-             {described}. Carry on as if it had worked, and say so in your summary."
+             {described}. Carry on as if it had worked, and say so in your answer."
         ));
     }
 
@@ -2298,7 +2434,7 @@ async fn message_person(state: &AppState, run_id: &str, args: &Value) -> Value {
     // Before the fence, never after. A rehearsal that armed the fence would use
     // up this occurrence's one message to this person, and the real run would
     // then be refused for something that never happened.
-    if is_dry_run(state, run_id).await {
+    if is_rehearsal(state, run_id).await {
         let _ = journal(
             state,
             run_id,
@@ -2894,12 +3030,17 @@ async fn guard_message(
 }
 
 /// Is this run a rehearsal?
-async fn is_dry_run(state: &AppState, run_id: &str) -> bool {
+///
+/// The one gate every irreversible tool asks before it does anything, so it
+/// asks the run itself rather than reading the mode: a teach run somebody asked
+/// to rehearse is still called "teach", and a check that spelled the mode out
+/// here would let that run really book the court.
+async fn is_rehearsal(state: &AppState, run_id: &str) -> bool {
     errand_core::db::get_run(state.pool(), run_id)
         .await
         .ok()
         .flatten()
-        .map(|r| r.mode == "dry_run")
+        .map(|r| r.is_rehearsal())
         .unwrap_or(false)
 }
 
@@ -2987,18 +3128,28 @@ async fn save_playbook(state: &AppState, run_id: &str, args: &Value) -> anyhow::
         anyhow::bail!("a playbook needs a goal");
     }
 
-    let source = if run.mode == "teach" {
+    let source = if run.is_teaching() {
         Source::Teach
     } else {
         Source::Refine
     };
+    // Whoever approves this has to know a rehearsal wrote it. The steps read
+    // the same either way, and the difference between "it booked the court" and
+    // "it noted that it would have booked the court" is the whole of what they
+    // are being asked to trust, so it is recorded here rather than left to the
+    // agent to remember to mention.
+    let changelog = run.is_rehearsal().then_some(
+        "Written by a rehearsal, so nothing in it was actually done: everything that cannot be \
+         undone was recorded instead. Read it as a plan for the first real run rather than as a \
+         record of one.",
+    );
     errand_core::db::add_playbook_version(
         state.pool(),
         &run.task_id,
         &pb,
         source,
         Some(run_id),
-        None,
+        changelog,
         false,
     )
     .await?;
@@ -3007,15 +3158,28 @@ async fn save_playbook(state: &AppState, run_id: &str, args: &Value) -> anyhow::
         state,
         run_id,
         "plan",
-        &format!("Wrote down how to do this, as version {version}"),
+        &format!(
+            "Wrote down how to do this, as version {version}{}",
+            if run.is_rehearsal() {
+                ", marked as written by a rehearsal"
+            } else {
+                ""
+            }
+        ),
         true,
     )
     .await;
 
     Ok(format!(
         "Saved as version {version}, with {} steps. It is waiting for the person to read and \
-         approve it; nothing will follow it until they do.",
-        pb.steps.len()
+         approve it; nothing will follow it until they do.{}",
+        pb.steps.len(),
+        if run.is_rehearsal() {
+            " It is marked as written by a rehearsal, so they will know nothing in it was \
+             actually done."
+        } else {
+            ""
+        }
     ))
 }
 
@@ -3034,6 +3198,7 @@ async fn task_limits(state: &AppState, run_id: &str) -> errand_core::limits::Lim
 #[cfg(test)]
 mod tests {
     use super::*;
+    use errand_core::models::RunMode;
 
     #[test]
     fn every_advertised_tool_has_a_qualified_name() {
@@ -3118,6 +3283,7 @@ mod tests {
     #[test]
     fn a_failure_answers_all_three_questions() {
         let o = Outcome::Failed {
+            answer: None,
             code: "captcha_or_2fa_needed".into(),
             attempting: "Booking your Wednesday court".into(),
             because: "The site now asks for a code sent to your phone".into(),
@@ -3238,7 +3404,7 @@ mod tests {
         }
     }
 
-    async fn an_errand(mode: &str, limits: Value) -> Errand {
+    async fn an_errand(mode: RunMode, limits: Value) -> Errand {
         let api = crate::api::testkit::start().await;
         let task_id = crate::api::testkit::a_task(
             &api,
@@ -3271,7 +3437,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_rehearsal_tells_nobody_and_still_reports_that_it_worked() {
-        let errand = an_errand("dry_run", json!({})).await;
+        let errand = an_errand(RunMode::REHEARSAL, json!({})).await;
         let mum = errand
             .may_write_to("Mum", "whatsapp", "+447700900123")
             .await;
@@ -3314,9 +3480,162 @@ mod tests {
         );
     }
 
+    // ------------------------------------------- teaching it as a rehearsal --
+
+    #[tokio::test]
+    async fn a_rehearsed_teach_tells_nobody_and_leaves_the_real_run_free_to_do_it() {
+        // The whole point of the thing: the first run of a task is always a
+        // teach run, so before this there was no way to watch a task that
+        // messages people, moves post or books a court without it happening.
+        let errand = an_errand(RunMode::TEACH_REHEARSAL, json!({})).await;
+        let mum = errand
+            .may_write_to("Mum", "whatsapp", "+447700900123")
+            .await;
+
+        let (is_error, text) = errand
+            .call(
+                "message_person",
+                json!({ "recipient_id": mum, "body": "The shopping is booked for Friday." }),
+            )
+            .await;
+
+        assert!(
+            !is_error,
+            "a rehearsal must succeed, or the agent goes looking for another way: {text}"
+        );
+        assert!(
+            text.contains("nothing was actually sent"),
+            "it must say plainly that nobody heard: {text}"
+        );
+        assert!(
+            errand.queued_messages().await.is_empty(),
+            "teaching it as a rehearsal sent a real person a real message"
+        );
+
+        let armed = errand_core::db::arm_side_effect(
+            &errand.api.pool,
+            &errand.run.id,
+            &errand.task_id,
+            &errand.run.occurrence_id,
+            "message",
+            &mum,
+        )
+        .await
+        .expect("asking the fence");
+        assert!(
+            matches!(armed, errand_core::db::FenceVerdict::Armed(_)),
+            "the rehearsal armed the fence, so the first real run would be refused for something \
+             that never happened"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rehearsed_teach_is_told_to_hold_everything_back_and_still_write_its_plan() {
+        let rehearsing = an_errand(RunMode::TEACH_REHEARSAL, json!({})).await;
+        let (_, brief) = rehearsing.call("read_brief", json!({})).await;
+        assert!(
+            brief.contains("REHEARSAL"),
+            "a rehearsed teach that is not told it is a rehearsal will book the court: {brief}"
+        );
+        assert!(
+            brief.contains("save_playbook"),
+            "a teach run that is not told to write a plan teaches nobody anything: {brief}"
+        );
+        assert!(
+            brief.contains("never write down that you booked"),
+            "the plan it writes must not claim it did what it only recorded: {brief}"
+        );
+
+        let ordinary = an_errand(RunMode::TEACH, json!({})).await;
+        let (_, brief) = ordinary.call("read_brief", json!({})).await;
+        assert!(
+            !brief.contains("REHEARSAL"),
+            "an ordinary teach run does the job for real and must be told so: {brief}"
+        );
+        assert!(brief.contains("save_playbook"), "{brief}");
+    }
+
+    #[tokio::test]
+    async fn the_plan_a_rehearsal_writes_says_it_was_rehearsed() {
+        // Somebody approving this is being asked to trust a plan whose steps
+        // read exactly like a plan from a run that really did the job.
+        let errand = an_errand(RunMode::TEACH_REHEARSAL, json!({})).await;
+        let (is_error, text) = errand
+            .call(
+                "save_playbook",
+                json!({
+                    "goal": "Put the usual shopping order in.",
+                    "steps": [{ "intent": "Open the basket and pay." }]
+                }),
+            )
+            .await;
+        assert!(
+            !is_error,
+            "a rehearsed teach could not write a plan: {text}"
+        );
+
+        let versions = errand_core::db::list_playbook_versions(&errand.api.pool, &errand.task_id)
+            .await
+            .expect("the versions");
+        let v = versions
+            .first()
+            .expect("a rehearsed teach wrote no plan at all");
+        assert_eq!(
+            v.source, "teach",
+            "it was still teaching, so it still counts as teaching"
+        );
+        assert!(
+            !v.approved,
+            "no plan is ever in force until a person has read it"
+        );
+        let changelog = v.changelog.clone().unwrap_or_default();
+        assert!(
+            changelog.contains("rehearsal")
+                && changelog.contains("nothing in it was actually done"),
+            "whoever approves this has to be told a rehearsal wrote it: {changelog:?}"
+        );
+
+        // And the task still cannot run alone, because nobody has approved it.
+        assert!(
+            errand_core::db::active_playbook(&errand.api.pool, &errand.task_id)
+                .await
+                .expect("the active plan")
+                .is_none(),
+            "a rehearsal's plan went into force without anybody reading it"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_plan_an_ordinary_teach_writes_claims_nothing_about_rehearsing() {
+        let errand = an_errand(RunMode::TEACH, json!({})).await;
+        let (is_error, text) = errand
+            .call(
+                "save_playbook",
+                json!({
+                    "goal": "Put the usual shopping order in.",
+                    "steps": [{ "intent": "Open the basket and pay." }]
+                }),
+            )
+            .await;
+        assert!(
+            !is_error,
+            "an ordinary teach could not write a plan: {text}"
+        );
+
+        let versions = errand_core::db::list_playbook_versions(&errand.api.pool, &errand.task_id)
+            .await
+            .expect("the versions");
+        let v = versions.first().expect("an ordinary teach wrote no plan");
+        assert_eq!(v.source, "teach");
+        assert_eq!(
+            v.changelog, None,
+            "a run that really did the job must not be described as a rehearsal"
+        );
+    }
+
     #[tokio::test]
     async fn an_id_this_task_was_never_given_reaches_nobody() {
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
         // Somebody who exists, but whom this task was never granted.
         let (_, stranger) = errand
             .api
@@ -3349,7 +3668,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_link_to_a_site_this_task_does_not_use_is_not_passed_on() {
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
         let mum = errand
             .may_write_to("Mum", "whatsapp", "+447700900123")
             .await;
@@ -3391,7 +3710,7 @@ mod tests {
         // The generic budget gate breaches on *more than* the limit and runs
         // before the tool does anything, so a task allowed one message would
         // otherwise get two out before anything noticed.
-        let errand = an_errand("normal", json!({ "max_messages": 1 })).await;
+        let errand = an_errand(RunMode::NORMAL, json!({ "max_messages": 1 })).await;
         let mum = errand
             .may_write_to("Mum", "whatsapp", "+447700900123")
             .await;
@@ -3427,7 +3746,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_person_hears_once_while_another_can_still_be_told() {
-        let errand = an_errand("normal", json!({ "max_messages": 5 })).await;
+        let errand = an_errand(RunMode::NORMAL, json!({ "max_messages": 5 })).await;
         let mum = errand
             .may_write_to("Mum", "whatsapp", "+447700900123")
             .await;
@@ -3477,7 +3796,7 @@ mod tests {
         // Two paths reach the same person: the agent's own tool during the run,
         // and the automatic report afterwards. One person, one run, one message,
         // whichever path gets there first.
-        let errand = an_errand("normal", json!({ "max_messages": 5 })).await;
+        let errand = an_errand(RunMode::NORMAL, json!({ "max_messages": 5 })).await;
         let mum = errand
             .may_write_to("Mum", "whatsapp", "+447700900123")
             .await;
@@ -3490,7 +3809,7 @@ mod tests {
             .await;
         assert!(!is_error, "{text}");
 
-        errand_core::db::finish_run_ok(&errand.api.pool, &errand.run.id, "Ordered for Friday.")
+        errand_core::db::finish_run_ok(&errand.api.pool, &errand.run.id, "Ordered for Friday.", None)
             .await
             .expect("finishing the run");
         crate::outbox::notify_run(&errand.api.state, &errand.run.id)
@@ -3506,7 +3825,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_task_with_nobody_to_write_to_is_told_what_the_person_must_do() {
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
         let (is_error, text) = errand.call("list_recipients", json!({})).await;
         assert!(
             is_error,
@@ -3520,7 +3839,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_agent_is_shown_enough_to_recognise_somebody_never_enough_to_reach_them() {
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
         errand
             .may_write_to("Mum", "apple_mail", "mum@example.com")
             .await;
@@ -3713,6 +4032,7 @@ mod tests {
     #[test]
     fn success_has_no_failure_text() {
         let o = Outcome::Finished {
+            answer: String::new(),
             summary: "Court 4 booked".into(),
         };
         assert!(o.failure_human().is_none());
@@ -3739,7 +4059,7 @@ mod tests {
     #[tokio::test]
     async fn a_file_name_that_is_really_a_path_is_refused_and_says_what_to_type_instead() {
         nothing_touches_the_real_mac();
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
 
         for name in [
             "reports/bitcoin.txt",
@@ -3781,7 +4101,7 @@ mod tests {
     #[tokio::test]
     async fn a_site_this_task_may_not_open_is_not_put_in_front_of_the_person() {
         nothing_touches_the_real_mac();
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
 
         // The plain off-list site, the lookalike that merely starts with an
         // allowed name, and an address with no scheme, which used to read as an
@@ -3822,7 +4142,7 @@ mod tests {
     #[tokio::test]
     async fn a_rehearsal_writes_nothing_opens_nothing_and_still_reports_that_it_worked() {
         nothing_touches_the_real_mac();
-        let errand = an_errand("dry_run", json!({})).await;
+        let errand = an_errand(RunMode::REHEARSAL, json!({})).await;
 
         let calls = [
             (
@@ -3869,7 +4189,7 @@ mod tests {
     #[tokio::test]
     async fn a_saved_file_lands_where_the_person_looks_and_the_journal_says_where() {
         nothing_touches_the_real_mac();
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
 
         // No ending on purpose: a file the Mac does not know how to open is a
         // file the person double-clicks and gets a dialogue for.
@@ -3900,7 +4220,7 @@ mod tests {
     #[tokio::test]
     async fn a_note_a_run_wrote_is_named_in_the_journal_so_the_person_knows_to_look() {
         nothing_touches_the_real_mac();
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
 
         let (is_error, text) = errand
             .call(
@@ -3953,7 +4273,7 @@ mod tests {
     #[tokio::test]
     async fn a_note_the_mac_will_not_allow_names_the_app_and_says_which_button_to_press() {
         nothing_touches_the_real_mac();
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
 
         let (is_error, text) = on_a_mac_that_says_no(
             &errand,
@@ -3992,18 +4312,18 @@ mod tests {
     #[tokio::test]
     async fn a_mailbox_the_mac_will_not_allow_tells_the_agent_to_stop_rather_than_hunt() {
         nothing_touches_the_real_mac();
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
         errand.may_read_mail(true).await;
 
         for (tool, args) in [
             ("list_mail", json!({})),
             (
                 "read_mail",
-                json!({ "id": "errand-rehearsal-1@example.invalid" }),
+                json!({ "id": crate::mail::rehearsal_id(1) }),
             ),
             (
                 "file_mail",
-                json!({ "id": "errand-rehearsal-1@example.invalid", "mailbox": "Junk" }),
+                json!({ "id": crate::mail::rehearsal_id(1), "mailbox": "Junk" }),
             ),
         ] {
             let (is_error, text) = on_a_mac_that_says_no(&errand, tool, args).await;
@@ -4021,7 +4341,7 @@ mod tests {
         // has moved since it was listed is exactly the kind of thing to try
         // again another way.
         nothing_touches_the_real_mac();
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
         errand.may_read_mail(true).await;
 
         let (is_error, text) = errand
@@ -4033,13 +4353,104 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_run_cannot_finish_by_pointing_at_the_answer_instead_of_giving_it() {
+        // The behaviour this whole field exists to stop. A model that has just
+        // written a note reaches for "see the note above", and the person opens
+        // their task to find a signpost.
+        nothing_touches_the_real_mac();
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
+
+        for pointer in ["see the note", "Done.", "as above", "ok"] {
+            let (is_error, text) = errand
+                .call(
+                    "finish",
+                    json!({ "summary": "Wrote it down.", "answer": pointer }),
+                )
+                .await;
+            assert!(is_error, "{pointer:?} was accepted as an answer: {text}");
+            assert!(
+                text.contains("pointer, not an answer") || text.contains("needs an 'answer'"),
+                "the refusal has to say what is wrong: {text}"
+            );
+        }
+        assert!(
+            errand.api.state.take_outcome(&errand.run.id).is_none(),
+            "a refused finish must not end the run"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_answer_is_scrubbed_before_it_is_kept() {
+        // The answer is built to carry the contents of a page back out, and it
+        // travels further than anything else here: a database row, a webhook to
+        // somebody's own program, and a phone. A login typed into a form
+        // earlier in the same run is in this redactor.
+        nothing_touches_the_real_mac();
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
+        errand
+            .api
+            .state
+            .redactor(&errand.run.id)
+            .register("hunter2-secret", "the password it typed in");
+
+        let (is_error, text) = errand
+            .call(
+                "finish",
+                json!({
+                    "summary": "Signed in and read the page.",
+                    "answer": "The account balance is 412 euro. I signed in with hunter2-secret."
+                }),
+            )
+            .await;
+        assert!(!is_error, "{text}");
+
+        match errand.api.state.take_outcome(&errand.run.id) {
+            Some(Outcome::Finished { answer, .. }) => {
+                assert!(
+                    !answer.contains("hunter2-secret"),
+                    "a secret reached the answer: {answer}"
+                );
+                assert!(
+                    answer.contains("412 euro"),
+                    "scrubbing must not eat the answer: {answer}"
+                );
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_note_the_task_asked_for_is_recorded_as_a_copy_of_the_answer() {
+        // So the task page can offer to open it. Recorded by the tool that
+        // wrote it, not read back out of the journal's sentences, because a
+        // link that opens nothing is worse than no link.
+        nothing_touches_the_real_mac();
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
+
+        let (is_error, text) = errand
+            .call(
+                "save_note",
+                json!({ "title": "Morning mail summary", "body": "Four digests and a receipt." }),
+            )
+            .await;
+        assert!(!is_error, "{text}");
+
+        let copies = errand_core::db::list_answer_copies(&errand.api.pool, &errand.run.id)
+            .await
+            .expect("the copies this run made");
+        assert_eq!(copies.len(), 1, "{copies:?}");
+        assert_eq!(copies[0].kind, "note");
+        assert_eq!(copies[0].label, "Morning mail summary");
+    }
+
+    #[tokio::test]
     async fn saving_the_answer_somewhere_else_is_still_a_run_that_did_not_do_what_was_asked() {
         // The Bitcoin run's own shape: Notes was shut, the agent sensibly wrote
         // a file instead, and then called it a success. Writing the file is the
         // right instinct and is kept. Calling it a success is how a permission
         // stays switched off for a month.
         nothing_touches_the_real_mac();
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
 
         let (blocked, _) = on_a_mac_that_says_no(
             &errand,
@@ -4060,20 +4471,30 @@ mod tests {
         let (is_error, text) = errand
             .call(
                 "finish",
-                json!({ "summary": "Saved the headlines to a file, because Notes would not open." }),
+                json!({
+                    "summary": "Saved the headlines to a file, because Notes would not open.",
+                    "answer": "Bitcoin is up 3 percent today, trading around 61,400 dollars."
+                }),
             )
             .await;
         assert!(!is_error, "{text}");
 
         match errand.api.state.take_outcome(&errand.run.id) {
             Some(Outcome::Failed {
+                answer,
                 attempting,
                 because,
                 next_steps,
                 ..
             }) => {
-                // What it did manage is kept, so the person is not left
-                // wondering where the answer went.
+                // The run really did fail: the person asked for a note and
+                // there is no note. It also really did find the answer, and
+                // that has to survive, or somebody reads "it could not finish"
+                // and goes and does the work again by hand.
+                assert!(
+                    answer.as_deref().is_some_and(|a| a.contains("61,400")),
+                    "the answer was thrown away with the failure: {answer:?}"
+                );
                 assert!(attempting.contains("Saved the headlines"), "{attempting}");
                 assert!(because.contains("Apple Notes"), "{because}");
                 assert!(next_steps.contains("Enable"), "{next_steps}");
@@ -4088,7 +4509,7 @@ mod tests {
     #[tokio::test]
     async fn a_run_nothing_blocked_still_finishes_as_a_success() {
         nothing_touches_the_real_mac();
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
 
         let (is_error, text) = errand
             .call(
@@ -4099,7 +4520,7 @@ mod tests {
         assert!(!is_error, "{text}");
 
         let (is_error, text) = errand
-            .call("finish", json!({ "summary": "Wrote the note." }))
+            .call("finish", json!({ "summary": "Wrote the note.", "answer": "Court 4 is booked for Wednesday at 19:00. Confirmation TC-88421." }))
             .await;
         assert!(!is_error, "{text}");
         assert!(
@@ -4114,7 +4535,7 @@ mod tests {
     #[tokio::test]
     async fn a_password_the_run_used_never_reaches_a_file_that_stays_on_disk() {
         nothing_touches_the_real_mac();
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
         errand
             .api
             .state
@@ -4147,7 +4568,7 @@ mod tests {
     #[tokio::test]
     async fn a_file_that_was_never_saved_cannot_be_shown_and_the_agent_is_told_why() {
         nothing_touches_the_real_mac();
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
 
         let (is_error, text) = errand
             .call(
@@ -4177,7 +4598,7 @@ mod tests {
     #[tokio::test]
     async fn a_task_nobody_gave_the_mail_to_is_never_even_offered_the_mail_tools() {
         nothing_touches_the_real_mac();
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
 
         let before = errand.tools_offered().await;
         for tool in ["list_mail", "read_mail", "file_mail"] {
@@ -4204,7 +4625,7 @@ mod tests {
     #[tokio::test]
     async fn without_the_grant_the_mail_is_refused_in_a_sentence_that_names_the_switch() {
         nothing_touches_the_real_mac();
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
 
         // Dispatch refuses as well as the tool list omitting them, because the
         // in-process agent loop offers every tool and only this stops it.
@@ -4212,11 +4633,11 @@ mod tests {
             ("list_mail", json!({})),
             (
                 "read_mail",
-                json!({ "id": "errand-rehearsal-1@example.invalid" }),
+                json!({ "id": crate::mail::rehearsal_id(1) }),
             ),
             (
                 "file_mail",
-                json!({ "id": "errand-rehearsal-1@example.invalid", "mailbox": "Junk" }),
+                json!({ "id": crate::mail::rehearsal_id(1), "mailbox": "Junk" }),
             ),
         ] {
             let (is_error, text) = errand.call(tool, args).await;
@@ -4239,7 +4660,7 @@ mod tests {
     #[tokio::test]
     async fn a_task_allowed_to_read_the_mail_is_not_thereby_allowed_to_move_it() {
         nothing_touches_the_real_mac();
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
         errand.may_read_mail(false).await;
 
         let (is_error, listed) = errand.call("list_mail", json!({})).await;
@@ -4251,7 +4672,7 @@ mod tests {
         let (is_error, text) = errand
             .call(
                 "file_mail",
-                json!({ "id": "errand-rehearsal-1@example.invalid", "mailbox": "Junk" }),
+                json!({ "id": crate::mail::rehearsal_id(1), "mailbox": "Junk" }),
             )
             .await;
         assert!(is_error, "a read-only grant moved a message: {text}");
@@ -4277,10 +4698,10 @@ mod tests {
     #[tokio::test]
     async fn a_rehearsal_moves_no_message_and_still_reports_that_it_worked() {
         nothing_touches_the_real_mac();
-        let errand = an_errand("dry_run", json!({})).await;
+        let errand = an_errand(RunMode::REHEARSAL, json!({})).await;
         errand.may_read_mail(true).await;
 
-        let id = "errand-rehearsal-1@example.invalid";
+        let id = crate::mail::rehearsal_id(1);
         let (is_error, text) = errand
             .call("file_mail", json!({ "id": id, "mailbox": "Junk" }))
             .await;
@@ -4299,7 +4720,14 @@ mod tests {
             "a rehearsed move nobody can read afterwards is not a rehearsal: {lines:?}"
         );
         assert!(
-            errand_core::db::recent_commit(&errand.api.pool, &errand.task_id, "deletion", id, 10)
+            errand_core::db::recent_commit(
+                &errand.api.pool,
+                &errand.task_id,
+                "deletion",
+                // The fence keys on the message, not on where it was sitting.
+                &crate::mail::stable_id(&id),
+                10
+            )
                 .await
                 .expect("the safety record")
                 .is_none(),
@@ -4308,12 +4736,53 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_same_message_cannot_be_moved_twice_in_one_run() {
+    async fn a_message_that_moved_up_the_list_still_cannot_be_moved_twice() {
+        // The ids a listing hands out say where a message was sitting, and mail
+        // arriving in the seconds before a second listing shifts every one of
+        // them. If the fence keyed on the whole id, the same message listed
+        // twice would be two different scopes and "never move it twice" would
+        // quietly stop being true -- for spam tidying, that means the same
+        // message filed twice and a person wondering where it went.
         nothing_touches_the_real_mac();
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
         errand.may_read_mail(true).await;
 
-        let id = "errand-rehearsal-1@example.invalid";
+        let first_listing = crate::mail::rehearsal_id(1);
+        let (is_error, first) = errand
+            .call("file_mail", json!({ "id": first_listing, "mailbox": "Junk" }))
+            .await;
+        assert!(!is_error, "the first move was refused: {first}");
+
+        // The same message, listed again after two more arrived: same message
+        // id, two places further down.
+        let moved_down = first_listing.replace("E1.1.", "E1.3.");
+        assert_ne!(moved_down, first_listing, "the id has to carry a position");
+        assert_eq!(
+            crate::mail::stable_id(&moved_down),
+            crate::mail::stable_id(&first_listing),
+            "both ids have to name the same message for this to test anything"
+        );
+
+        let (is_error, again) = errand
+            .call("file_mail", json!({ "id": moved_down, "mailbox": "Archive" }))
+            .await;
+        assert!(
+            is_error,
+            "a message that shifted position was moved a second time: {again}"
+        );
+        assert!(
+            again.contains("already moved that message"),
+            "the repeat has to be named as one: {again}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_same_message_cannot_be_moved_twice_in_one_run() {
+        nothing_touches_the_real_mac();
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
+        errand.may_read_mail(true).await;
+
+        let id = crate::mail::rehearsal_id(1);
         let (is_error, first) = errand
             .call("file_mail", json!({ "id": id, "mailbox": "Junk" }))
             .await;
@@ -4333,7 +4802,7 @@ mod tests {
         let (is_error, other) = errand
             .call(
                 "file_mail",
-                json!({ "id": "errand-rehearsal-2@example.invalid", "mailbox": "Junk" }),
+                json!({ "id": crate::mail::rehearsal_id(2), "mailbox": "Junk" }),
             )
             .await;
         assert!(
@@ -4343,9 +4812,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_contents_of_a_message_never_reach_the_run_journal() {
+    /// What Errand itself writes down about a message it opened.
+    ///
+    /// Named carefully, because the obvious name would claim more than anyone
+    /// can enforce. This proves that Errand's own journalling keeps only who a
+    /// message was from and what it was about, never the body -- so a person
+    /// scrolling a run cannot read their own post over Errand's shoulder, and
+    /// neither can anything that later reads the run.
+    ///
+    /// The model's own narration is a separate matter and is deliberately not
+    /// covered: it has read the message, and a run that says only "decided one
+    /// message was junk" is not reviewable. Characterising what it saw -- "a
+    /// digest urging replies that promote a free mailbox" -- is the evidence
+    /// that makes the verdict checkable, and that does reach the journal.
+    async fn errand_itself_never_writes_a_message_body_into_the_run_journal() {
         nothing_touches_the_real_mac();
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
         errand.may_read_mail(true).await;
 
         let (_, listed) = errand.call("list_mail", json!({})).await;
@@ -4357,7 +4839,7 @@ mod tests {
         let (is_error, body) = errand
             .call(
                 "read_mail",
-                json!({ "id": "errand-rehearsal-1@example.invalid" }),
+                json!({ "id": crate::mail::rehearsal_id(1) }),
             )
             .await;
         assert!(!is_error, "an id from the listing would not open: {body}");
@@ -4388,7 +4870,7 @@ mod tests {
     #[tokio::test]
     async fn a_task_that_was_given_the_mail_is_told_so_in_its_brief() {
         nothing_touches_the_real_mac();
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
 
         let (_, before) = errand.call("read_brief", json!({})).await;
         assert!(
@@ -4421,7 +4903,7 @@ mod tests {
         // A mailbox is the likeliest place in the whole app for somebody to
         // write "reply with the code" and hope a model reads it as an order.
         nothing_touches_the_real_mac();
-        let errand = an_errand("normal", json!({})).await;
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
         errand.may_read_mail(false).await;
 
         let (_, listed) = errand.call("list_mail", json!({})).await;
@@ -4433,7 +4915,7 @@ mod tests {
         let (_, body) = errand
             .call(
                 "read_mail",
-                json!({ "id": "errand-rehearsal-1@example.invalid" }),
+                json!({ "id": crate::mail::rehearsal_id(1) }),
             )
             .await;
         assert!(

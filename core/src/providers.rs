@@ -367,6 +367,79 @@ impl Provider {
     }
 }
 
+// ------------------------------------------------------- one task's choice --
+//
+// A model is chosen for a job once, on the AI screen, and that is the right
+// default. It is the wrong answer for every task at once, though, because
+// whichever model carries a task out is the model that reads whatever the tools
+// hand back: a task that opens a mailbox wants one on your own machine, and a
+// task that books a tennis court may as well use the best one you have. So a
+// task may name its own, and saying nothing means following the default.
+
+/// Which of the four jobs a task may name a model for.
+///
+/// One, deliberately. The job that matters is the one that sees what the task
+/// sees; the other three read a finished run, and nobody has asked to vary
+/// those per task. The column is a bag keyed by role, so a second one could be
+/// added later without touching the schema, which is why the key is written
+/// down rather than assumed.
+fn task_model_key() -> &'static str {
+    Role::Executor.as_str()
+}
+
+/// Which model a task has been told to carry itself out with.
+///
+/// `None` means it never said, and the choice on the AI screen stands. An
+/// unreadable column means the same: a task whose stored settings cannot be
+/// parsed should run on the default rather than not run at all.
+pub fn read_task_model(stored: Option<&str>) -> Option<String> {
+    let id = serde_json::from_str::<serde_json::Value>(stored?)
+        .ok()?
+        .get(task_model_key())?
+        .as_str()?
+        .trim()
+        .to_string();
+    (!id.is_empty()).then_some(id)
+}
+
+/// What to store for a task that has just been told which model to use.
+///
+/// Rewritten rather than replaced, so naming a model cannot take anything else
+/// in that column with it. `None` clears the choice and puts the task back on
+/// the default; an object left with nothing in it becomes `None`, so a task
+/// that has said nothing stores nothing.
+pub fn write_task_model(stored: Option<&str>, chosen: Option<&str>) -> Option<String> {
+    let mut obj = stored
+        .and_then(|s| serde_json::from_str::<serde_json::Value>(s).ok())
+        .and_then(|v| v.as_object().cloned())
+        .unwrap_or_default();
+    match chosen.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(id) => {
+            obj.insert(task_model_key().to_string(), serde_json::Value::from(id));
+        }
+        None => {
+            obj.remove(task_model_key());
+        }
+    }
+    (!obj.is_empty()).then(|| serde_json::Value::Object(obj).to_string())
+}
+
+/// What an edit says about the model that carries a task out.
+///
+/// Three answers rather than two, because "the edit did not mention it" and
+/// "put it back on the default" are different instructions and only one of them
+/// should change anything. Without the distinction, saving a task's sites would
+/// quietly forget which model it was told to use.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ModelChoice {
+    #[default]
+    Unchanged,
+    /// Follow whatever the AI screen is set to.
+    Default,
+    /// This model in Errand's list, by id.
+    Named(String),
+}
+
 /// A service Errand already knows how to talk to.
 ///
 /// The point of this list is that nobody should have to know a base URL. You

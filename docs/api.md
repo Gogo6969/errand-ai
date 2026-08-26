@@ -69,7 +69,7 @@ Every task response also carries `open_holds`: how many armed irreversible
 actions are waiting on a person to say what happened. Above zero, the task is
 blocked until someone resolves the hold, and `POST /v1/tasks/{id}/holds` is the
 way to do it.
-| `PATCH /v1/tasks/{id}` | Change any of the above. Absent fields are left alone. || `POST /v1/tasks/{id}/teach` | Run it once in teach mode, so it can write a plan. |
+| `PATCH /v1/tasks/{id}` | Change any of the above. Absent fields are left alone. || `POST /v1/tasks/{id}/teach` | Run it once in teach mode, so it can write a plan. No body teaches it for real; `{"dry_run": true}` teaches it as a rehearsal, which still writes a plan but records anything irreversible instead of doing it. |
 | `POST /v1/tasks/{id}/run` | Run now. `{"dry_run": true}` rehearses without doing anything. |
 | `POST /v1/tasks/{id}/activate` | Arm it, once a plan is approved. |
 | `POST /v1/tasks/{id}/pause` · `/resume` | Stop and restart scheduled runs. |
@@ -102,6 +102,24 @@ saying but not worth refusing over, such as `www.x.com` without `x.com`.
 Order matters: the first entry decides which browser profile the task uses, and
 that profile holds its saved logins.
 
+### Which model carries a task out
+
+`model_id` names one of the models from `GET /v1/ai`, by id. Null means the task
+has not chosen, and it follows the executor binding on the AI screen. It is
+worth setting where the work is private: whichever model carries the task out is
+the one that reads what the task reads, so a task that opens a mailbox can be
+kept on a model of your own while everything else uses a service.
+
+On `PATCH`, leaving `model_id` out and sending it as `null` mean different
+things. Out means unchanged, so an edit about anything else keeps the model the
+task was given. `null` (or an empty string) puts it back on the default.
+
+A model that Errand has asked and found unable to use tools is refused here, the
+same as it is for the executor binding. One that is merely switched off, removed
+later, or put out of reach by *keep everything on this machine* is not: the run
+falls through to the next usable model rather than failing, and says in its
+journal what it was asked for and why it could not have it.
+
 ### Schedules
 
 ```json
@@ -126,6 +144,11 @@ means, and the next few times it would really fire. Call it before saving one.
 | `GET /v1/runs/{id}/stream` | Server-sent events, live. |
 | `GET /v1/events` | Every run, live. |
 | `GET /v1/artifacts/{id}` | A file a run left behind, such as a screenshot. Steps that have one carry an `artifact_id`. Addressed by id, never by path. |
+
+Every run carries `mode` (`normal`, `teach` or `dry_run`) and `rehearsal`. They
+are two different questions, and a teach run can be a rehearsal too, so **read
+`rehearsal` and not the mode** when what you want to know is whether anything
+the run did was real.
 
 ## People a task may message
 

@@ -38,6 +38,24 @@ else
   SRC="target/debug/errandd"
 fi
 
+# Check the build actually produced a binary newer than the code.
+#
+# cargo will report success and leave a stale executable behind: clippy and
+# test share this target directory and their artifacts can win the fingerprint,
+# so `cargo build` prints nothing and target/release/errandd stays as it was.
+# Installing that is a genuinely confusing failure -- an older binary knows
+# fewer migrations, so the daemon dies with "migration 5 was previously applied
+# but is missing", which reads like a corrupt database rather than a stale copy.
+NEWEST=$(find core runner app/src-tauri -name '*.rs' -o -name '*.sql' 2>/dev/null \
+  | xargs ls -t 2>/dev/null | head -1)
+if [ -n "$NEWEST" ] && [ "$SRC" -ot "$NEWEST" ]; then
+  echo "Refusing to install: $SRC is older than $NEWEST." >&2
+  echo "  cargo reported success but did not rewrite the binary." >&2
+  echo "  Run: cargo clean -p errand-runner && $0 $PROFILE" >&2
+  exit 1
+fi
+echo "  $SRC is newer than the code it was built from"
+
 echo "Stopping any running runner"
 launchctl bootout "gui/$(id -u)/com.errandai.runner" 2>/dev/null || true
 pkill -9 -f 'errandd --launchd' 2>/dev/null || true

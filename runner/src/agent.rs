@@ -34,6 +34,13 @@ use crate::state::AppState;
 /// a model that is confused rather than expensive still stops.
 const MAX_TURNS: usize = 40;
 
+/// How many identical turns before the model is told it is repeating itself,
+/// and how many before the run stops. Two different numbers because a model
+/// that is merely stuck sometimes recovers when it is told plainly; one that
+/// does not is not going to finish the task at all.
+const SAME_CALL_WARN: usize = 2;
+const SAME_CALL_STOP: usize = 5;
+
 /// How much of one tool result the model is shown.
 ///
 /// A page snapshot can be enormous and a model on somebody's desk may have a
@@ -120,6 +127,18 @@ pub async fn run_with_tools(
     });
 
     let mut nudged = false;
+    // A model that gets stuck repeating itself.
+    //
+    // A weaker model can settle into asking for the same thing with the same
+    // arguments over and over. One local model listed the same mailbox
+    // twenty-five times, a second apart, and then ran out of turns: every one
+    // of those was a real Apple Event against a real 191,000-message mailbox,
+    // and the run ended saying the agent "stopped without reporting whether it
+    // finished", which describes the symptom and hides the cause. So the
+    // repeat is named to the model when it starts, and the run is stopped with
+    // a reason a person can act on if it carries on regardless.
+    let mut same_call: Option<String> = None;
+    let mut repeats = 0usize;
 
     for _ in 0..MAX_TURNS {
         // Checked before asking the model rather than only inside dispatch, so
@@ -177,6 +196,32 @@ pub async fn run_with_tools(
         // than inheriting one used up earlier in the run.
         nudged = false;
 
+        let fingerprint = turn
+            .tool_calls
+            .iter()
+            .map(|c| format!("{}({})", c.name, c.arguments))
+            .collect::<Vec<_>>()
+            .join("; ");
+        if same_call.as_ref() == Some(&fingerprint) {
+            repeats += 1;
+        } else {
+            repeats = 0;
+            same_call = Some(fingerprint);
+        }
+        if repeats >= SAME_CALL_STOP {
+            return Err(ExecError::NoModel(format!(
+                "{model} asked for exactly the same thing {} times in a row without doing \
+                 anything with the answer, so the task was not carried out. That usually means \
+                 the model is not able to follow a task of this shape. Choose a different one \
+                 for \"Doing the task\", either in Settings or on this task.",
+                repeats + 1
+            )));
+        }
+        // Answered rather than dispatched: repeating the call costs real time
+        // against real mail, and the answer would be the same one it already
+        // has.
+        let repeating = repeats >= SAME_CALL_WARN;
+
         for call in &turn.tool_calls {
             // CONTAINMENT, and asked first, before anything else about the
             // call is considered: nothing outside the list Errand handed over
@@ -190,6 +235,16 @@ pub async fn run_with_tools(
                      offered. The only tools that exist are: {}.",
                     call.name,
                     offered.join(", ")
+                )
+            } else if repeating {
+                let line = format!("Asked for the same thing again: {}", call.name);
+                decided(state, run_id, &line).await;
+                format!(
+                    "You have already called '{}' with exactly these arguments {} times in a \
+                     row, and the answer will not change. Use the answer you already have, or do \
+                     something different. If you have what you need, call finish.",
+                    call.name,
+                    repeats + 1
                 )
             } else if let Some(raw) = &call.unreadable {
                 format!(
@@ -387,6 +442,52 @@ mod tests {
                 health_detail: None,
             }
         }
+        /// The same stub under a name of its own, for a test that needs two
+        /// models and has to be able to tell which one did the work.
+        fn provider_called(&self, id: &str, label: &str) -> Provider {
+            Provider {
+                id: id.into(),
+                label: label.into(),
+                ..self.provider()
+            }
+        }
+    }
+
+    /// Save a model the way the AI screen's own form does.
+    async fn save_model(api: &crate::api::testkit::Api, p: &Provider, enabled: bool) {
+        let (code, body) = api
+            .post(
+                "/v1/ai/providers",
+                json!({
+                    "id": p.id, "kind": p.kind, "label": p.label,
+                    "base_url": p.base_url, "model": p.model, "enabled": enabled,
+                }),
+            )
+            .await;
+        assert_eq!(code, 200, "saving {} failed: {body}", p.label);
+    }
+
+    /// Tell a task which model should carry it out, the way its page does.
+    /// `None` puts it back on whatever the AI screen is set to.
+    async fn choose_model(
+        api: &crate::api::testkit::Api,
+        task_id: &str,
+        model_id: Option<&str>,
+    ) -> (u16, Value) {
+        api.patch(
+            &format!("/v1/tasks/{task_id}"),
+            json!({ "model_id": model_id }),
+        )
+        .await
+    }
+
+    /// Choose the model for every task that has not chosen one, the way the AI
+    /// screen does.
+    async fn choose_default_model(api: &crate::api::testkit::Api, id: &str) {
+        let (code, body) = api
+            .post("/v1/ai/roles/executor", json!({ "provider_id": id }))
+            .await;
+        assert_eq!(code, 200, "choosing the default model failed: {body}");
     }
 
     /// One assistant turn that calls one tool, in the shape most servers send:
@@ -410,6 +511,13 @@ mod tests {
 
     /// A task and a run, set up the way the app sets one up.
     async fn a_run() -> (crate::api::testkit::Api, String) {
+        let (api, _task_id, run_id) = a_task_and_a_run().await;
+        (api, run_id)
+    }
+
+    /// The same, and which task the run is for, which is what the tests about
+    /// choosing a model per task need in order to make the choice.
+    async fn a_task_and_a_run() -> (crate::api::testkit::Api, String, String) {
         let api = crate::api::testkit::start().await;
         let task_id = crate::api::testkit::a_task(
             &api,
@@ -421,12 +529,12 @@ mod tests {
             &task_id,
             &format!("manual/{}", errand_core::new_id()),
             "manual",
-            "normal",
+            errand_core::models::RunMode::NORMAL,
             None,
         )
         .await
         .expect("a run");
-        (api, run.id)
+        (api, task_id, run.id)
     }
 
     async fn steps(api: &crate::api::testkit::Api, run_id: &str) -> Vec<String> {
@@ -449,7 +557,7 @@ mod tests {
                     "journal",
                     json!({ "title": "Opening the shop", "kind": "plan" }),
                 ),
-                calls("finish", json!({ "summary": "The usual order is in." })),
+                calls("finish", json!({ "summary": "The usual order is in.", "answer": "Court 4 is booked for Wednesday at 19:00. Confirmation TC-88421." })),
             ],
             "200 OK",
         );
@@ -460,7 +568,7 @@ mod tests {
             .expect("the loop ran");
 
         assert!(
-            matches!(outcome, Outcome::Finished { ref summary } if summary.contains("usual order")),
+            matches!(outcome, Outcome::Finished { ref summary, .. } if summary.contains("usual order")),
             "the run should have finished with the model's own summary: {outcome:?}"
         );
         assert!(
@@ -479,7 +587,7 @@ mod tests {
         let server = serve(
             vec![
                 calls("run_shell_command", json!({ "command": "rm -rf ~" })),
-                calls("finish", json!({ "summary": "Nothing was done." })),
+                calls("finish", json!({ "summary": "Nothing was done.", "answer": "Court 4 is booked for Wednesday at 19:00. Confirmation TC-88421." })),
             ],
             "200 OK",
         );
@@ -504,7 +612,7 @@ mod tests {
         let (api, run_id) = a_run().await;
         let server = serve(
             vec![
-                calls("finish", json!({ "summary": "Done on the first turn." })),
+                calls("finish", json!({ "summary": "Done on the first turn.", "answer": "Court 4 is booked for Wednesday at 19:00. Confirmation TC-88421." })),
                 calls("journal", json!({ "title": "This should never happen" })),
             ],
             "200 OK",
@@ -543,6 +651,49 @@ mod tests {
             server.times_asked() <= 2,
             "it should be nudged once and then stopped, not asked {} times",
             server.times_asked()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_stuck_asking_the_same_thing_is_stopped_rather_than_ground_to_a_halt() {
+        // Seen for real: a 27B model listed the same mailbox twenty-five times,
+        // one second apart, until it ran out of turns. Every repeat was a real
+        // Apple Event against a real mailbox, and the run ended saying the
+        // agent "stopped without reporting whether it finished" -- a sentence
+        // about the ceiling that says nothing about the cause. The stub here
+        // repeats its last reply for ever, which is exactly that model.
+        let (api, run_id) = a_run().await;
+        let server = serve(vec![calls("list_mail", json!({ "limit": 5 }))], "200 OK");
+        let p = server.provider();
+
+        let e = run_with_tools(&api.state, &run_id, &p, "qwen3.5-27b", None)
+            .await
+            .expect_err("a model that only repeats itself cannot finish")
+            .to_string();
+
+        assert!(
+            e.contains("qwen3.5-27b") && e.contains("same thing"),
+            "the failure has to name the model and say what it did: {e}"
+        );
+        assert!(
+            server.times_asked() <= SAME_CALL_STOP + 2,
+            "it should stop within a few turns, not run to the ceiling of \
+             {MAX_TURNS}; it was asked {} times",
+            server.times_asked()
+        );
+        // And the repeat is told to the model before the run is given up on,
+        // so one that is merely stuck has a chance to do something else.
+        let journal: Vec<String> = errand_core::db::list_steps(api.state.pool(), &run_id)
+            .await
+            .expect("the run's steps")
+            .into_iter()
+            .map(|s| s.title)
+            .collect();
+        assert!(
+            journal
+                .iter()
+                .any(|l| l.contains("Asked for the same thing again")),
+            "a person reading the run has to see why it stopped: {journal:?}"
         );
     }
 
@@ -587,7 +738,7 @@ mod tests {
         let server = serve(
             vec![
                 already_parsed,
-                calls("finish", json!({ "summary": "Checked it." })),
+                calls("finish", json!({ "summary": "Checked it.", "answer": "Court 4 is booked for Wednesday at 19:00. Confirmation TC-88421." })),
             ],
             "200 OK",
         );
@@ -637,7 +788,7 @@ mod tests {
         let server = serve(
             vec![
                 calls("journal", json!({ "title": "Signed in", "kind": "act" })),
-                calls("finish", json!({ "summary": "Ordered, arriving Friday." })),
+                calls("finish", json!({ "summary": "Ordered, arriving Friday.", "answer": "Court 4 is booked for Wednesday at 19:00. Confirmation TC-88421." })),
             ],
             "200 OK",
         );
@@ -668,6 +819,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_local_model_does_not_promise_privacy_the_rest_of_the_run_will_not_keep() {
+        // Choosing a model for one task only chooses who carries it out.
+        // Writing the plan afterwards, explaining a failure and wording a
+        // notification each resolve against the global choice, so a mail task
+        // pointed at the machine on the desk can still have its journal -- who
+        // wrote to the person, and about what -- handed to a service a moment
+        // later. The line people read to check must not say otherwise.
+        let (api, task_id, run_id) = a_task_and_a_run().await;
+        let local = serve(
+            vec![calls("finish", json!({ "summary": "Done.", "answer": "Court 4 is booked for Wednesday at 19:00. Confirmation TC-88421." }))],
+            "200 OK",
+        );
+        save_model(&api, &local.provider(), true).await;
+
+        // Something on the internet, enabled, which nothing has ruled out for
+        // writing the plan or the summary.
+        let away = errand_core::providers::Provider {
+            id: "hosted".into(),
+            kind: Kind::OpenAiCompat.as_str().into(),
+            label: "A service on the internet".into(),
+            base_url: Some("https://api.example.com".into()),
+            model: Some("something-large".into()),
+            enabled: true,
+            discovered: false,
+            health: None,
+            health_detail: None,
+        };
+        assert!(!away.is_local(), "the second provider has to be off-machine");
+        save_model(&api, &away, true).await;
+
+        // The task asks for the one on the desk, which is the whole point of
+        // choosing a model per task.
+        let (code, body) = choose_model(&api, &task_id, Some(&local.provider().id)).await;
+        assert_eq!(code, 200, "{body}");
+
+        let _ = crate::executor::carry_out(
+            &api.state,
+            &run_id,
+            crate::executor::ExecOptions::default(),
+        )
+        .await;
+
+        let journal = steps(&api, &run_id).await;
+        assert!(
+            !journal
+                .iter()
+                .any(|s| s.contains("Nothing about this task leaves your machine")),
+            "the run promised privacy that only covers the model doing the work: {journal:?}"
+        );
+        assert!(
+            journal
+                .iter()
+                .any(|s| s.contains("done on your machine") && s.contains("Keep everything")),
+            "it has to say what is still not staying here, and how to change it: {journal:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn a_whole_run_really_ends_as_done_when_a_local_model_did_it() {
         // Through run_to_completion, which is what the scheduler and the Run
         // now button both call. Anything short of this can pass while the
@@ -676,7 +885,7 @@ mod tests {
         let server = serve(
             vec![calls(
                 "finish",
-                json!({ "summary": "Booked the court for Wednesday." }),
+                json!({ "summary": "Booked the court for Wednesday.", "answer": "Court 4 is booked for Wednesday at 19:00. Confirmation TC-88421." }),
             )],
             "200 OK",
         );
@@ -715,6 +924,211 @@ mod tests {
         assert!(
             e.contains("Settings") && e.contains("claude /login"),
             "the failure has to name what to configure: {e}"
+        );
+    }
+
+    /// Two models that answer differently, so a test can tell which one did the
+    /// work from the summary alone.
+    fn two_models() -> (Server, Server) {
+        (
+            serve(
+                vec![calls(
+                    "finish",
+                    json!({ "summary": "The usual model did it.", "answer": "Court 4 is booked for Wednesday at 19:00. Confirmation TC-88421." }),
+                )],
+                "200 OK",
+            ),
+            serve(
+                vec![calls(
+                    "finish",
+                    json!({ "summary": "The model I chose did it.", "answer": "Court 4 is booked for Wednesday at 19:00. Confirmation TC-88421." }),
+                )],
+                "200 OK",
+            ),
+        )
+    }
+
+    #[tokio::test]
+    async fn a_task_that_names_no_model_is_carried_out_by_the_one_chosen_in_settings() {
+        let (api, _task_id, run_id) = a_task_and_a_run().await;
+        let (usual, mine) = two_models();
+        save_model(
+            &api,
+            &usual.provider_called("usual", "The usual model"),
+            true,
+        )
+        .await;
+        save_model(
+            &api,
+            &mine.provider_called("mine", "The model on my desk"),
+            true,
+        )
+        .await;
+        choose_default_model(&api, "usual").await;
+
+        let outcome = crate::executor::carry_out(
+            &api.state,
+            &run_id,
+            crate::executor::ExecOptions::default(),
+        )
+        .await
+        .expect("the run went ahead");
+
+        assert!(
+            matches!(outcome, Outcome::Finished { ref summary, .. } if summary.contains("usual model")),
+            "a task that names no model must use the one Settings chose: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_that_names_a_model_is_carried_out_by_that_one_and_not_the_usual_one() {
+        // What the whole change is for. Whichever model does the work is the
+        // one that reads what the tools hand back, so a task that reads a
+        // mailbox has to be able to insist on a model of your own even where
+        // everything else goes to a service.
+        let (api, task_id, run_id) = a_task_and_a_run().await;
+        let (usual, mine) = two_models();
+        save_model(
+            &api,
+            &usual.provider_called("usual", "The usual model"),
+            true,
+        )
+        .await;
+        save_model(
+            &api,
+            &mine.provider_called("mine", "The model on my desk"),
+            true,
+        )
+        .await;
+        choose_default_model(&api, "usual").await;
+
+        let (code, body) = choose_model(&api, &task_id, Some("mine")).await;
+        assert_eq!(code, 200, "naming a model for this task failed: {body}");
+
+        let outcome = crate::executor::carry_out(
+            &api.state,
+            &run_id,
+            crate::executor::ExecOptions::default(),
+        )
+        .await
+        .expect("the run went ahead");
+
+        assert!(
+            matches!(outcome, Outcome::Finished { ref summary, .. } if summary.contains("model I chose")),
+            "the model the task names has to be the one that does the work: {outcome:?}"
+        );
+        let journal = steps(&api, &run_id).await;
+        assert!(
+            journal
+                .iter()
+                .any(|s| s.contains("The model on my desk") && s.contains("This task asks for")),
+            "the run has to say the model was the task's own choice: {journal:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn changing_the_model_in_settings_leaves_a_task_that_named_its_own_alone() {
+        // Otherwise the per-task choice is not a choice at all: it would last
+        // only until somebody touched the AI screen for an unrelated reason.
+        let (api, task_id, run_id) = a_task_and_a_run().await;
+        let (usual, mine) = two_models();
+        save_model(
+            &api,
+            &usual.provider_called("usual", "The usual model"),
+            true,
+        )
+        .await;
+        save_model(
+            &api,
+            &mine.provider_called("mine", "The model on my desk"),
+            true,
+        )
+        .await;
+
+        let (code, body) = choose_model(&api, &task_id, Some("mine")).await;
+        assert_eq!(code, 200, "naming a model for this task failed: {body}");
+        // Afterwards, and about every other task.
+        choose_default_model(&api, "usual").await;
+
+        let outcome = crate::executor::carry_out(
+            &api.state,
+            &run_id,
+            crate::executor::ExecOptions::default(),
+        )
+        .await
+        .expect("the run went ahead");
+
+        assert!(
+            matches!(outcome, Outcome::Finished { ref summary, .. } if summary.contains("model I chose")),
+            "changing the default must not take a task's own model away: {outcome:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_whose_model_can_no_longer_do_the_job_runs_on_one_that_can_and_says_so() {
+        // A choice is a preference, not a requirement. A model switched off
+        // after it was chosen, and one Errand cannot drive a task through at
+        // all, are both passed over rather than allowed to fail the run: the
+        // shopping still gets ordered, and the run says what happened.
+        let (api, task_id, run_id) = a_task_and_a_run().await;
+        let (usual, mine) = two_models();
+        save_model(
+            &api,
+            &usual.provider_called("usual", "The usual model"),
+            true,
+        )
+        .await;
+        save_model(
+            &api,
+            &mine.provider_called("mine", "The model on my desk"),
+            true,
+        )
+        .await;
+        errand_core::db::upsert_provider(
+            &api.pool,
+            &Provider {
+                id: "anthropic".into(),
+                kind: Kind::AnthropicApi.as_str().into(),
+                label: "Anthropic".into(),
+                base_url: None,
+                model: Some("claude-sonnet-4-5".into()),
+                enabled: true,
+                discovered: false,
+                health: None,
+                health_detail: None,
+            },
+        )
+        .await
+        .expect("saving a model Errand cannot drive a task through");
+
+        let (code, body) = choose_model(&api, &task_id, Some("mine")).await;
+        assert_eq!(code, 200, "naming a model for this task failed: {body}");
+        // And then switched off, the way the AI screen switches one off.
+        save_model(
+            &api,
+            &mine.provider_called("mine", "The model on my desk"),
+            false,
+        )
+        .await;
+
+        let outcome = crate::executor::carry_out(
+            &api.state,
+            &run_id,
+            crate::executor::ExecOptions::default(),
+        )
+        .await
+        .expect("a model that cannot be used must not stop the task");
+
+        assert!(
+            matches!(outcome, Outcome::Finished { ref summary, .. } if summary.contains("usual model")),
+            "it should have fallen back to something that works: {outcome:?}"
+        );
+        let journal = steps(&api, &run_id).await;
+        assert!(
+            journal
+                .iter()
+                .any(|s| s.contains("The model on my desk") && s.contains("switched off")),
+            "the run has to say the task did not get the model it asked for, and why: {journal:?}"
         );
     }
 

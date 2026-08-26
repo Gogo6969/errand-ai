@@ -216,21 +216,24 @@ pub(crate) fn system_prompt(has_playbook: bool) -> String {
          - save_note writes into their Apple Notes. save_file writes a text file into their \
          Errand Files folder. show_me opens a web page, a saved file, or an app in front of \
          them on their own Mac.\n\
-         - If the task asks to be SHOWN or TOLD something, the answer belongs in a note or a \
-         file. Your run summary is not somewhere anybody looks; a note on their phone is. A \
-         run that found the right answer and left it only in the summary has not done the job.\n\
-         - For something that repeats daily, call save_note with append set and the same title \
-         every run, so the person reads one growing note instead of finding seven.\n\
+         - The answer always goes to finish, in the 'answer' field. That is what the person \
+         reads when they open the task, and it is the only place they are certain to look. \
+         Write it out there in full even if you have also put a copy somewhere else.\n\
+         - A note, a file or a message is an EXTRA copy, not the place the answer lives. Make \
+         one only when the task text asks for one, in words like 'put it in Notes' or 'save it \
+         as a file', or when the task repeats daily and a growing note is plainly the point. \
+         If the task did not ask for a note, do not invent one.\n\
+         - When the task does ask for a repeating note, call save_note with append set and the \
+         same title every run, so the person reads one growing note instead of finding seven.\n\
          - show_me may only open a web address that is on this task's list of allowed sites, \
          the same list navigate is held to. It shows a page to them; it does not read it back \
          to you, so use navigate for anything you need to know yourself.\n\
          - If the Mac will not let you write where they asked, in Notes or in their mail, that \
          is a permission somebody has to switch on and not a puzzle for you to solve. Do not \
-         try it again. Put what you found somewhere they can still find it, usually a file with \
-         save_file, and then end with fail rather than finish: say what could not be written, \
-         where you put it instead, and that they need to press Enable on Errand's settings \
-         screen. Leaving the answer somewhere else is the right thing to do. Calling it a \
-         success is not, because the thing they asked for still has not happened.\n\n\
+         try it again. Call finish anyway, with the answer written out in full: it reaches the \
+         person whether or not the note could be written. Errand records the run as a failure \
+         by itself, and says which permission is off, so you do not have to choose between \
+         reporting the problem and handing over what you found.\n\n\
          Rules that do not bend:\n\
          - Never report a job as done unless you actually confirmed it was done. An honest \
          failure is always better than a hopeful guess.\n\
@@ -270,6 +273,11 @@ pub(crate) fn system_prompt(has_playbook: bool) -> String {
 /// chat format: a model on your desk, on your network, or at a service you pay
 /// for. Both end the same way, through the same tools, under the same budget.
 ///
+/// The task's own choice of model, where it has made one, is what the chain is
+/// built around; see `models::executor_chain`. It is a preference and not a
+/// requirement, exactly like the global one, so a model that has since been
+/// switched off falls through to the next rather than failing the run.
+///
 /// The chain is only walked to find something that can be *started*. Once a
 /// model has begun acting, a failure is that run's failure and is handled by
 /// the repair ladder above; quietly starting the whole task again somewhere
@@ -282,15 +290,39 @@ pub async fn carry_out(
 ) -> std::result::Result<Outcome, ExecError> {
     use errand_core::providers::{Kind, Role};
 
-    let chain = crate::models::executor_chain(state)
+    // Which task this run is for, because the task may name the model that
+    // carries it out. A run whose task cannot be read still runs: it falls back
+    // to the global choice, which is what it would have used anyway.
+    let task_id = errand_core::db::get_run(state.pool(), run_id)
+        .await
+        .ok()
+        .flatten()
+        .map(|r| r.task_id);
+
+    let crate::models::Executors {
+        chain,
+        asked_for,
+        asked_for_problem,
+    } = crate::models::executor_chain(state, task_id.as_deref())
         .await
         .map_err(|e| ExecError::NoModel(e.to_string()))?;
 
     // Why each candidate was passed over, so the failure at the end names the
-    // real obstacles rather than saying nothing is configured.
+    // real obstacles rather than saying nothing is configured. A model the task
+    // itself asked for and could not have belongs at the front of that list:
+    // it is the first thing the person will want to know about.
     let mut passed_over: Vec<String> = vec![];
+    if let Some(why) = &asked_for_problem {
+        passed_over.push(format!("{why}, and this task asks for it"));
+    }
+
+    // Why the model this task asked for is not the one doing the work, when it
+    // is not. Some obstacles are known before the walk begins; the rest turn up
+    // during it, which is what the check at the foot of the loop is for.
+    let mut but_for: Option<String> = asked_for_problem;
 
     for p in &chain {
+        let reasons_before = passed_over.len();
         match p.kind_enum() {
             Some(Kind::ClaudeCli) => {
                 if find_claude().is_none() {
@@ -309,7 +341,7 @@ pub async fn carry_out(
                     &crate::models::claude_models(state).await,
                 )
                 .to_string();
-                announce(state, run_id, p, &model).await;
+                announce(state, run_id, p, &model, asked(&asked_for, &but_for)).await;
                 return execute(state, run_id, ExecOptions { model, ..opts }).await;
             }
 
@@ -321,7 +353,7 @@ pub async fn carry_out(
                     ));
                     continue;
                 };
-                announce(state, run_id, p, &model).await;
+                announce(state, run_id, p, &model, asked(&asked_for, &but_for)).await;
                 return crate::agent::run_with_tools(
                     state,
                     run_id,
@@ -343,6 +375,14 @@ pub async fn carry_out(
 
             None => passed_over.push(format!("Errand does not recognise what {} is", p.label)),
         }
+
+        // Whatever this candidate was passed over for is also, when it is the
+        // one the task named, the answer to "why am I not getting the model I
+        // asked for". One check rather than a note at every place a candidate
+        // can be skipped, which is how the two would drift apart.
+        if passed_over.len() > reasons_before && asked_for.as_ref().is_some_and(|a| a.id == p.id) {
+            but_for = passed_over.last().cloned();
+        }
     }
 
     Err(ExecError::NoModel(format!(
@@ -352,21 +392,59 @@ pub async fn carry_out(
     )))
 }
 
+/// What this task asked for, for the line that says who is doing the work.
+struct Asked<'a> {
+    /// The model the task names, when it names one still in Errand's list.
+    provider: Option<&'a errand_core::providers::Provider>,
+    /// Why that model is not the one working, when it is not.
+    but_for: Option<&'a str>,
+}
+
+/// The pair of them, borrowed, at the two points the announcement is made.
+fn asked<'a>(
+    provider: &'a Option<errand_core::providers::Provider>,
+    but_for: &'a Option<String>,
+) -> Asked<'a> {
+    Asked {
+        provider: provider.as_ref(),
+        but_for: but_for.as_deref(),
+    }
+}
+
 /// Write down which model is doing the work.
 ///
 /// "Who did this" is a question the run view should answer without anybody
 /// having to guess from the writing style, and it is also where a person finds
 /// out whether their task text left the machine.
+///
+/// It has to stay true when the task chose the model itself. A task that names
+/// one and gets it should say so, and a task that names one and does not get it
+/// must not read as though nothing was asked for: somebody who picked a model
+/// of their own to keep a mailbox off the internet needs to find out here that
+/// it was not used, rather than assuming it was.
 async fn announce(
     state: &AppState,
     run_id: &str,
     p: &errand_core::providers::Provider,
     model: &str,
+    asked: Asked<'_>,
 ) {
-    let privacy = if p.is_local() {
-        "Nothing about this task leaves your machine."
+    // Said only when it is true of the whole run, not just of the model doing
+    // the work. Writing the plan, explaining a failure and wording a
+    // notification are separate jobs that resolve against the global choice,
+    // so a task pointed at a model on the desk can still have its journal --
+    // for a mail task, who wrote and about what -- sent on a moment later.
+    // Promising otherwise in the one line people read to check is worse than
+    // saying nothing.
+    let privacy = if !p.is_local() {
+        "Your task text goes to that service.".to_string()
+    } else if crate::models::other_jobs_stay_here(state).await {
+        "Nothing about this task leaves your machine.".to_string()
     } else {
-        "Your task text goes to that service."
+        "The job itself is done on your machine, but writing the plan and the \
+         summary afterwards is not set to stay here. Turn on \"Keep everything \
+         on this machine\" if none of it should leave."
+            .to_string()
     };
     // "Opus" rather than "opus" where the name is one of Claude's, since this
     // line is read by a person. Anything else is named exactly as configured,
@@ -376,7 +454,22 @@ async fn announce(
     } else {
         model
     };
-    let line = format!("Doing this task with {shown}, via {}. {privacy}", p.label);
+    let mut line = format!("Doing this task with {shown}, via {}. {privacy}", p.label);
+    match asked.provider {
+        Some(a) if a.id == p.id => {
+            line.push_str(" This task asks for this model rather than the usual one.")
+        }
+        // Everything else is a task that asked for something and did not get
+        // it, including one whose model has since been removed from the list
+        // altogether. The reason names the model, so this does not have to.
+        _ => {
+            if let Some(why) = asked.but_for {
+                line.push_str(&format!(
+                    " This task did not get the model it asked for: {why}."
+                ));
+            }
+        }
+    }
     if let Err(e) =
         errand_core::db::append_step(state.pool(), run_id, "plan", &line, true, None).await
     {
@@ -719,8 +812,14 @@ pub async fn run_to_completion(state: AppState, run_id: String) {
         }
 
         match outcome {
-            Ok(crate::mcp::Outcome::Finished { summary }) => {
-                let _ = errand_core::db::finish_run_ok(state.pool(), &run_id, &summary).await;
+            Ok(crate::mcp::Outcome::Finished { summary, answer }) => {
+                let _ = errand_core::db::finish_run_ok(
+                    state.pool(),
+                    &run_id,
+                    &summary,
+                    Some(answer.as_str()),
+                )
+                .await;
                 // A run that worked and wrote down nothing leaves a task that
                 // can never be armed, so the plan is written from the journal
                 // instead. Unapproved either way: a person still reads it.
@@ -734,7 +833,11 @@ pub async fn run_to_completion(state: AppState, run_id: String) {
                 break;
             }
 
-            Ok(ref o @ crate::mcp::Outcome::Failed { ref code, .. }) => {
+            Ok(ref o @ crate::mcp::Outcome::Failed {
+                ref code,
+                ref answer,
+                ..
+            }) => {
                 let human = o.failure_human().unwrap_or_default();
                 let parsed = parse_failure_code(code);
 
@@ -791,7 +894,20 @@ pub async fn run_to_completion(state: AppState, run_id: String) {
                     crate::fixer::Retry::No(_) => {}
                 }
 
-                finish_failed(&state, &run_id, &task_id, code, &human, None).await;
+                // The answer travels with the failure. A run that read the
+                // mail and only then found it could not write the note the
+                // task asked for has really failed, and has really done the
+                // reading; throwing that away sends a person to do it again.
+                finish_failed_keeping(
+                    &state,
+                    &run_id,
+                    &task_id,
+                    code,
+                    &human,
+                    None,
+                    answer.as_deref(),
+                )
+                .await;
                 break;
             }
 
@@ -868,7 +984,31 @@ async fn finish_failed(
     human: &str,
     technical: Option<&str>,
 ) {
-    let _ = errand_core::db::finish_run_failed(state.pool(), run_id, code, human, technical).await;
+    finish_failed_keeping(state, run_id, task_id, code, human, technical, None).await;
+}
+
+/// The same, for a failure that still produced something worth keeping.
+///
+/// Split rather than given a seventh argument, because six of the seven callers
+/// have nothing to keep and would all have to grow a `None`.
+async fn finish_failed_keeping(
+    state: &AppState,
+    run_id: &str,
+    task_id: &str,
+    code: &str,
+    human: &str,
+    technical: Option<&str>,
+    answer: Option<&str>,
+) {
+    let _ = errand_core::db::finish_run_failed_with_answer(
+        state.pool(),
+        run_id,
+        code,
+        human,
+        technical,
+        answer,
+    )
+    .await;
     // Before the event, so a screen that reloads the task on hearing about the
     // failure reads the status this just corrected rather than the old one.
     stop_saying_it_is_learning(state, run_id, task_id).await;
@@ -897,7 +1037,7 @@ async fn stop_saying_it_is_learning(state: &AppState, run_id: &str, task_id: &st
         .await
         .ok()
         .flatten()
-        .is_some_and(|r| r.mode == "teach");
+        .is_some_and(|r| r.is_teaching());
     if !teaching_run {
         return;
     }
@@ -973,6 +1113,7 @@ fn parse_failure_code(code: &str) -> errand_core::models::FailureCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use errand_core::models::RunMode;
 
     #[test]
     fn our_own_tools_are_contained() {
@@ -1046,28 +1187,59 @@ mod tests {
 
     #[test]
     fn the_agent_is_told_what_to_do_when_the_mac_will_not_let_it_write() {
-        // Both halves matter and neither is enough alone. Saving the answer
-        // somewhere else is the right instinct and was already what happened;
-        // what turned that into a run nobody looked at twice was calling it a
-        // success afterwards.
+        // This used to tell the agent to put the answer in a file and then end
+        // with fail, which made the person hunt for their own answer in a
+        // folder while the run said only that something had gone wrong.
+        //
+        // Now: hand the answer over through finish, whatever else was refused.
+        // Errand records the failure by itself, from the journal, so the agent
+        // is never choosing between reporting the problem and delivering the
+        // work.
         for taught in [true, false] {
             let p = system_prompt(taught);
             for rule in [
                 "Do not try it again",
-                "save_file",
-                "end with fail rather than finish",
-                "press Enable",
-                "Calling it a success is not",
+                "Call finish anyway, with the answer written out in full",
+                "Errand records the run as a failure by itself",
             ] {
                 assert!(p.contains(rule), "the prompt never says {rule:?}: {p}");
             }
+            assert!(
+                !p.contains("end with fail rather than finish"),
+                "the prompt still tells the agent to withhold the answer: {p}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_agent_is_never_told_that_a_note_is_where_answers_live() {
+        // The sentence this replaces was the cause of the whole complaint:
+        // "If the task asks to be SHOWN or TOLD something, the answer belongs
+        // in a note or a file. Your run summary is not somewhere anybody looks;
+        // a note on their phone is." The agent obeyed it exactly, wrote the
+        // morning mail summary into Apple Notes, and the app had nothing to
+        // show but a receipt for the filing.
+        for taught in [true, false] {
+            let p = system_prompt(taught);
+            assert!(
+                !p.contains("the answer belongs in a note"),
+                "the prompt still sends answers to Notes: {p}"
+            );
+            assert!(
+                p.contains("The answer always goes to finish"),
+                "the prompt has to name the one place an answer goes: {p}"
+            );
+            assert!(
+                p.contains("If the task did not ask for a note, do not invent one"),
+                "the prompt has to stop the agent inventing a side errand: {p}"
+            );
         }
     }
 
     /// A task in the middle of a run, marked the way `teach_task` marks one.
     async fn a_task_being_taught(
         api: &crate::api::testkit::Api,
-        mode: &str,
+        mode: RunMode,
         trigger: &str,
     ) -> (String, errand_core::models::Run) {
         let task_id = crate::api::testkit::a_task(
@@ -1078,7 +1250,7 @@ mod tests {
         let run = errand_core::db::try_create_run(
             &api.pool,
             &task_id,
-            &format!("{mode}/{}", errand_core::new_id()),
+            &format!("{}/{}", mode.stored(), errand_core::new_id()),
             trigger,
             mode,
             None,
@@ -1104,7 +1276,7 @@ mod tests {
         // Reproduced: a task whose teach run had failed hours earlier still
         // said "Learning", so the screen looked busy and nothing was happening.
         let api = crate::api::testkit::start().await;
-        let (task_id, run) = a_task_being_taught(&api, "teach", "teach").await;
+        let (task_id, run) = a_task_being_taught(&api, RunMode::TEACH, "teach").await;
 
         finish_failed(
             &api.state,
@@ -1127,7 +1299,7 @@ mod tests {
     async fn an_ordinary_run_failing_does_not_rewrite_the_task_status() {
         // Only the run that set the task to teaching may set it back.
         let api = crate::api::testkit::start().await;
-        let (task_id, run) = a_task_being_taught(&api, "normal", "schedule").await;
+        let (task_id, run) = a_task_being_taught(&api, RunMode::NORMAL, "schedule").await;
 
         finish_failed(
             &api.state,
@@ -1148,7 +1320,7 @@ mod tests {
         // "paused" is something a person chose. Overwriting it with draft would
         // undo their decision on the strength of a run they had already left.
         let api = crate::api::testkit::start().await;
-        let (task_id, run) = a_task_being_taught(&api, "teach", "teach").await;
+        let (task_id, run) = a_task_being_taught(&api, RunMode::TEACH, "teach").await;
         errand_core::db::set_task_status(&api.pool, &task_id, "paused")
             .await
             .expect("pausing it");

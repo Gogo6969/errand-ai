@@ -100,6 +100,14 @@ impl Api {
             .await
     }
 
+    /// A POST with no body at all, the way everything written before an
+    /// endpoint took one still sends it. An endpoint that grows an optional
+    /// body has to keep answering these.
+    pub async fn post_with_no_body(&self, path: &str) -> (u16, Value) {
+        let admin = self.admin.clone();
+        self.as_token(&admin, Method::POST, path, None, None).await
+    }
+
     pub async fn patch(&self, path: &str, body: Value) -> (u16, Value) {
         let admin = self.admin.clone();
         self.as_token(&admin, Method::PATCH, path, Some(body), None)

@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { page } from "$app/state";
-  import { api, channelName, followRun, statusLabel, when, ApiError, type Task, type Run, type TaskRecipient, type Recipient, type MailGrant } from "$lib/api";
+  import { api, channelName, followRun, statusLabel, when, ApiError, type AiSetup, type ListedProvider, type Task, type Run, type TaskRecipient, type Recipient, type MailGrant } from "$lib/api";
   import Hint from "$lib/components/Hint.svelte";
   import { headlineFor, hintFor, ranHeadline } from "$lib/taskState";
   import ScheduleEditor from "$lib/components/ScheduleEditor.svelte";
@@ -12,6 +12,9 @@
   let runs = $state<Run[]>([]);
   let plan = $state<any>(null);
   let problem = $state<string | null>(null);
+  // Closed by default, which is the whole point: a task is opened to see what
+  // it produced, not to be asked eight questions about how it should work.
+  let showSettings = $state(false);
   let busy = $state(false);
 
   // Editing state. Nothing is saved until Save is pressed, so a half-typed site
@@ -35,6 +38,49 @@
   let mail = $state<MailGrant | null>(null);
   let channelNames = $state<Record<string, string>>({});
   const named = (channel: string) => channelNames[channel] ?? channel.replace(/_/g, " ");
+
+  // What the AI screen is set up with, so this page can name the default rather
+  // than saying "Default" and leaving somebody to go and look. Null means the
+  // daemon would not say, and then the choice is left off the page: offering a
+  // list of models nobody could fill in would be worse than not offering one.
+  let ai = $state<AiSetup | null>(null);
+  const executorRole = $derived(ai?.roles.find((r) => r.role === "executor") ?? null);
+  const defaultModel = $derived(executorRole?.using?.label ?? null);
+  // The model this task names, when it names one that is still in the list.
+  const taskModel = $derived(
+    ai?.providers.find((p) => p.id === task?.model_id) ?? null,
+  );
+  /**
+   * Would this task's choice keep the work on this machine?
+   *
+   * Only said where it matters, which is a task that has been handed something
+   * private. The model doing the job is the thing that reads what the job
+   * reads, and that is the whole reason for choosing one per task.
+   */
+  const readsSomethingPrivate = $derived(mail?.granted ?? false);
+
+  /**
+   * What to say after a model's name in the list of who could do this task.
+   *
+   * The same three answers the AI screen gives, because they are answers to the
+   * same question and two screens disagreeing about a model is worse than
+   * either of them being wrong.
+   */
+  function modelNote(p: ListedProvider): string {
+    if (p.tools === "no") return " (cannot use tools)";
+    if (p.cannot_carry_out_because) return " (cannot do this job)";
+    if (!p.enabled) return " (switched off)";
+    if (p.tools === "unknown") return " (not checked yet)";
+    return "";
+  }
+
+  async function chooseModel(modelId: string) {
+    // Null rather than the empty string the menu's first option carries, so
+    // what reaches the daemon says "back to the default" in as many words.
+    // A refused choice is reloaded rather than left showing in the menu: the
+    // task is not using it, and a menu that says otherwise is a lie.
+    if (!(await save({ model_id: modelId || null }))) await load();
+  }
 
   // A run that has stopped. Anything else is still going, which is the thing
   // somebody standing at this page actually wants to know.
@@ -63,6 +109,16 @@
    * disagrees with the task, the run is the one that knows.
    */
   const headline = $derived(headlineFor(task, liveRun ?? finishedRun));
+
+  /**
+   * Do we already know this task can do something it cannot take back?
+   *
+   * Only two of those are visible from here: moving somebody's post, and
+   * writing to a real person. Whether the job books a court is in the
+   * description and nothing on this page can read it, so the advice below is
+   * offered for every untaught task and only sharpened when we do know.
+   */
+  const knownIrreversible = $derived((mail?.may_file ?? false) || people.length > 0);
 
 
   async function countSteps(runId: string) {
@@ -107,6 +163,11 @@
       try {
         mail = await api.mailGrant(id);
       } catch { mail = null; }
+      // Optional in the same way: a task page must still open when the daemon
+      // cannot say what models it has.
+      try {
+        ai = await api.ai();
+      } catch { ai = null; }
       // A recipient carries only a channel's id, and "imessage" is not a word
       // anybody uses. The names come from the daemon rather than a second list
       // kept here, which would drift away from it.
@@ -254,7 +315,24 @@
 {#if task}
   <div class="row spread">
     <h1>{task.emoji ?? ""} {task.name}</h1>
-    <Hint id={hintFor(task, liveRun ?? finishedRun)}><span class="pill {headline.cls}">{headline.text}</span></Hint>
+    <div class="row" style="gap:10px">
+      <Hint id={hintFor(task, liveRun ?? finishedRun)}><span class="pill {headline.cls}">{headline.text}</span></Hint>
+      <Hint id="task.settings">
+        <button
+          class="gear"
+          aria-expanded={showSettings}
+          aria-label={showSettings ? "Hide task settings" : "Task settings"}
+          onclick={() => (showSettings = !showSettings)}
+        >
+          <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"
+            fill="none" stroke="currentColor" stroke-width="1.7"
+            stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="3.2" />
+            <path d="M19.9 14.7a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5v.2a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1.1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1.1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1h.2a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1z" />
+          </svg>
+        </button>
+      </Hint>
+    </div>
   </div>
   <p class="deck">{task.description}</p>
 
@@ -278,8 +356,21 @@
       </div>
     </div>
   {:else if finishedRun}
+    <!-- The answer first, and whole.
+         This card used to show only what the run DID, in one clipped line,
+         while the thing the task was set up to produce went into a note. A
+         person opening a finished task should read the answer before anything
+         else, and should not have to open a second screen to find it.
+
+         A failed run gets the same treatment when it has one: the common
+         failure is a run that read everything, worked out the answer, and only
+         then found the Mac would not let it write the note. Hiding what it
+         found behind the failure makes somebody do that work again. -->
     <div class="card ended" class:bad={finishedRun.status === "failed"}>
-      <div class="row spread">
+      {#if finishedRun.answer}
+        <div class="answer">{finishedRun.answer}</div>
+      {/if}
+      <div class="row spread" style="margin-top:{finishedRun.answer ? '12px' : '0'}">
         <div>
           <strong>{ranHeadline(finishedRun)}</strong>
           <span class="muted"> · {when(finishedRun.finished_at ?? finishedRun.created_at)}</span>
@@ -300,7 +391,12 @@
     {#if !plan?.active}
       <Hint id="task.teach">
         <button class="primary" disabled={busy} onclick={() => act(() => api.teach(id))}>
-          Teach it once
+          Teach it once, for real
+        </button>
+      </Hint>
+      <Hint id="task.teach_rehearsal">
+        <button disabled={busy} onclick={() => act(() => api.teach(id, true))}>
+          Teach it as a rehearsal
         </button>
       </Hint>
     {:else}
@@ -324,6 +420,24 @@
       </Hint>
     {/if}
   </div>
+
+  <!-- Said next to the two buttons rather than in the tooltip on one of them.
+       The first run of a task is the only run nobody has watched before, and
+       until now it was always for real, so which button to press is the whole
+       decision being made here. -->
+  {#if !plan?.active}
+    <p class="muted" style="margin:8px 0 0; max-width:60ch">
+      {#if knownIrreversible}
+        This task can already do something it cannot take back, so rehearse it first. A rehearsal
+        goes through the whole job and writes the same plan for you to approve, with anything
+        irreversible recorded instead of done.
+      {:else}
+        If this job books, sends, buys or moves anything, rehearse it first. A rehearsal goes
+        through the whole job and writes the same plan for you to approve, with anything
+        irreversible recorded instead of done.
+      {/if}
+    </p>
+  {/if}
 
   {#if task.auto_paused}
     <div class="err" style="margin-top:16px">
@@ -350,6 +464,12 @@
     </div>
   {/if}
 
+  <!-- Everything below is settings, and settings are not what this page is for.
+       A task exists to produce an outcome; the panels that used to sit between
+       the answer and the history were a wall to read past. They are all still
+       here, unchanged, one click away, for the times somebody really does want
+       to change the schedule or take a permission back. -->
+  {#if showSettings}
   <h2>When it runs</h2>
   <div class="card">
     {#if editingSchedule}
@@ -450,6 +570,67 @@
       </div>
     {/if}
   </div>
+
+  <!-- Left off the page entirely when the daemon would not say what models it
+       has, rather than drawn as an empty menu somebody cannot act on. -->
+  {#if ai}
+    <h2>Which AI does this task</h2>
+    <div class="card">
+      <Hint id="task.model">
+        <select
+          disabled={busy}
+          value={task.model_id ?? ""}
+          onchange={(e) => chooseModel((e.currentTarget as HTMLSelectElement).value)}
+        >
+          <option value="">
+            {defaultModel ? `Default (currently ${defaultModel})` : "Default"}
+          </option>
+          {#each ai.providers as p}
+            <!-- A model Errand has found wanting is shown and not offered. It
+                 stays in the list because a name missing altogether reads as a
+                 bug, and the reason is said underneath. A model that is merely
+                 switched off can still be picked, the same as on the AI screen:
+                 it is a model you have, not one that cannot do the job. -->
+            <option value={p.id} disabled={!!p.cannot_carry_out_because}>
+              {p.label}{modelNote(p)}
+            </option>
+          {/each}
+        </select>
+      </Hint>
+
+      <p class="muted" style="margin:8px 0 0; max-width:62ch">
+        {#if task.model_id && !taskModel}
+          <!-- The menu cannot show a model that is not in it, so it falls back
+               to reading "Default", which is what will happen but not what the
+               task says. Saying so beats letting the menu be believed. -->
+          This task asks for a model that is no longer in Errand's list, so it runs on the
+          default until you pick another one.
+        {:else if taskModel}
+          This task uses {taskModel.label}, whatever the AI screen is set to.
+        {:else if defaultModel}
+          This task follows the AI screen, which is set to {defaultModel}. Choosing one here
+          changes it for this task only.
+        {:else}
+          This task follows whatever the AI screen is set to. Choosing one here changes it for
+          this task only.
+        {/if}
+      </p>
+
+      {#if readsSomethingPrivate}
+        <!-- Said here and only here: the model carrying the task out is the one
+             that reads the mail, so this is where that choice has consequences
+             somebody would mind. -->
+        <p class="muted" style="margin:8px 0 0; max-width:62ch">
+          This task can read your mail, and the model doing the job is what reads it. A model on
+          your own machine keeps it here.
+        </p>
+      {/if}
+
+      {#each ai.providers.filter((p) => p.cannot_carry_out_because) as p}
+        <p class="muted" style="margin:8px 0 0; max-width:62ch">{p.cannot_carry_out_because}</p>
+      {/each}
+    </div>
+  {/if}
 
   <h2>Who it tells when it is done</h2>
   <div class="card">
@@ -565,6 +746,7 @@
       {/if}
     </div>
   {/if}
+  {/if}
 
   <h2>How it does this job</h2>
   {#if plan?.active}
@@ -584,12 +766,31 @@
               onclick={() => act(() => api.approvePlaybook(id, v.version))}>Approve</button>
           </Hint>
         </div>
+        <!-- What the run said about itself when it wrote this. A plan written
+             by a rehearsal reads exactly like one written by a run that really
+             did the job, and that difference is the whole of what is being
+             approved. -->
+        {#if v.changelog}
+          <p class="muted" style="margin:4px 0 0; max-width:70ch">{v.changelog}</p>
+        {/if}
+        <!-- The plan itself, which is the thing the Approve button above is
+             asking about. Folded away rather than absent: several rehearsals
+             leave several versions waiting, and three plans printed in full
+             would bury the buttons. Open by default when there is only one,
+             because then there is nothing to bury. -->
+        {#if v.markdown}
+          <details open={plan.versions.length === 1} style="margin-top:6px">
+            <summary class="muted" data-hint-exempt="shows the plan this Approve button is about; nothing happens on the machine"
+              style="cursor:pointer">Read version {v.version}</summary>
+            <pre class="card" style="white-space:pre-wrap; font-size:12.5px; margin-top:6px">{v.markdown}</pre>
+          </details>
+        {/if}
       {/each}
     </div>
   {:else}
     <div class="card">
       <p class="muted" style="margin:0">
-        Nothing yet. Teach it once and it will write down what worked.
+        Nothing yet. Teach it once, for real or as a rehearsal, and it will write down what worked.
       </p>
     </div>
   {/if}
@@ -606,7 +807,7 @@
               <span class="pill {r.status === 'succeeded' ? 'ok' : r.status === 'failed' ? 'bad' : ''}">
                 {statusLabel(r.status)}
               </span>
-              {#if r.mode === "dry_run"}<span class="pill warn">rehearsal</span>{/if}
+              {#if r.rehearsal}<span class="pill warn">rehearsal</span>{/if}
               <div class="muted" style="margin-top:6px">
                 {(r.summary ?? r.failure?.plain_reason ?? "").split("\n")[0].slice(0, 110)}
               </div>
@@ -622,6 +823,39 @@
 {/if}
 
 <style>
+  /* A quiet control. It sits beside the status because that is where the eye
+     already is when the page opens, and it must not compete with the answer. */
+  .gear {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 30px;
+    height: 30px;
+    padding: 0;
+    border-radius: 7px;
+    color: var(--ink-soft);
+    background: transparent;
+    border: 1px solid transparent;
+  }
+  .gear:hover, .gear[aria-expanded="true"] {
+    color: var(--ink);
+    background: var(--surface-2);
+    border-color: var(--rule);
+  }
+
+  /* The answer, set as something to read rather than a status line.
+     pre-wrap rather than a Markdown renderer: this text is written by a model
+     and often quotes a web page, and putting that through {@html} inside the
+     app's own webview buys formatting with a class of bug nobody wants. The
+     playbook is shown the same way. */
+  .answer {
+    white-space: pre-wrap;
+    color: var(--ink);
+    font-size: 14px;
+    line-height: 1.55;
+    max-width: 72ch;
+  }
+
   /* This page had no styles of its own; app.css covers the rest. */
   .warnbox {
     background: var(--warn-bg); color: var(--warn);

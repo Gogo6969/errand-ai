@@ -8,6 +8,38 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **A run has an answer, separate from what it did.** A task exists to produce an outcome, and
+  there was nowhere to put one: a run stored a one-line summary of the work and a step journal,
+  so a task told to "look at my inbox and tell me who each message is from" reported that it had
+  filed a note and left the actual summary inside Apple Notes. `finish` now takes an `answer`
+  beside the `summary` and refuses a pointer such as "see the note", the answer is shown first
+  and whole on the task and the run, and it survives a failure: the commonest failure of all is a
+  run that read everything, worked the answer out, and only then found macOS would not let it
+  write the note it was asked for. The answer is scrubbed like anything else that leaves the run,
+  because it is the one field built to carry the contents of a page into a database row, a
+  webhook and a phone.
+- **Copies of an answer are recorded and can be opened.** A task that asks for a note or a file
+  still gets one, and the task page names it with a button that brings it up
+  (`POST /v1/answer-copies/{id}/open`). The rows are written by the tool that actually did the
+  writing rather than read back out of the journal's sentences, so a link never points at
+  something that did not happen.
+- **A task can name the model that carries it out.** The AI screen sets the default; a task may
+  choose its own, and the run says which it used and whether the task asked for it. Only the
+  executor is per-task so far: writing the plan, diagnosing a failure and wording a notification
+  still resolve against the global choice, and the run now says so rather than promising a
+  privacy it cannot keep.
+- **A task can be taught as a rehearsal.** A task may not run until it has been taught, and
+  teaching was always for real, so the first run of "clean my mailbox of spam" really moved the
+  post and the first run of "book a tennis court" really booked it: the one run nobody had watched
+  before was the one that could not be rehearsed. `POST /v1/tasks/{id}/teach` now takes an
+  optional `{"dry_run": true}` (no body still teaches for real), and the task page offers "Teach
+  it as a rehearsal" beside "Teach it once, for real". The rehearsed run works the job out and
+  writes its plan exactly as before, while everything irreversible is recorded rather than done
+  and the fence is left unarmed, so the first real run is still allowed to do the thing. Whether a
+  run was a rehearsal is now a flag of its own beside the mode, because teaching and rehearsing
+  are two different questions and a run can be both. The plan such a run writes says on the
+  approval card that a rehearsal wrote it, since its steps otherwise read exactly like a plan from
+  a run that really did the job.
 - **Screenshots in the run timeline.** A step that took one carries a "See what it saw"
   disclosure: the shot is recorded as an artifact, addressed by id, served by the API at
   `GET /v1/artifacts/{id}`, and shown where the step is. The explanation has promised this since
@@ -19,8 +51,42 @@ All notable changes to this project are documented here. The format follows
 - **Tasks report their open holds.** The "needs you" card keys off a count of armed fences rather
   than off the wording of the pause reason, which is a sentence that can be reworded.
 
+### Changed
+
+- **Task settings live behind a gear.** A task page opened onto eight panels of configuration
+  with the result somewhere below them. When it runs, what it may open, which AI, who it tells
+  and reading your mail are now one click away instead of in the way; the answer, what the task
+  learned, and its history are what the page shows.
+- **The agent is no longer told that answers belong in Apple Notes.** The system prompt said, in
+  those words, that a run summary is not somewhere anybody looks and a note on their phone is.
+  The agent obeyed it exactly, and wrote the answer into a note nobody had asked for. It now
+  hands the answer to `finish` and makes a note only when the task text asks for one.
+
 ### Fixed
 
+- **Reading or moving a message searched the whole mailbox.** Listing was taught to walk by index
+  after an inbox of 191,000 messages failed with AppleScript error -1741, and the finder behind
+  `read` and `file` was left doing `first message of inbox whose message id is ...`, which builds
+  the collection before narrowing it and never answers. Worse, the fallback repeated that scan for
+  every mailbox of every account, and the timeout was reported to the person as a missing macOS
+  permission, sending them to System Settings to fix something that was not broken. The ids a
+  listing hands out now carry where the message was, so reading one is a lookup rather than a
+  search, with a bounded rescan when new mail has shifted it.
+- **The fence could have let one message be filed twice.** Ids that carry a position had to be
+  kept out of the side-effect fence, which identifies a message: the same message listed a minute
+  apart would otherwise have been two different scopes, and "never move it twice" would quietly
+  have stopped being true.
+- **A model repeating itself burned the whole run.** One local model asked for the same mailbox
+  twenty-five times, a second apart, until it ran out of turns, and the run ended saying the agent
+  had stopped without reporting whether it finished. It is now told plainly that it is repeating
+  itself, and the run is stopped with a reason that names the model.
+- **A plan waiting for approval could not be read.** The approval gate is the one line between
+  "somebody watched it try once" and "it does this alone at three in the morning", and the API
+  told a person to read what the task wrote while returning the text of the approved version only.
+- **`dev-install.sh` would install a stale binary.** cargo can report success and leave the last
+  executable in place when clippy or test has won the fingerprint, and an older daemon knows fewer
+  migrations, so it dies with "migration 5 was previously applied but is missing" and reads like a
+  corrupt database. The script now refuses to install anything older than the code.
 - **Checking a model said nothing.** The AI screen's Check button re-probed the model and stored
   the verdict, but when the verdict was unchanged no pixel moved, so the click looked dead. The
   button now says what it is doing, the answer lands on the row it came from ("Checked just now:

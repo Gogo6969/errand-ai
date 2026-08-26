@@ -28,6 +28,15 @@ use std::fmt;
 /// next door because a `whose` search asks Mail to walk every mailbox.
 const TIMEOUT_S: u64 = 45;
 
+/// How far back to walk when looking for unread mail.
+///
+/// Unread cannot be asked for directly without making Mail build a list of the
+/// whole mailbox, which is what breaks at scale, so recent messages are walked
+/// instead and the walk stops as soon as enough have been found. Bounded on
+/// purpose: a summary of what has just arrived is worth having quickly, and
+/// unread post from last year is not what somebody means by "my inbox".
+const SCAN_FOR_UNREAD: usize = 200;
+
 /// The most messages one listing may hand back.
 ///
 /// A ceiling rather than a preference: every row crosses to whichever model is
@@ -45,10 +54,19 @@ const PREVIEW_CHARS: usize = 200;
 /// archive it.
 const MAX_BODY_CHARS: usize = 20_000;
 
+/// How far back to look when a message is not where the listing said it was.
+///
+/// The position carried in an id is a starting guess, not a promise: mail
+/// arriving between a listing and a read shifts every index down by one. Five
+/// hundred covers any plausible amount of new mail in the seconds between the
+/// two, and being a fixed number is the whole point -- it is what stops a
+/// missing message from turning back into a scan of the entire mailbox.
+const RESCAN: usize = 500;
+
 /// Guards on what is interpolated into a script. Nothing legitimate is anywhere
 /// near these, and an enormous argument fails deep inside osascript with an
 /// error nobody can read.
-const MAX_ID_CHARS: usize = 400;
+const MAX_ID_CHARS: usize = 1_200;
 const MAX_MAILBOX_CHARS: usize = 200;
 
 /// The body of the message the rehearsal inbox hands back.
@@ -150,6 +168,91 @@ fn rehearsed_refusal() -> Option<MailError> {
     crate::desktop::rehearsed_refusal().map(|said| from_stderr(&said))
 }
 
+/// Where a message was when it was listed, carried inside the id.
+///
+/// A message id on its own is not an address. Turning one back into a message
+/// means asking Mail to search for it, and `whose message id is ...` builds the
+/// whole collection first -- the same thing that made listing an inbox of
+/// 191,000 messages fail with -1741 after eight seconds. Listing was taught to
+/// walk by index; reading was not, so it went on searching and timed out, and
+/// the timeout was reported as a missing permission, sending people to System
+/// Settings to fix something that was not broken.
+///
+/// Carrying the mailbox and the position turns that search into a lookup. The
+/// real message id travels too, so the lookup is checked rather than trusted:
+/// mail arriving in the seconds between a listing and a read shifts every index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Locator {
+    /// The mailbox it was listed from. Empty means the inbox.
+    mailbox: String,
+    index: usize,
+    message_id: String,
+}
+
+/// The tag an Errand-issued id starts with, and the version of its shape.
+const LOCATOR_TAG: &str = "E1.";
+
+/// Build the id a listing hands out.
+///
+/// The mailbox is hex encoded so the id has no delimiter a mailbox name could
+/// contain, and the real message id goes last so it may contain anything.
+fn locator_id(mailbox: &str, index: usize, message_id: &str) -> String {
+    use std::fmt::Write;
+    let mut hex = String::with_capacity(mailbox.len() * 2);
+    for b in mailbox.as_bytes() {
+        let _ = write!(hex, "{b:02x}");
+    }
+    format!("{LOCATOR_TAG}{index}.{hex}.{message_id}")
+}
+
+/// Read one back, or decide it did not come from here.
+fn parse_locator(id: &str) -> Option<Locator> {
+    let (index, rest) = id.strip_prefix(LOCATOR_TAG)?.split_once('.')?;
+    let (hex, message_id) = rest.split_once('.')?;
+    let index: usize = index.parse().ok()?;
+    if index == 0 || message_id.is_empty() || hex.len() % 2 != 0 {
+        return None;
+    }
+    let bytes: Vec<u8> = (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16))
+        .collect::<Result<_, _>>()
+        .ok()?;
+    Some(Locator {
+        mailbox: String::from_utf8(bytes).ok()?,
+        index,
+        message_id: message_id.to_string(),
+    })
+}
+
+/// The part of an id that names the message rather than where it sat.
+///
+/// An id carries a position so a message can be found quickly, and a position
+/// changes every time mail arrives. Anything that asks *which message is this*
+/// -- above all the fence that stops one being moved twice -- has to ask this,
+/// or the same message listed a minute apart would look like two.
+pub fn stable_id(id: &str) -> String {
+    parse_locator(id).map_or_else(|| id.to_string(), |l| l.message_id)
+}
+
+/// The one line of AppleScript that turns an id into a message.
+///
+/// Both paths are bounded. An id from somewhere other than a listing -- an
+/// older playbook, or a model repeating one from memory -- still gets looked
+/// for, but only through recent mail: a search that cannot finish is worse
+/// than one that politely does not find it.
+fn bind_line(id: &str) -> String {
+    match parse_locator(id) {
+        Some(l) => format!(
+            r#"set m to my findAt("{}", {}, "{}", {RESCAN})"#,
+            escape(&l.mailbox),
+            l.index,
+            escape(&l.message_id)
+        ),
+        None => format!(r#"set m to my findNear("", "{}", {RESCAN})"#, escape(id)),
+    }
+}
+
 /// Make a string safe to sit inside an AppleScript literal.
 fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
@@ -194,6 +297,18 @@ fn from_stderr(stderr: &str) -> MailError {
                 .into(),
         );
     }
+    // What a mailbox too large to enumerate says. Every path reaches messages
+    // by index now -- listing, reading and moving alike -- so this should not
+    // happen, but a mailbox can always be bigger than the last one, and a bare
+    // number in the run view helps nobody.
+    if stderr.contains("-1741") {
+        return MailError::Machine(
+            "Mail could not hand over that mailbox: it is large enough that asking for its \
+             messages all at once fails. Errand asks for them a few at a time, so this usually \
+             means the mailbox is unusually large even for that. Try a more specific mailbox."
+                .into(),
+        );
+    }
     // Refused consent and an app that is not running mean the same thing
     // wherever they happen, and are already put into words once for the mail
     // and messages channels. A second copy of those codes here would be a
@@ -210,6 +325,7 @@ fn from_stderr(stderr: &str) -> MailError {
 /// messages, one of them nonsense.
 const HANDLERS: &str = r#"on findBox(boxName)
 	tell application "Mail"
+		if boxName is "" then return inbox
 		try
 			return mailbox boxName
 		end try
@@ -222,26 +338,38 @@ const HANDLERS: &str = r#"on findBox(boxName)
 	return missing value
 end findBox
 
-on findMsg(wanted)
+on findAt(boxName, idx, wanted, howManyMost)
+	set theBox to my findBox(boxName)
+	if theBox is missing value then return missing value
 	tell application "Mail"
 		try
-			return first message of inbox whose message id is wanted
+			set m to message idx of theBox
+			if (my flat(message id of m)) is wanted then return m
 		end try
-		repeat with acct in accounts
-			repeat with mb in mailboxes of acct
-				try
-					return first message of mb whose message id is wanted
-				end try
-			end repeat
-		end repeat
-		repeat with mb in mailboxes
+	end tell
+	return my scanFor(theBox, wanted, howManyMost)
+end findAt
+
+on findNear(boxName, wanted, howManyMost)
+	set theBox to my findBox(boxName)
+	if theBox is missing value then return missing value
+	return my scanFor(theBox, wanted, howManyMost)
+end findNear
+
+on scanFor(theBox, wanted, howManyMost)
+	tell application "Mail"
+		set total to (count of messages of theBox)
+		set howMany to howManyMost
+		if howMany > total then set howMany to total
+		repeat with i from 1 to howMany
 			try
-				return first message of mb whose message id is wanted
+				set m to message i of theBox
+				if (my flat(message id of m)) is wanted then return m
 			end try
 		end repeat
 	end tell
 	return missing value
-end findMsg
+end scanFor
 
 on flat(v)
 	try
@@ -289,27 +417,45 @@ pub async fn list(
         return Ok(rehearsal_listing(mailbox, limit, unread_only));
     }
 
-    let box_line = match mailbox {
-        Some(name) => format!("set theBox to my findBox(\"{}\")", escape(name)),
-        None => "tell application \"Mail\" to set theBox to inbox".to_string(),
-    };
-    let picker = if unread_only {
-        "set msgs to (messages of theBox whose read status is false)"
-    } else {
-        "set msgs to (messages of theBox)"
-    };
+    // An empty name means the inbox, here and in every id this listing hands
+    // out, so a message can be found again the same way it was found first.
+    let box_name = mailbox.unwrap_or("");
+    let box_line = format!("set theBox to my findBox(\"{}\")", escape(box_name));
+    // Reach for messages one at a time by index, never the whole collection.
+    //
+    // `messages of theBox` asks Mail to hand over every message in the mailbox
+    // before anything is narrowed down. On a real mailbox that is not slow, it
+    // is fatal: an inbox of 191,000 messages answered with AppleScript error
+    // -1741 after eight seconds. Indexing works at any size, because Mail is
+    // asked for one message rather than for a list it has to build first.
+    //
+    // Unread is the same problem wearing a `whose` clause, so it is done by
+    // walking recent messages and stopping early. That means unread mail older
+    // than the window is not found, which is the right trade for a summary of
+    // what has just arrived: it is bounded and it always answers.
+    let scan = if unread_only { SCAN_FOR_UNREAD } else { limit };
 
     let script = format!(
         r#"{handlers}
 {box_line}
 if theBox is missing value then return "!no-mailbox"
 tell application "Mail"
-	{picker}
-	set howMany to (count of msgs)
-	if howMany > {limit} then set howMany to {limit}
+	set total to (count of messages of theBox)
+	set howMany to {scan}
+	if howMany > total then set howMany to total
 	set out to ""
+	set found to 0
 	repeat with i from 1 to howMany
-		set m to item i of msgs
+		if found is {limit} then exit repeat
+		set m to missing value
+		try
+			set m to message i of theBox
+		end try
+		if m is missing value then
+			set out to out & "!no-id" & linefeed
+		else
+			if {unread_test} then
+			set found to found + 1
 		set theId to ""
 		try
 			set theId to my flat(message id of m)
@@ -333,13 +479,22 @@ tell application "Mail"
 			try
 				set pv to my flat(my clip(content of m, {PREVIEW_CHARS}))
 			end try
-			set out to out & theId & tab & snd & tab & subj & tab & dt & tab & pv & linefeed
+			set out to out & i & tab & theId & tab & snd & tab & subj & tab & dt & tab & pv & linefeed
+		end if
+			end if
 		end if
 	end repeat
 	return out
 end tell
 "#,
         handlers = HANDLERS,
+        scan = scan,
+        limit = limit,
+        unread_test = if unread_only {
+            "(read status of m) is false"
+        } else {
+            "true"
+        },
     );
 
     let reply = osascript(&script).await?;
@@ -360,14 +515,18 @@ end tell
             continue;
         }
         let mut f = line.split('\t');
-        let (Some(id), Some(sender), Some(subject), Some(date)) =
-            (f.next(), f.next(), f.next(), f.next())
+        let (Some(at), Some(id), Some(sender), Some(subject), Some(date)) =
+            (f.next(), f.next(), f.next(), f.next(), f.next())
         else {
             unaddressable += 1;
             continue;
         };
+        let Ok(at) = at.trim().parse::<usize>() else {
+            unaddressable += 1;
+            continue;
+        };
         messages.push(Summary {
-            id: id.trim().to_string(),
+            id: locator_id(box_name, at, id.trim()),
             sender: sender.trim().to_string(),
             subject: subject.trim().to_string(),
             date: date.trim().to_string(),
@@ -392,7 +551,7 @@ pub async fn read(id: &str) -> Result<Message, MailError> {
 
     let script = format!(
         r#"{handlers}
-set m to my findMsg("{id}")
+{bind}
 if m is missing value then return "!no-message"
 tell application "Mail"
 	set snd to ""
@@ -415,7 +574,7 @@ tell application "Mail"
 end tell
 "#,
         handlers = HANDLERS,
-        id = escape(id),
+        bind = bind_line(id),
     );
 
     let reply = osascript(&script).await?;
@@ -452,7 +611,7 @@ pub async fn describe(id: &str) -> Result<Headers, MailError> {
 
     let script = format!(
         r#"{handlers}
-set m to my findMsg("{id}")
+{bind}
 if m is missing value then return "!no-message"
 tell application "Mail"
 	set snd to ""
@@ -467,7 +626,7 @@ tell application "Mail"
 end tell
 "#,
         handlers = HANDLERS,
-        id = escape(id),
+        bind = bind_line(id),
     );
 
     let reply = osascript(&script).await?;
@@ -502,7 +661,7 @@ pub async fn file(id: &str, mailbox: &str) -> Result<Headers, MailError> {
 
     let script = format!(
         r#"{handlers}
-set m to my findMsg("{id}")
+{bind}
 if m is missing value then return "!no-message"
 set theBox to my findBox("{mailbox}")
 if theBox is missing value then return "!no-mailbox"
@@ -520,7 +679,7 @@ tell application "Mail"
 end tell
 "#,
         handlers = HANDLERS,
-        id = escape(id),
+        bind = bind_line(id),
         mailbox = escape(mailbox),
     );
 
@@ -575,6 +734,16 @@ fn check_name(name: &str) -> Result<(), MailError> {
 // rehearsal inbox that looked like real post would teach the tests, and anybody
 // reading them, the wrong thing entirely.
 
+/// The id a rehearsal listing hands out for one of its invented messages.
+///
+/// Tests used to write this out by hand. That quietly stopped being the id a
+/// listing gives the moment ids started carrying a position, so they now ask
+/// for it the same way a model gets it.
+#[cfg(test)]
+pub fn rehearsal_id(nth: usize) -> String {
+    rehearsal_messages()[nth - 1].id.clone()
+}
+
 fn rehearsal_listing(mailbox: Option<&str>, limit: usize, unread_only: bool) -> Listing {
     // A mailbox nobody has is still a mailbox nobody has, even in a rehearsal:
     // the two invented messages live in the inbox and in "Junk".
@@ -599,14 +768,14 @@ fn rehearsal_listing(mailbox: Option<&str>, limit: usize, unread_only: bool) -> 
 fn rehearsal_messages() -> Vec<Summary> {
     vec![
         Summary {
-            id: "errand-rehearsal-1@example.invalid".into(),
+            id: locator_id("", 1, "errand-rehearsal-1@example.invalid"),
             sender: "A Made-Up Sender <nobody@example.invalid>".into(),
             subject: "An invented message, for testing".into(),
             date: "Tuesday 26 August 2026 at 09:00".into(),
             preview: "Errand invented this. There is no such message in anybody's mail.".into(),
         },
         Summary {
-            id: "errand-rehearsal-2@example.invalid".into(),
+            id: locator_id("", 2, "errand-rehearsal-2@example.invalid"),
             sender: "Another Made-Up Sender <nobody-else@example.invalid>".into(),
             subject: "A second invented message".into(),
             date: "Tuesday 26 August 2026 at 08:15".into(),
@@ -631,6 +800,78 @@ fn rehearsal_message(id: &str) -> Result<Message, MailError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn no_script_ever_asks_mail_to_search() {
+        // The guard that would have caught this the first time.
+        //
+        // `whose message id is ...` reads perfectly well and is fatal: Mail
+        // builds the whole collection before narrowing it, so on a real inbox
+        // it never answers. Listing was fixed and reading was not, and because
+        // no test could reach either -- both need a Mac with mail on it -- the
+        // suite stayed green while every read of a real mailbox timed out.
+        // This asserts on the script instead of on the answer, which needs
+        // nothing but a string.
+        assert!(
+            !HANDLERS.contains("whose"),
+            "a handler asks Mail to search; it must walk by index instead"
+        );
+        for id in ["E1.4.4a756e6b.<abc@example.com>", "<plain@example.com>"] {
+            let line = bind_line(id);
+            assert!(!line.contains("whose"), "bind_line searches: {line}");
+            assert!(line.contains(&RESCAN.to_string()), "unbounded: {line}");
+        }
+    }
+
+    #[test]
+    fn an_id_says_where_the_message_was() {
+        let id = locator_id("Junk", 4, "<abc@example.com>");
+        let back = parse_locator(&id).expect("an id we made is one we can read");
+        assert_eq!(back.mailbox, "Junk");
+        assert_eq!(back.index, 4);
+        assert_eq!(back.message_id, "<abc@example.com>");
+        // The inbox is the empty name, and survives the round trip as one.
+        assert_eq!(parse_locator(&locator_id("", 1, "<x@y>")).unwrap().mailbox, "");
+    }
+
+    #[test]
+    fn a_mailbox_name_survives_being_carried_in_an_id() {
+        // Hex is used precisely so a name may contain the delimiter, a quote,
+        // or anything else somebody has actually called a mailbox.
+        for name in ["Junk", "Work.Archive.2019", r#"Odd" name"#, "Ablage – alt", ""] {
+            let id = locator_id(name, 7, "<m@example.com>");
+            assert_eq!(parse_locator(&id).unwrap().mailbox, name, "lost: {name:?}");
+        }
+    }
+
+    #[test]
+    fn an_id_from_somewhere_else_is_still_looked_for() {
+        // A playbook written before ids carried a position, or a model
+        // repeating one from memory. It must not be refused, and must not
+        // become a search either.
+        for id in [
+            "<older@example.com>",
+            "E1.notanumber.4a.<x@y>",
+            "E1.0.4a.<x@y>",
+            "E1.4.odd.<x@y>",
+            "E1.4.4a756e6b.",
+        ] {
+            assert!(parse_locator(id).is_none(), "read as a locator: {id}");
+            assert!(bind_line(id).contains("findNear"), "not looked for: {id}");
+        }
+    }
+
+    #[test]
+    fn a_real_id_fits_the_length_guard() {
+        // The guard exists to stop an enormous argument reaching osascript. It
+        // now has to leave room for a hex mailbox name and the id itself.
+        let id = locator_id(&"m".repeat(MAX_MAILBOX_CHARS), 999_999, &"<a@b>".repeat(20));
+        assert!(
+            check_id(&id).is_ok(),
+            "an id this tool hands out is refused by its own guard: {} chars",
+            id.chars().count()
+        );
+    }
 
     #[test]
     fn a_mailbox_name_cannot_break_out_of_the_script() {

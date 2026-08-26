@@ -365,7 +365,7 @@ async fn notify_recipients(
     // A rehearsal must not reach a third party. This is the same promise
     // read_brief makes to the agent, kept here rather than there, because a
     // promise enforced only in a prompt is not a promise.
-    if run.mode == "dry_run" {
+    if run.is_rehearsal() {
         return;
     }
 
@@ -715,6 +715,7 @@ async fn narrate(state: &AppState, run_id: &str, task: &str, ok: bool, summary: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use errand_core::models::RunMode;
 
     #[test]
     fn a_message_held_until_morning_really_goes_out_in_the_morning() {
@@ -863,7 +864,7 @@ mod tests {
     /// calls the settings screen makes.
     async fn a_task_that_tells_mum(
         api: &testkit::Api,
-        mode: &str,
+        mode: RunMode,
         on_success: bool,
         on_failure: bool,
     ) -> errand_core::models::Run {
@@ -916,8 +917,8 @@ mod tests {
     #[tokio::test]
     async fn a_finished_run_writes_to_the_person_the_task_was_told_to_write_to() {
         let api = testkit::start().await;
-        let run = a_task_that_tells_mum(&api, "normal", true, true).await;
-        errand_core::db::finish_run_ok(&api.pool, &run.id, "The usual order is booked for Friday.")
+        let run = a_task_that_tells_mum(&api, RunMode::NORMAL, true, true).await;
+        errand_core::db::finish_run_ok(&api.pool, &run.id, "The usual order is booked for Friday.", None)
             .await
             .expect("finishing the run");
 
@@ -951,7 +952,7 @@ mod tests {
         // being told at nine that the eight o'clock booking failed is too late.
         // None of that reasoning applies to somebody else's phone at 03:00.
         let api = testkit::start().await;
-        let run = a_task_that_tells_mum(&api, "normal", true, true).await;
+        let run = a_task_that_tells_mum(&api, RunMode::NORMAL, true, true).await;
         errand_core::db::finish_run_failed(
             &api.pool,
             &run.id,
@@ -981,8 +982,8 @@ mod tests {
     #[tokio::test]
     async fn somebody_who_only_wanted_the_bad_news_is_not_told_the_good() {
         let api = testkit::start().await;
-        let run = a_task_that_tells_mum(&api, "normal", false, true).await;
-        errand_core::db::finish_run_ok(&api.pool, &run.id, "Ordered.")
+        let run = a_task_that_tells_mum(&api, RunMode::NORMAL, false, true).await;
+        errand_core::db::finish_run_ok(&api.pool, &run.id, "Ordered.", None)
             .await
             .expect("finishing the run");
 
@@ -999,8 +1000,8 @@ mod tests {
     #[tokio::test]
     async fn a_rehearsal_reaches_nobody_at_all() {
         let api = testkit::start().await;
-        let run = a_task_that_tells_mum(&api, "dry_run", true, true).await;
-        errand_core::db::finish_run_ok(&api.pool, &run.id, "Would have ordered the usual.")
+        let run = a_task_that_tells_mum(&api, RunMode::REHEARSAL, true, true).await;
+        errand_core::db::finish_run_ok(&api.pool, &run.id, "Would have ordered the usual.", None)
             .await
             .expect("finishing the run");
 
@@ -1018,8 +1019,8 @@ mod tests {
     async fn a_second_report_of_the_same_run_does_not_tell_anybody_twice() {
         // A retried notification, or two runners racing over one finished run.
         let api = testkit::start().await;
-        let run = a_task_that_tells_mum(&api, "normal", true, true).await;
-        errand_core::db::finish_run_ok(&api.pool, &run.id, "The usual order is booked.")
+        let run = a_task_that_tells_mum(&api, RunMode::NORMAL, true, true).await;
+        errand_core::db::finish_run_ok(&api.pool, &run.id, "The usual order is booked.", None)
             .await
             .expect("finishing the run");
 
@@ -1087,7 +1088,7 @@ mod tests {
             task_id,
             &format!("manual/{}", errand_core::new_id()),
             "manual",
-            "normal",
+            errand_core::models::RunMode::NORMAL,
             None,
         )
         .await
@@ -1115,7 +1116,7 @@ mod tests {
         )
         .await;
         let run = a_press_of_run_now(&api, &task_id).await;
-        errand_core::db::finish_run_ok(&api.pool, &run.id, "The usual order is booked for Friday.")
+        errand_core::db::finish_run_ok(&api.pool, &run.id, "The usual order is booked for Friday.", None)
             .await
             .expect("finishing the run");
 
@@ -1177,7 +1178,7 @@ mod tests {
         )
         .await
         .expect("the agent's own message");
-        errand_core::db::finish_run_ok(&api.pool, &run.id, "Ordered.")
+        errand_core::db::finish_run_ok(&api.pool, &run.id, "Ordered.", None)
             .await
             .expect("finishing the run");
 
@@ -1197,7 +1198,7 @@ mod tests {
         let task_id = a_task_that_tells(&api, 3, &[("Mum", MUMS_NUMBER)]).await;
 
         let first = a_press_of_run_now(&api, &task_id).await;
-        errand_core::db::finish_run_ok(&api.pool, &first.id, "The usual order is booked.")
+        errand_core::db::finish_run_ok(&api.pool, &first.id, "The usual order is booked.", None)
             .await
             .expect("finishing the first run");
         notify_run(&api.state, &first.id)
@@ -1247,7 +1248,7 @@ mod tests {
         let task_id =
             a_task_that_tells(&api, 3, &[("Mum", MUMS_NUMBER), ("Dad", DADS_NUMBER)]).await;
         let run = a_press_of_run_now(&api, &task_id).await;
-        errand_core::db::finish_run_ok(&api.pool, &run.id, "The usual order is booked.")
+        errand_core::db::finish_run_ok(&api.pool, &run.id, "The usual order is booked.", None)
             .await
             .expect("finishing the run");
 
@@ -1269,7 +1270,7 @@ mod tests {
         // empty string, which knows none of the secrets the run actually
         // resolved, so a summary quoting one handed it straight to the model.
         let api = testkit::start().await;
-        let run = a_task_that_tells_mum(&api, "normal", true, true).await;
+        let run = a_task_that_tells_mum(&api, RunMode::NORMAL, true, true).await;
         api.state
             .redactor(&run.id)
             .register("hunter2horse", "Shop password");

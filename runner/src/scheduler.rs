@@ -485,7 +485,7 @@ async fn fire(
         &task.id,
         &occurrence_id,
         "schedule",
-        "normal",
+        errand_core::models::RunMode::NORMAL,
         None,
     )
     .await
@@ -550,7 +550,7 @@ async fn record_skip(
         &task.id,
         &occurrence_id,
         "schedule",
-        "normal",
+        errand_core::models::RunMode::NORMAL,
         None,
     )
     .await
@@ -681,7 +681,7 @@ mod tests {
             task_id,
             &format!("manual/{}", errand_core::new_id()),
             "manual",
-            "normal",
+            errand_core::models::RunMode::NORMAL,
             None,
         )
         .await
@@ -904,7 +904,7 @@ mod tests {
         );
 
         // The run that was in the way finishes, and the queue starts moving.
-        errand_core::db::finish_run_ok(&api.pool, &busy, "done")
+        errand_core::db::finish_run_ok(&api.pool, &busy, "done", None)
             .await
             .expect("closing the run");
         tick(

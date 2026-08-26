@@ -402,6 +402,25 @@ pub async fn open_file(path: &Path) -> Result<()> {
 }
 
 /// Bring an app to the front, starting it if it is not running.
+/// Bring one note to the front in Apple Notes.
+///
+/// `open` cannot address a note, so this asks Notes itself. Matching by title
+/// is what the person sees and what save_note wrote, and a title that no longer
+/// matches simply opens the app, which is a better answer than an error about a
+/// note somebody has since renamed.
+pub async fn open_note(title: &str) -> Result<()> {
+    let script = format!(
+        r#"tell application "Notes"
+	activate
+	try
+		show (first note whose name is "{title}")
+	end try
+end tell"#,
+        title = title.replace('\\', "\\\\").replace('"', "\\\"")
+    );
+    osascript(&script).await.map(|_| ())
+}
+
 pub async fn open_app(name: &str) -> Result<()> {
     run_open(&["-a", name]).await
 }

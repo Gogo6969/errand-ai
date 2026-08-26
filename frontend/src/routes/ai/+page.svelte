@@ -311,6 +311,15 @@
               drive a browser. Being able to is not the same as being good at it: a small model
               will misread a page and give up half way through, so use the best one you have.
             </div>
+
+            <!-- Said from this end as well as from the task's, because whoever
+                 is looking at one of the two screens is the one who needs to
+                 know that the other exists. -->
+            <div class="muted">
+              This is the default for every task. A single task can name a model of its own on its
+              page, and that choice wins for that task: worth doing where a task reads your mail
+              or anything else private, since the model doing the job is what reads it.
+            </div>
           {/if}
         {/if}
       </div>

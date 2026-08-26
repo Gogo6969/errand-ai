@@ -30,9 +30,9 @@ export const hints = {
   "task.create": {
     short: "Save this as a draft. Nothing runs yet.",
     long:
-      "Creating only saves what you wrote. The task cannot run, even once, until you press " +
-      "'Teach it once' on its page, and it cannot run on a schedule until you have approved " +
-      "what it learned.",
+      "Creating only saves what you wrote. The task cannot run, even once, until you teach it on " +
+      "its page, either for real or as a rehearsal, and it cannot run on a schedule until you " +
+      "have approved what it learned.",
   },
   // One per state, because a single sentence covering all of them explains the
   // one the reader is looking at least of all. The pill says what the task is;
@@ -40,8 +40,10 @@ export const hints = {
   "task.state.draft": {
     short: "Written down, but never tried. It cannot run yet.",
     long:
-      "Press 'Teach it once' to watch it attempt the job from your description. Nothing runs on " +
-      "a schedule until you have read and approved what it works out.",
+      "Teach it once to watch it attempt the job from your description. If the job books, sends " +
+      "or moves anything, teach it as a rehearsal, so you can watch the whole thing with none of " +
+      "it really happening. Nothing runs on a schedule until you have read and approved what it " +
+      "works out.",
   },
   "task.state.teaching": {
     short: "Trying the job for the first time, from your description alone.",
@@ -93,6 +95,13 @@ export const hints = {
       "The steps appear as they happen. If the count on this card has stopped moving, the run " +
       "itself says what it was in the middle of.",
   },
+  "task.settings": {
+    short: "How this task works: when it runs, what it may open, which AI, who it tells.",
+    long:
+      "Kept out of the way on purpose. Errand fills these in from what you wrote and you can " +
+      "leave them alone; open this when you want to change the schedule, take a permission " +
+      "back, or point the task at a different model.",
+  },
   "task.last_run": {
     short: "Open the newest run and see everything it did.",
     long:
@@ -119,10 +128,20 @@ export const hints = {
       "deleted.",
   },
   "task.teach": {
-    short: "Let it try the job once while you watch, and write down what worked.",
+    short: "Let it really do the job once while you watch, and write down what worked.",
     long:
-      "The first run works only from your description. At the end the agent writes a plan, which " +
-      "you read and approve. Nothing runs on a schedule until you have approved a plan.",
+      "The first run works only from your description, and it does everything for real: if the " +
+      "job books a court or moves your post, this books it and moves it. At the end the agent " +
+      "writes a plan, which you read and approve. Nothing runs on a schedule until you have " +
+      "approved a plan.",
+  },
+  "task.teach_rehearsal": {
+    short: "Let it work the job out while you watch, without anything really happening.",
+    long:
+      "The same first run, rehearsed. The agent works from your description and writes the same " +
+      "plan for you to approve, but anything irreversible is recorded as what it would have done " +
+      "instead of happening: nothing is booked, sent, bought or moved. The plan says it was " +
+      "written by a rehearsal, so you know what you are approving.",
   },
   "task.pause": {
     short: "Skip scheduled runs. Manual runs still work. Nothing is deleted.",
@@ -164,6 +183,16 @@ export const hints = {
   "task.save_limits": {
     short: "Save them. They apply from the next run.",
   },
+  "task.model": {
+    short: "Which AI carries out this task. Saved as soon as you pick it.",
+    long:
+      "Whichever model does the job is the one that reads what the job reads, so a task that " +
+      "opens your mail is worth putting on a model that runs on your own machine, while a task " +
+      "that books a court can use anything. Leave it on Default and this task follows the " +
+      "choice on the AI screen. A model Errand has found cannot drive a browser is shown here " +
+      "but cannot be picked, and if the one you pick is later switched off, the task still runs " +
+      "on something that works and the run says what happened.",
+  },
 
   // ------------------------------------------------------------- playbook --
   "playbook.what": {
@@ -181,6 +210,19 @@ export const hints = {
   },
 
   // ------------------------------------------------------------------ run --
+  "run.answer": {
+    short: "What the task produced, which is the reason you set it up.",
+    long:
+      "Separate from what the run did. If you asked to be told something, this is the telling. " +
+      "If you asked for something to be done, this is what is now true and the proof of it. " +
+      "A run that could not finish still shows what it found before it stopped.",
+  },
+  "run.answer_copy": {
+    short: "Opens the note or file where this run also put the answer.",
+    long:
+      "Errand makes a copy like this only when the task asked for one. The answer above is the " +
+      "original and is always here, whether or not a copy could be written.",
+  },
   "run.timeline": {
     short: "Everything the agent did, in order, in its own words.",
     long:
@@ -189,6 +231,13 @@ export const hints = {
   },
   "run.status": {
     short: "How this run ended.",
+  },
+  "run.rehearsal": {
+    short: "Nothing in this run really happened.",
+    long:
+      "It went through the whole job, and anything it could not have taken back was recorded as " +
+      "what it would have done. Nothing was booked, sent, bought or moved, so where the steps " +
+      "below say it did something, read that as what the first real run will do.",
   },
   "run.cost": {
     short: "What the AI for this run cost.",
@@ -254,7 +303,7 @@ export const hints = {
     short: "Something a task may do on the Mac itself, once macOS allows it.",
     long:
       "Not a way of reaching you: nothing here messages anybody. It is what a task may do on this " +
-      "machine, such as writing an answer into Notes or going through your post. macOS asks " +
+      "machine, such as writing into Notes or going through your post. macOS asks " +
       "before allowing it, and until somebody answers that question the task stops when it gets " +
       "there.",
   },

@@ -38,13 +38,23 @@ actually reads, so vagueness costs you a run.
 Type the plain form (`example.com`, not `www.example.com`), because subdomains
 are included but it only works downwards.
 
-**3. Teach it once.** Press **Teach it once** and watch. The agent works only
-from your description this time. You can follow every step as it happens.
+**3. Teach it once.** Press **Teach it once, for real** and watch. The agent
+works only from your description this time. You can follow every step as it
+happens.
+
+If the job books, sends, buys or moves anything, press **Teach it as a
+rehearsal** instead. It is the same run, watched the same way, and it writes the
+same plan at the end: the difference is that anything it cannot take back is
+recorded as what it would have done rather than happening. A task cannot run
+until it has been taught, so this is the only way to watch the whole job through
+once with nothing at stake.
 
 **4. Read the plan.** At the end it writes down what worked: each step as an
 *intent* separately from the *hint* it used. Read it. Nothing runs on a schedule
 until you approve it: that is the line between "it tried something once" and
-"it does this alone while you are asleep".
+"it does this alone while you are asleep". A plan written by a rehearsal says so
+above the Approve button, so you know whether the run behind it really did what
+the steps describe.
 
 **5. Give it a schedule.** Pick when it should run. Underneath, Errand shows
 what the schedule really means and the next few times it will fire. If that
@@ -54,7 +64,8 @@ sentence is not what you meant, change the form until it is.
 
 **Rehearse it.** A rehearsal runs the task normally but records anything
 irreversible instead of doing it. Nothing is booked, sent or deleted. It is the
-cheapest way to find out that a site has changed.
+cheapest way to find out that a site has changed. Rehearse the very first run
+too, by teaching it as a rehearsal: that is the run nobody has watched before.
 
 **Save the login properly.** Add it in Settings, bound to one site. Errand can
 use it and cannot show it to you, and it will be refused on any other site, so

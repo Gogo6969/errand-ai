@@ -126,6 +126,10 @@ fn task_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<crate::models::Task> {
         notify: parse(r.try_get("notify_json")?),
         limits: parse(r.try_get("limits_json")?),
         allowed_domains: parse(r.try_get("allowed_domains_json")?),
+        model_id: crate::providers::read_task_model(
+            r.try_get::<Option<String>, _>("model_roles_json")?
+                .as_deref(),
+        ),
         playbook_version: r.try_get("active_playbook_version")?,
         next_run_at: r.try_get("next_run_at")?,
         paused_reason: r.try_get("paused_reason")?,
@@ -192,6 +196,12 @@ pub struct TaskPatch {
     /// route by which an entry the run-time check could never match gets
     /// written to the database.
     pub allowed_domains: Option<Vec<String>>,
+    /// Which model carries this task out. Its own three-valued type rather than
+    /// an `Option`, because here the difference between "not mentioned" and
+    /// "put it back on the default" is the difference between a task keeping
+    /// the model it was given and quietly losing it when somebody edits its
+    /// sites.
+    pub model: crate::providers::ModelChoice,
 }
 
 /// Lay a patch over a stored settings object, one key at a time.
@@ -252,7 +262,8 @@ pub async fn update_task(pool: &Pool, id: &str, patch: TaskPatch) -> Result<crat
     let mut tx = pool.begin().await?;
 
     let row = sqlx::query(
-        "SELECT status, schedule_json, notify_json, limits_json FROM tasks WHERE id = ?",
+        "SELECT status, schedule_json, notify_json, limits_json, model_roles_json
+         FROM tasks WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&mut *tx)
@@ -284,6 +295,25 @@ pub async fn update_task(pool: &Pool, id: &str, patch: TaskPatch) -> Result<crat
         &row.try_get::<String, _>("limits_json")?,
         patch.limits.as_ref(),
     )?;
+
+    // Which model carries the task out. Read inside the transaction like the
+    // two above, and rewritten rather than replaced, so naming a model cannot
+    // take the rest of that column with it. An edit that says nothing about the
+    // model leaves the column untouched: a task told to use the machine under
+    // the desk must still be using it after somebody edits its sites.
+    let model_changing = patch.model != crate::providers::ModelChoice::Unchanged;
+    let model_roles_json = {
+        let stored: Option<String> = row.try_get("model_roles_json")?;
+        match &patch.model {
+            crate::providers::ModelChoice::Unchanged => None,
+            crate::providers::ModelChoice::Default => {
+                crate::providers::write_task_model(stored.as_deref(), None)
+            }
+            crate::providers::ModelChoice::Named(model_id) => {
+                crate::providers::write_task_model(stored.as_deref(), Some(model_id))
+            }
+        }
+    };
 
     let mut floor_at: Option<String> = None;
     let mut next_run_at: Option<String> = None;
@@ -362,6 +392,10 @@ pub async fn update_task(pool: &Pool, id: &str, patch: TaskPatch) -> Result<crat
             notify_json          = COALESCE(?, notify_json),
             limits_json          = COALESCE(?, limits_json),
             allowed_domains_json = COALESCE(?, allowed_domains_json),
+            -- Not COALESCE, because putting a task back on the default means
+            -- writing NULL here, and COALESCE cannot tell that apart from an
+            -- edit that never mentioned the model.
+            model_roles_json     = CASE WHEN ? = 1 THEN ? ELSE model_roles_json END,
             catch_up_floor_at    = CASE WHEN ? = 1 THEN ? ELSE catch_up_floor_at END,
             next_run_at          = CASE WHEN ? = 1 THEN ? ELSE next_run_at END,
             updated_at           = ?
@@ -374,6 +408,8 @@ pub async fn update_task(pool: &Pool, id: &str, patch: TaskPatch) -> Result<crat
     .bind(&notify_json)
     .bind(&limits_json)
     .bind(&domains_json)
+    .bind(i64::from(model_changing))
+    .bind(&model_roles_json)
     .bind(i64::from(schedule_changing))
     .bind(&floor_at)
     .bind(i64::from(schedule_changing))
@@ -508,6 +544,11 @@ fn run_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<crate::models::Run> {
         task_id: r.try_get("task_id")?,
         occurrence_id: r.try_get("occurrence_id")?,
         mode: r.try_get("mode")?,
+        // The mode is read as well as the flag, and once, here. A run recorded
+        // as a rehearsal before the flag existed says so in its mode alone, and
+        // this is the only place that has to know it.
+        rehearsal: r.try_get::<i64, _>("rehearsal")? != 0
+            || r.try_get::<String, _>("mode")? == crate::models::RunMode::REHEARSAL.stored(),
         trigger: r.try_get("trigger")?,
         triggered_by: r.try_get("triggered_by")?,
         status: r.try_get("status")?,
@@ -515,6 +556,7 @@ fn run_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<crate::models::Run> {
         started_at: r.try_get("started_at")?,
         finished_at: r.try_get("finished_at")?,
         summary: r.try_get("summary_md")?,
+        answer: r.try_get("answer_md")?,
         failure,
         tokens_in: r.try_get("tokens_in")?,
         tokens_out: r.try_get("tokens_out")?,
@@ -549,18 +591,20 @@ pub async fn try_create_run(
     task_id: &str,
     occurrence_id: &str,
     trigger: &str,
-    mode: &str,
+    mode: crate::models::RunMode,
     triggered_by: Option<&str>,
 ) -> std::result::Result<crate::models::Run, CreateRunError> {
     let id = crate::new_id();
     let res = sqlx::query(
-        "INSERT INTO runs (id, task_id, occurrence_id, mode, trigger, triggered_by, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
+        "INSERT INTO runs (id, task_id, occurrence_id, mode, rehearsal, trigger, triggered_by,
+                           status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
     )
     .bind(&id)
     .bind(task_id)
     .bind(occurrence_id)
-    .bind(mode)
+    .bind(mode.stored())
+    .bind(i64::from(mode.is_rehearsal()))
     .bind(trigger)
     .bind(triggered_by)
     .bind(crate::now_iso())
@@ -598,18 +642,20 @@ pub async fn create_run(
     task_id: &str,
     occurrence_id: &str,
     trigger: &str,
-    mode: &str,
+    mode: crate::models::RunMode,
     triggered_by: Option<&str>,
 ) -> Result<crate::models::Run> {
     let id = crate::new_id();
     sqlx::query(
-        "INSERT INTO runs (id, task_id, occurrence_id, mode, trigger, triggered_by, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
+        "INSERT INTO runs (id, task_id, occurrence_id, mode, rehearsal, trigger, triggered_by,
+                           status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
     )
     .bind(&id)
     .bind(task_id)
     .bind(occurrence_id)
-    .bind(mode)
+    .bind(mode.stored())
+    .bind(i64::from(mode.is_rehearsal()))
     .bind(trigger)
     .bind(triggered_by)
     .bind(crate::now_iso())
@@ -762,12 +808,24 @@ pub async fn set_run_status(pool: &Pool, run_id: &str, status: &str) -> Result<(
     Ok(())
 }
 
-pub async fn finish_run_ok(pool: &Pool, run_id: &str, summary: &str) -> Result<()> {
+/// Close a run as done, with the story of the work and the answer it produced.
+///
+/// The two are separate columns because they are separate things, and the app
+/// had only the first of them for too long: a person opening a finished task
+/// was shown what it did and never what it found.
+pub async fn finish_run_ok(
+    pool: &Pool,
+    run_id: &str,
+    summary: &str,
+    answer: Option<&str>,
+) -> Result<()> {
     sqlx::query(
-        "UPDATE runs SET status = 'succeeded', finished_at = ?, summary_md = ? WHERE id = ?",
+        "UPDATE runs SET status = 'succeeded', finished_at = ?, summary_md = ?, answer_md = ?
+         WHERE id = ?",
     )
     .bind(crate::now_iso())
     .bind(summary)
+    .bind(answer)
     .bind(run_id)
     .execute(pool)
     .await?;
@@ -784,19 +842,113 @@ pub async fn finish_run_failed(
     human: &str,
     technical: Option<&str>,
 ) -> Result<()> {
+    finish_run_failed_with_answer(pool, run_id, code, human, technical, None).await
+}
+
+/// The same, for a run that failed holding an answer anyway.
+///
+/// That combination is not a curiosity, it is the common case: a run reads the
+/// mail, works out the summary, and only then finds that macOS will not let it
+/// write the note it was told to write. The run is genuinely a failure, and
+/// throwing away what it found would make a person do the work again by hand.
+pub async fn finish_run_failed_with_answer(
+    pool: &Pool,
+    run_id: &str,
+    code: &str,
+    human: &str,
+    technical: Option<&str>,
+    answer: Option<&str>,
+) -> Result<()> {
     sqlx::query(
         "UPDATE runs SET status = 'failed', finished_at = ?, failure_code = ?,
-                         failure_human = ?, failure_technical = ?
+                         failure_human = ?, failure_technical = ?,
+                         answer_md = COALESCE(?, answer_md)
          WHERE id = ?",
     )
     .bind(crate::now_iso())
     .bind(code)
     .bind(human)
     .bind(technical)
+    .bind(answer)
     .bind(run_id)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Where a run put a copy of its answer, and what it is called.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AnswerCopy {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    /// Never sent to a browser. Opening one goes through the delivery's id, so
+    /// a caller cannot name a file of its own choosing and have it opened.
+    #[serde(skip_serializing)]
+    pub locator: String,
+}
+
+/// Write down that a run left a copy of its answer somewhere.
+///
+/// Called by the tool that did it, at the point it succeeded, so a link on
+/// screen always corresponds to something that really happened.
+pub async fn record_answer_copy(
+    pool: &Pool,
+    run_id: &str,
+    kind: &str,
+    label: &str,
+    locator: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO run_answer_copies (id, run_id, kind, label, locator, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(crate::new_id())
+    .bind(run_id)
+    .bind(kind)
+    .bind(label)
+    .bind(locator)
+    .bind(crate::now_iso())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_answer_copies(pool: &Pool, run_id: &str) -> Result<Vec<AnswerCopy>> {
+    let rows = sqlx::query(
+        "SELECT id, kind, label, locator FROM run_answer_copies
+         WHERE run_id = ? ORDER BY created_at, rowid",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| {
+            Ok(AnswerCopy {
+                id: r.try_get("id")?,
+                kind: r.try_get("kind")?,
+                label: r.try_get("label")?,
+                locator: r.try_get("locator")?,
+            })
+        })
+        .collect()
+}
+
+/// One copy, by its own id, for opening it.
+pub async fn get_answer_copy(pool: &Pool, id: &str) -> Result<Option<AnswerCopy>> {
+    let row = sqlx::query("SELECT id, kind, label, locator FROM run_answer_copies WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    match row {
+        None => Ok(None),
+        Some(r) => Ok(Some(AnswerCopy {
+            id: r.try_get("id")?,
+            kind: r.try_get("kind")?,
+            label: r.try_get("label")?,
+            locator: r.try_get("locator")?,
+        })),
+    }
 }
 
 pub async fn record_usage(
@@ -2547,9 +2699,16 @@ mod tests {
         .unwrap();
         assert_eq!(t.status, "draft");
 
-        let run = create_run(&pool, &t.id, "occ-1", "manual", "normal", None)
-            .await
-            .unwrap();
+        let run = create_run(
+            &pool,
+            &t.id,
+            "occ-1",
+            "manual",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
         append_step(&pool, &run.id, "plan", "Loaded playbook", true, None)
             .await
             .unwrap();
@@ -2584,10 +2743,25 @@ mod tests {
         )
         .await
         .unwrap();
-        create_run(&pool, &t.id, "2026-08-26T08:00", "schedule", "normal", None)
-            .await
-            .unwrap();
-        let second = create_run(&pool, &t.id, "2026-08-26T08:00", "schedule", "normal", None).await;
+        create_run(
+            &pool,
+            &t.id,
+            "2026-08-26T08:00",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
+        let second = create_run(
+            &pool,
+            &t.id,
+            "2026-08-26T08:00",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await;
         assert!(second.is_err(), "duplicate occurrence must be rejected");
     }
 
@@ -2607,9 +2781,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let run = create_run(&pool, &t.id, "occ", "manual", "normal", None)
-            .await
-            .unwrap();
+        let run = create_run(
+            &pool,
+            &t.id,
+            "occ",
+            "manual",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         let bare = sqlx::query("UPDATE runs SET status = 'failed' WHERE id = ?")
             .bind(&run.id)
@@ -2670,7 +2851,7 @@ mod tests {
             &t.id,
             "2026-08-26T08:00Z",
             "schedule",
-            "normal",
+            crate::models::RunMode::NORMAL,
             None,
         )
         .await
@@ -2714,9 +2895,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let r1 = create_run(&pool, &t.id, "slot-A", "schedule", "normal", None)
-            .await
-            .unwrap();
+        let r1 = create_run(
+            &pool,
+            &t.id,
+            "slot-A",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         // First attempt books court 2.
         let FenceVerdict::Armed(id) =
@@ -2755,9 +2943,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = create_run(&pool, &t.id, "slot-B", "schedule", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "slot-B",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         // Armed, then the process died. Nobody knows if it went through.
         arm_side_effect(&pool, &r.id, &t.id, "slot-B", "booking", "")
@@ -2788,9 +2983,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = create_run(&pool, &t.id, "slot-C", "schedule", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "slot-C",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         let FenceVerdict::Armed(id) = arm_side_effect(&pool, &r.id, &t.id, "slot-C", "booking", "")
             .await
@@ -2826,9 +3028,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = create_run(&pool, &t.id, "w1", "schedule", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "w1",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         let FenceVerdict::Armed(a) = arm_side_effect(&pool, &r.id, &t.id, "w1", "booking", "")
             .await
@@ -2870,9 +3079,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = create_run(&pool, &t.id, "manual/one", "manual", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "manual/one",
+            "manual",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(recent_commit(&pool, &t.id, "booking", "", 10)
             .await
@@ -2891,9 +3107,16 @@ mod tests {
             .unwrap();
 
         // A second manual run is a different occurrence, so the fence allows it.
-        let r2 = create_run(&pool, &t.id, "manual/two", "manual", "normal", None)
-            .await
-            .unwrap();
+        let r2 = create_run(
+            &pool,
+            &t.id,
+            "manual/two",
+            "manual",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             arm_side_effect(&pool, &r2.id, &t.id, "manual/two", "booking", "")
                 .await
@@ -2925,9 +3148,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = create_run(&pool, &t.id, "old", "manual", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "old",
+            "manual",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
         let FenceVerdict::Armed(id) = arm_side_effect(&pool, &r.id, &t.id, "old", "booking", "")
             .await
             .unwrap()
@@ -2962,10 +3192,25 @@ mod tests {
         )
         .await
         .unwrap();
-        try_create_run(&pool, &t.id, "slot", "schedule", "normal", None)
-            .await
-            .unwrap();
-        let again = try_create_run(&pool, &t.id, "slot", "schedule", "normal", None).await;
+        try_create_run(
+            &pool,
+            &t.id,
+            "slot",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
+        let again = try_create_run(
+            &pool,
+            &t.id,
+            "slot",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await;
         assert!(
             matches!(again, Err(CreateRunError::AlreadyExists)),
             "a second run for one slot must be reported as a duplicate, not a fault"
@@ -2973,7 +3218,15 @@ mod tests {
 
         // A genuine fault must NOT masquerade as a duplicate, or the occurrence
         // is lost silently.
-        let bad = try_create_run(&pool, "no-such-task", "slot2", "schedule", "normal", None).await;
+        let bad = try_create_run(
+            &pool,
+            "no-such-task",
+            "slot2",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await;
         assert!(
             matches!(bad, Err(CreateRunError::Other(_))),
             "a foreign key failure must not be read as 'already ran'"
@@ -3017,9 +3270,16 @@ mod tests {
         .await
         .unwrap();
         activate_task(&pool, &t.id).await.unwrap();
-        let r = create_run(&pool, &t.id, "slot", "schedule", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "slot",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
         set_run_status(&pool, &r.id, "running").await.unwrap();
         arm_side_effect(&pool, &r.id, &t.id, "slot", "booking", "")
             .await
@@ -3061,14 +3321,21 @@ mod tests {
         .await
         .unwrap();
         assert!(busy_run_for_task(&pool, &t.id).await.unwrap().is_none());
-        let r = create_run(&pool, &t.id, "s", "manual", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "s",
+            "manual",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             busy_run_for_task(&pool, &t.id).await.unwrap(),
             Some(r.id.clone())
         );
-        finish_run_ok(&pool, &r.id, "done").await.unwrap();
+        finish_run_ok(&pool, &r.id, "done", None).await.unwrap();
         assert!(busy_run_for_task(&pool, &t.id).await.unwrap().is_none());
     }
 
@@ -3086,9 +3353,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = create_run(&pool, &t.id, "slot", "schedule", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "slot",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
         arm_side_effect(&pool, &r.id, &t.id, "slot", "booking", "")
             .await
             .unwrap();
@@ -3124,9 +3398,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = create_run(&pool, &t.id, "slot", "schedule", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "slot",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
         arm_side_effect(&pool, &r.id, &t.id, "slot", "booking", "")
             .await
             .unwrap();
@@ -3225,10 +3506,17 @@ mod tests {
         .await
         .unwrap();
         for (i, note) in ["older", "newer"].iter().enumerate() {
-            let r = create_run(&pool, &t.id, &format!("s{i}"), "manual", "normal", None)
-                .await
-                .unwrap();
-            finish_run_ok(&pool, &r.id, "ok").await.unwrap();
+            let r = create_run(
+                &pool,
+                &t.id,
+                &format!("s{i}"),
+                "manual",
+                crate::models::RunMode::NORMAL,
+                None,
+            )
+            .await
+            .unwrap();
+            finish_run_ok(&pool, &r.id, "ok", None).await.unwrap();
             set_run_notes(&pool, &r.id, note).await.unwrap();
         }
         let notes = recent_notes(&pool, &t.id, 5).await.unwrap();
@@ -3646,7 +3934,7 @@ mod tests {
             &t.id,
             "2099-01-01T08:00:00Z",
             "schedule",
-            "normal",
+            crate::models::RunMode::NORMAL,
             None,
         )
         .await
@@ -3656,7 +3944,7 @@ mod tests {
             &t.id,
             &format!("manual/{}", crate::new_id()),
             "manual",
-            "normal",
+            crate::models::RunMode::NORMAL,
             None,
         )
         .await
@@ -4017,7 +4305,7 @@ mod tests {
             &t.id,
             "2026-08-26T08:00:00Z",
             "schedule",
-            "normal",
+            crate::models::RunMode::NORMAL,
             None,
         )
         .await
@@ -4045,9 +4333,16 @@ mod tests {
     async fn a_scope_the_person_chose_gets_its_own_go_ahead() {
         let pool = open_memory().await.unwrap();
         let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
-        let r = create_run(&pool, &t.id, "slot", "schedule", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "slot",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         // Telling two people about one booking is two separate promises, and
         // neither is a repeat of the other.
@@ -4075,9 +4370,16 @@ mod tests {
     async fn a_repeat_check_for_one_person_ignores_what_was_sent_to_another() {
         let pool = open_memory().await.unwrap();
         let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
-        let r = create_run(&pool, &t.id, "slot", "schedule", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "slot",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         let FenceVerdict::Armed(id) =
             arm_side_effect(&pool, &r.id, &t.id, "slot", "message", "recipient-a")
@@ -4105,9 +4407,16 @@ mod tests {
     async fn a_message_to_one_person_still_counts_as_something_this_task_has_just_done() {
         let pool = open_memory().await.unwrap();
         let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
-        let r = create_run(&pool, &t.id, "slot", "schedule", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "slot",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         let FenceVerdict::Armed(id) =
             arm_side_effect(&pool, &r.id, &t.id, "slot", "message", "recipient-mum")
@@ -4387,9 +4696,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = create_run(&pool, &t.id, "s", "manual", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "s",
+            "manual",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         let artifact = record_artifact(&pool, &r.id, "screenshot", "runs/x/shots/y.png", 1234)
             .await
@@ -4428,9 +4744,16 @@ mod tests {
         };
         let t = mk("T").await.unwrap();
         let other = mk("U").await.unwrap();
-        let r = create_run(&pool, &t.id, "s", "manual", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "s",
+            "manual",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(count_open_holds(&pool, &t.id).await.unwrap(), 0);
         assert!(open_hold_counts(&pool).await.unwrap().is_empty());

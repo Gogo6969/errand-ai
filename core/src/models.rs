@@ -87,12 +87,73 @@ pub enum RunTrigger {
     CatchUp,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum RunMode {
-    Normal,
-    Teach,
-    DryRun,
+/// What a run is for, and whether anything it does is real.
+///
+/// Two answers rather than one, because they are two different questions.
+/// Teaching a task and rehearsing it are not alternatives: a job that moves
+/// somebody's post or books a court is precisely the one a person wants to
+/// watch all the way through with nothing actually happening, and that run is
+/// both learning the job and doing none of it. A single word can only say one
+/// of the two, so the pair is chosen here, together, and nothing can store a
+/// rehearsal that forgot to say it was one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RunMode {
+    stored: &'static str,
+    rehearsal: bool,
+}
+
+impl RunMode {
+    /// Doing the job, for real.
+    pub const NORMAL: Self = Self {
+        stored: "normal",
+        rehearsal: false,
+    };
+    /// The supervised first run: it works the job out from the description and
+    /// writes down a plan at the end for a person to approve.
+    pub const TEACH: Self = Self {
+        stored: "teach",
+        rehearsal: false,
+    };
+    /// A run of a task that already knows the job, with everything irreversible
+    /// recorded instead of done.
+    pub const REHEARSAL: Self = Self {
+        stored: "dry_run",
+        rehearsal: true,
+    };
+    /// Teaching, rehearsed. It still ends with a plan to approve; it simply
+    /// books, sends and moves nothing on the way there.
+    pub const TEACH_REHEARSAL: Self = Self {
+        stored: "teach",
+        rehearsal: true,
+    };
+
+    /// Teaching, rehearsed or not, decided in one place so the two halves of
+    /// the answer cannot drift apart at the two ends of an if.
+    pub fn teach(rehearsal: bool) -> Self {
+        if rehearsal {
+            Self::TEACH_REHEARSAL
+        } else {
+            Self::TEACH
+        }
+    }
+
+    /// An ordinary run, rehearsed or not.
+    pub fn run(rehearsal: bool) -> Self {
+        if rehearsal {
+            Self::REHEARSAL
+        } else {
+            Self::NORMAL
+        }
+    }
+
+    /// The word the mode column stores.
+    pub fn stored(&self) -> &'static str {
+        self.stored
+    }
+
+    pub fn is_rehearsal(&self) -> bool {
+        self.rehearsal
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -318,6 +379,14 @@ pub struct Task {
     pub notify: serde_json::Value,
     pub limits: serde_json::Value,
     pub allowed_domains: serde_json::Value,
+    /// Which model in Errand's list carries this task out, by id.
+    ///
+    /// Null means the task never said, so it follows the choice on the AI
+    /// screen. It is worth naming one here because whichever model does the
+    /// work is the model that reads whatever the tools hand back, and that is a
+    /// per-task decision: a task that opens a mailbox is not the same as one
+    /// that books a tennis court.
+    pub model_id: Option<String>,
     pub playbook_version: Option<i64>,
     pub next_run_at: Option<String>,
     pub paused_reason: Option<String>,
@@ -340,6 +409,9 @@ pub struct Run {
     pub task_id: String,
     pub occurrence_id: String,
     pub mode: String,
+    /// Was everything irreversible recorded rather than done? Ask
+    /// [`Run::is_rehearsal`] rather than reading this directly.
+    pub rehearsal: bool,
     pub trigger: String,
     pub triggered_by: Option<String>,
     pub status: String,
@@ -347,12 +419,40 @@ pub struct Run {
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
     pub summary: Option<String>,
+    /// What the run produced: the answer, not the story of getting it.
+    ///
+    /// Always serialised, including as null, because "this run recorded no
+    /// answer" is a fact a reader needs and an absent key looks like an older
+    /// build.
+    pub answer: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub failure: Option<Failure>,
     pub tokens_in: i64,
     pub tokens_out: i64,
     pub cost_usd: f64,
     pub created_at: String,
+}
+
+impl Run {
+    /// Is nothing this run does allowed to really happen?
+    ///
+    /// Every rehearsal check in the program comes through here, because there
+    /// are two kinds of rehearsal and only one of them says so in its mode: a
+    /// teach run somebody asked to rehearse is still called "teach", since
+    /// learning is what it is for. Anything that read the mode for itself would
+    /// answer no to that one and really book the court.
+    pub fn is_rehearsal(&self) -> bool {
+        self.rehearsal
+    }
+
+    /// Is this the supervised first run, the one that ends by writing down a
+    /// plan for somebody to approve?
+    ///
+    /// True of a rehearsed teach as well. Rehearsing changes what a teach run
+    /// does to the world, not what it is for.
+    pub fn is_teaching(&self) -> bool {
+        self.mode == RunMode::TEACH.stored()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

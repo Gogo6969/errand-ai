@@ -2,7 +2,7 @@
  * What a task is really doing, as opposed to the word stored on it.
  *
  * The two disagree more often than you would think. A task sits at "teaching"
- * from the moment you press Teach it once until somebody approves what it
+ * from the moment you start teaching it until somebody approves what it
  * learned, so a run that finished hours ago still leaves the task saying
  * "Learning" -- which reads as nothing having happened at all.
  *
@@ -90,9 +90,11 @@ export function hintFor(task: Task | null, run?: Run | null): HintId {
 
 /** "The teaching run could not finish", in words nobody has to decode. */
 export function ranHeadline(r: Run): string {
+  // Teaching and rehearsing are two different things a run can be, and it can
+  // be both, so the rehearsed teach says so rather than picking one.
   const what =
-    r.trigger === "teach" ? "The teaching run"
-    : r.mode === "dry_run" ? "The last rehearsal"
+    r.trigger === "teach" ? (r.rehearsal ? "The rehearsed teaching run" : "The teaching run")
+    : r.rehearsal ? "The last rehearsal"
     : "The last run";
   const how =
     r.status === "succeeded" ? "worked"

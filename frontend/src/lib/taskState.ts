@@ -113,6 +113,16 @@ export function ranHeadline(r: Run): string {
 export function subline(task: Task, run?: Run | null): string | null {
   if (!run) return null;
   if (isLive(run)) return "Running now";
+
+  // The answer, wherever there is one, on every screen that shows a task.
+  //
+  // The task page was taught to lead with the answer and this was left saying
+  // what the run did, so a list of tasks read as a list of activities: "wrote
+  // a note", "checked the inbox". A person scanning their tasks wants to see
+  // what came back, and for most of them the first line is the whole of it.
+  const answered = firstLine(run.answer);
+  if (answered) return answered;
+
   if (run.status === "failed") {
     const why = run.failure?.plain_reason ?? "";
     return why ? `${ranHeadline(run)}: ${why}` : ranHeadline(run);
@@ -121,4 +131,21 @@ export function subline(task: Task, run?: Run | null): string | null {
     return "It wrote down how it did the job. Read that and approve it before it runs unattended.";
   }
   return run.summary || null;
+}
+
+/**
+ * The first line worth reading out of an answer.
+ *
+ * An answer is written to be read whole on the task, so in a list it has to be
+ * cut down. The first non-empty line is nearly always the sentence that says
+ * what came back, and taking a fixed number of characters instead would cut
+ * words in half.
+ */
+function firstLine(text?: string | null): string | null {
+  if (!text) return null;
+  for (const raw of text.split("\n")) {
+    const line = raw.trim();
+    if (line) return line;
+  }
+  return null;
 }

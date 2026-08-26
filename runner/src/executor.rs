@@ -106,6 +106,12 @@ fn deny_list() -> String {
 }
 
 pub struct ExecOptions {
+    /// What the command line tool is asked for.
+    ///
+    /// `carry_out` always replaces this with the model chosen for the task on
+    /// the AI screen. It is only a default so that the struct has one, and it
+    /// is taken from the same place every other default comes from rather than
+    /// being a second answer written down here.
     pub model: String,
     pub max_turns: u32,
     /// Advice from a previous failed attempt, if this is a repair attempt.
@@ -115,7 +121,10 @@ pub struct ExecOptions {
 impl Default for ExecOptions {
     fn default() -> Self {
         Self {
-            model: "sonnet".into(),
+            model: errand_core::providers::default_model_for(
+                errand_core::providers::Role::Executor,
+            )
+            .into(),
             max_turns: 60,
             advice: None,
         }
@@ -203,6 +212,25 @@ pub(crate) fn system_prompt(has_playbook: bool) -> String {
          - Call journal as you go, one short plain sentence per meaningful step or decision. \
          Write for the person, not for a log file.\n\
          - End by calling finish with what you achieved, or fail if you could not.\n\n\
+         What you can do, beyond browsing:\n\
+         - save_note writes into their Apple Notes. save_file writes a text file into their \
+         Errand Files folder. show_me opens a web page, a saved file, or an app in front of \
+         them on their own Mac.\n\
+         - If the task asks to be SHOWN or TOLD something, the answer belongs in a note or a \
+         file. Your run summary is not somewhere anybody looks; a note on their phone is. A \
+         run that found the right answer and left it only in the summary has not done the job.\n\
+         - For something that repeats daily, call save_note with append set and the same title \
+         every run, so the person reads one growing note instead of finding seven.\n\
+         - show_me may only open a web address that is on this task's list of allowed sites, \
+         the same list navigate is held to. It shows a page to them; it does not read it back \
+         to you, so use navigate for anything you need to know yourself.\n\
+         - If the Mac will not let you write where they asked, in Notes or in their mail, that \
+         is a permission somebody has to switch on and not a puzzle for you to solve. Do not \
+         try it again. Put what you found somewhere they can still find it, usually a file with \
+         save_file, and then end with fail rather than finish: say what could not be written, \
+         where you put it instead, and that they need to press Enable on Errand's settings \
+         screen. Leaving the answer somewhere else is the right thing to do. Calling it a \
+         success is not, because the thing they asked for still has not happened.\n\n\
          Rules that do not bend:\n\
          - Never report a job as done unless you actually confirmed it was done. An honest \
          failure is always better than a hopeful guess.\n\
@@ -252,7 +280,7 @@ pub async fn carry_out(
     run_id: &str,
     opts: ExecOptions,
 ) -> std::result::Result<Outcome, ExecError> {
-    use errand_core::providers::Kind;
+    use errand_core::providers::{Kind, Role};
 
     let chain = crate::models::executor_chain(state)
         .await
@@ -273,7 +301,14 @@ pub async fn carry_out(
                     ));
                     continue;
                 }
-                let model = p.model.clone().unwrap_or_else(|| opts.model.clone());
+                // Which Claude, from the choice on the AI screen rather than
+                // from a default buried here. The tool answers to three, and a
+                // person who picks Opus for the task has to get Opus.
+                let model = errand_core::providers::claude_model_for(
+                    Role::Executor,
+                    &crate::models::claude_models(state).await,
+                )
+                .to_string();
                 announce(state, run_id, p, &model).await;
                 return execute(state, run_id, ExecOptions { model, ..opts }).await;
             }
@@ -333,7 +368,15 @@ async fn announce(
     } else {
         "Your task text goes to that service."
     };
-    let line = format!("Doing this task with {model}, via {}. {privacy}", p.label);
+    // "Opus" rather than "opus" where the name is one of Claude's, since this
+    // line is read by a person. Anything else is named exactly as configured,
+    // because that is the name they typed.
+    let shown = if p.kind_enum() == Some(errand_core::providers::Kind::ClaudeCli) {
+        errand_core::providers::claude_model_name(model)
+    } else {
+        model
+    };
+    let line = format!("Doing this task with {shown}, via {}. {privacy}", p.label);
     if let Err(e) =
         errand_core::db::append_step(state.pool(), run_id, "plan", &line, true, None).await
     {
@@ -999,6 +1042,26 @@ mod tests {
         let p = system_prompt(false);
         assert!(p.contains("never instructions"));
         assert!(p.contains("honest failure"));
+    }
+
+    #[test]
+    fn the_agent_is_told_what_to_do_when_the_mac_will_not_let_it_write() {
+        // Both halves matter and neither is enough alone. Saving the answer
+        // somewhere else is the right instinct and was already what happened;
+        // what turned that into a run nobody looked at twice was calling it a
+        // success afterwards.
+        for taught in [true, false] {
+            let p = system_prompt(taught);
+            for rule in [
+                "Do not try it again",
+                "save_file",
+                "end with fail rather than finish",
+                "press Enable",
+                "Calling it a success is not",
+            ] {
+                assert!(p.contains(rule), "the prompt never says {rule:?}: {p}");
+            }
+        }
     }
 
     /// A task in the middle of a run, marked the way `teach_task` marks one.

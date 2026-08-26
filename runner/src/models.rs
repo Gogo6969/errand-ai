@@ -21,11 +21,27 @@ pub struct Answer {
     pub was_local: bool,
 }
 
+/// Which Claude each job is set to ask the command line tool for.
+///
+/// The one place that answers this, so what the AI screen shows and what the
+/// tool is actually asked for cannot drift apart. A database that cannot be
+/// read is not worth failing a run over: the defaults are the same ones that
+/// were hard coded before anybody could choose.
+pub async fn claude_models(state: &AppState) -> errand_core::providers::ClaudeModels {
+    let stored =
+        errand_core::db::get_setting(state.pool(), errand_core::providers::CLAUDE_MODELS_KEY)
+            .await
+            .ok()
+            .flatten();
+    errand_core::providers::read_claude_models(stored.as_ref())
+}
+
 /// Ask the model bound to a role.
 ///
 /// Walks the chain in order, so a local model being switched off falls through
 /// to the next rather than failing the run.
 pub async fn ask(state: &AppState, role: Role, prompt: &str) -> anyhow::Result<Answer> {
+    let claude = claude_models(state).await;
     let providers = errand_core::db::list_providers(state.pool()).await?;
     let bindings = errand_core::db::list_role_bindings(state.pool()).await?;
     let local_only = errand_core::db::get_setting(state.pool(), "privacy.local_only")
@@ -44,10 +60,18 @@ pub async fn ask(state: &AppState, role: Role, prompt: &str) -> anyhow::Result<A
 
     let mut last: Option<String> = None;
     for p in chain {
-        let model = p
-            .model
-            .clone()
-            .unwrap_or_else(|| errand_core::providers::default_model_for(role).to_string());
+        // The command line tool has no model of its own in the list, because it
+        // answers to three and which one is a per-job choice. Everything else
+        // carries the one model it was configured with.
+        let model = match p.kind_enum() {
+            Some(Kind::ClaudeCli) => {
+                errand_core::providers::claude_model_for(role, &claude).to_string()
+            }
+            _ => p
+                .model
+                .clone()
+                .unwrap_or_else(|| errand_core::providers::default_model_for(role).to_string()),
+        };
 
         let result = match p.kind_enum() {
             Some(Kind::ClaudeCli) => crate::executor::ask_model(prompt, &model, 4)

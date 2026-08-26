@@ -1374,6 +1374,67 @@ pub async fn revoke_tokens_named(pool: &Pool, name_prefix: &str) -> Result<u64> 
     Ok(res.rows_affected())
 }
 
+// ------------------------------------------------------------- mail access --
+//
+// The same shape as the recipient grants above, and for the same reason. A
+// task can reach the person's mail only because somebody sat down and said so
+// for that one task; there is no global switch, and nothing a run reads can
+// create one of these rows.
+
+/// What one task is allowed to do with the person's mail.
+///
+/// The absence of this, rather than any field on it, is what refuses a task.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MailGrant {
+    /// May it move messages between mailboxes, as opposed to only reading them.
+    pub may_file: bool,
+    pub granted_at: String,
+}
+
+/// Let one task read the person's mail, and optionally tidy it.
+///
+/// Granting again updates the filing half rather than failing, so the task
+/// screen can simply write what the person chose.
+pub async fn grant_mail(pool: &Pool, task_id: &str, may_file: bool) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO task_mail_grants (task_id, may_file, granted_at)
+         VALUES (?, ?, ?)
+         ON CONFLICT(task_id) DO UPDATE SET may_file = excluded.may_file",
+    )
+    .bind(task_id)
+    .bind(i64::from(may_file))
+    .bind(crate::now_iso())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Take the grant away. The next run of this task cannot see the mail tools at
+/// all, and messages already read or moved are not affected by it.
+pub async fn revoke_mail(pool: &Pool, task_id: &str) -> Result<bool> {
+    let res = sqlx::query("DELETE FROM task_mail_grants WHERE task_id = ?")
+        .bind(task_id)
+        .execute(pool)
+        .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// What this task may do with the mail. `None` means it was never granted, so
+/// it may do nothing at all.
+pub async fn mail_grant_for_task(pool: &Pool, task_id: &str) -> Result<Option<MailGrant>> {
+    let row = sqlx::query("SELECT may_file, granted_at FROM task_mail_grants WHERE task_id = ?")
+        .bind(task_id)
+        .fetch_optional(pool)
+        .await?;
+    match row {
+        Some(r) => Ok(Some(MailGrant {
+            may_file: r.try_get::<i64, _>("may_file")? != 0,
+            granted_at: r.try_get("granted_at")?,
+        })),
+        None => Ok(None),
+    }
+}
+
 // ------------------------------------------------------------ side effects --
 
 /// What the fence says about an irreversible action.
@@ -4187,6 +4248,80 @@ mod tests {
         let granted = recipients_for_task(&pool, &t.id).await.unwrap();
         assert_eq!(granted.len(), 1, "relinking must not add a second row");
         assert!(!granted[0].on_success);
+    }
+
+    // ------------------------------------------------------- mail access --
+
+    #[tokio::test]
+    async fn a_task_cannot_touch_the_mail_until_somebody_says_it_may() {
+        let pool = open_memory().await.unwrap();
+        let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        assert!(
+            mail_grant_for_task(&pool, &t.id).await.unwrap().is_none(),
+            "a task must start with no reach into the mail at all"
+        );
+
+        grant_mail(&pool, &t.id, false).await.unwrap();
+        let granted = mail_grant_for_task(&pool, &t.id).await.unwrap().unwrap();
+        assert!(
+            !granted.may_file,
+            "being allowed to read the mail must not also allow rearranging it"
+        );
+    }
+
+    #[tokio::test]
+    async fn permission_to_read_the_mail_is_separate_from_permission_to_move_it() {
+        let pool = open_memory().await.unwrap();
+        let reader = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        let tidier = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+
+        grant_mail(&pool, &reader.id, false).await.unwrap();
+        grant_mail(&pool, &tidier.id, true).await.unwrap();
+
+        assert!(
+            !mail_grant_for_task(&pool, &reader.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .may_file
+        );
+        assert!(
+            mail_grant_for_task(&pool, &tidier.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .may_file
+        );
+    }
+
+    #[tokio::test]
+    async fn granting_the_mail_twice_changes_the_answer_rather_than_adding_a_second_one() {
+        let pool = open_memory().await.unwrap();
+        let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        grant_mail(&pool, &t.id, true).await.unwrap();
+        grant_mail(&pool, &t.id, false).await.unwrap();
+        assert!(
+            !mail_grant_for_task(&pool, &t.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .may_file,
+            "taking filing back away has to actually take it away"
+        );
+    }
+
+    #[tokio::test]
+    async fn taking_the_mail_grant_away_leaves_the_task_with_nothing() {
+        let pool = open_memory().await.unwrap();
+        let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        grant_mail(&pool, &t.id, true).await.unwrap();
+
+        assert!(revoke_mail(&pool, &t.id).await.unwrap());
+        assert!(mail_grant_for_task(&pool, &t.id).await.unwrap().is_none());
+        assert!(
+            !revoke_mail(&pool, &t.id).await.unwrap(),
+            "revoking a grant that is not there is not a change"
+        );
     }
 
     #[tokio::test]

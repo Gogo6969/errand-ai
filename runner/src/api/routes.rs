@@ -72,11 +72,17 @@ pub fn router(state: AppState) -> Router {
             "/v1/tasks/{id}/recipients/{recipient_id}",
             delete(revoke_recipient),
         )
+        .route(
+            "/v1/tasks/{id}/mail",
+            get(get_mail_grant).post(grant_mail).delete(revoke_mail),
+        )
         .route("/v1/settings", get(get_settings))
         .route("/v1/channels", get(list_channels))
         .route("/v1/channels/{channel}/config", post(configure_channel))
         .route("/v1/channels/{channel}/test", post(test_channel))
         .route("/v1/channels/{channel}/enable", post(enable_channel))
+        .route("/v1/automation", get(list_automation))
+        .route("/v1/automation/{app}/enable", post(enable_automation))
         .route("/v1/tokens", get(list_tokens).post(mint_token))
         .route("/v1/tokens/{id}", delete(revoke_token))
         .route("/v1/webhooks", get(list_webhooks).post(create_webhook))
@@ -88,6 +94,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/ai/providers/{id}/test", post(test_provider))
         .route("/v1/ai/discover", post(discover_providers))
         .route("/v1/ai/roles/{role}", post(bind_role))
+        .route("/v1/ai/roles/{role}/model", post(set_role_model))
         .route("/v1/ai/local-only", post(set_local_only))
         .route("/v1/ai/anthropic-key", post(save_anthropic_key))
         .route("/v1/admin/quiesce", post(quiesce))
@@ -1410,6 +1417,153 @@ async fn revoke_recipient(
     })))
 }
 
+// ------------------------------------------------------------- mail access --
+//
+// The grant that lets one task read the person's mail, and the sentence that
+// tells them where that mail then goes.
+//
+// The sentence lives here rather than in the interface because it is the part
+// that must not drift. A screen can be redesigned by somebody who never reads
+// this file; what a person is told before they hand over their post cannot be
+// left to that. The interface shows what this returns.
+
+/// Where the mail actually goes, said plainly, for the Mac as it is set up now.
+///
+/// Errand's whole claim is that it tells the truth about what it does, and this
+/// is where that claim is tested. Whichever model carries out the task reads
+/// what the mail tools return, so with a hosted model a person's private post
+/// leaves their machine. Saying it softly, or only in the documentation, would
+/// be the same as not saying it.
+fn mail_privacy_note(local_only: bool) -> String {
+    if local_only {
+        return "Errand is set to keep everything on this machine, so a task reading your mail \
+                sends it to a model on your own Mac or your own network and nowhere else. If you \
+                ever turn that setting off, the sender, the subject and the contents of every \
+                message this task opens would go to whichever service is doing the job."
+            .to_string();
+    }
+    "Errand is set to use a model over the internet, and the model doing the job is what reads \
+     your mail. So the sender, the subject and the whole of any message this task opens leave \
+     this Mac and go to that service, the same as if you had pasted them into it yourself. If \
+     you would rather that never happened, open the AI page, turn on \"Keep everything on this \
+     machine\", and pick a model that runs on your own machine: your mail is then read here and \
+     goes no further."
+        .to_string()
+}
+
+/// What this task may do with the mail, and what that means.
+async fn get_mail_grant(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    if errand_core::db::get_task(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+        .is_none()
+    {
+        return Err(ApiError::not_found(format!("No task with id {id}.")));
+    }
+    let grant = errand_core::db::mail_grant_for_task(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(json!({
+        "task_id": id,
+        "granted": grant.is_some(),
+        "may_file": grant.as_ref().is_some_and(|g| g.may_file),
+        "granted_at": grant.as_ref().map(|g| g.granted_at.clone()),
+        "local_only": local_only_setting(&state).await,
+        "where_it_goes": mail_privacy_note(local_only_setting(&state).await),
+    })))
+}
+
+#[derive(Deserialize)]
+struct GrantMail {
+    /// Off unless it is asked for. Being allowed to read somebody's mail is not
+    /// the same as being allowed to rearrange it, and defaulting this to true
+    /// would quietly make it the same.
+    #[serde(default)]
+    may_file: bool,
+}
+
+/// Let one task read the person's mail.
+///
+/// Approve rather than Manage, for the reason granting a recipient is: this
+/// decides what an unattended agent may see of somebody's private life, which
+/// is the same class of decision as resolving a hold. A client that can change
+/// settings should not be able to make it.
+async fn grant_mail(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(body): Json<GrantMail>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Approve)?;
+
+    if errand_core::db::get_task(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+        .is_none()
+    {
+        return Err(ApiError::not_found(format!("No task with id {id}.")));
+    }
+
+    errand_core::db::grant_mail(state.pool(), &id, body.may_file)
+        .await
+        .map_err(ApiError::from)?;
+
+    state.emit(Event::TaskUpdated {
+        task_id: id.clone(),
+    });
+    let local_only = local_only_setting(&state).await;
+    Ok(Json(json!({
+        "task_id": id,
+        "granted": true,
+        "may_file": body.may_file,
+        "local_only": local_only,
+        "where_it_goes": mail_privacy_note(local_only),
+        "note": if body.may_file {
+            "This task can now read your mail and move messages between mailboxes. Every message \
+             it opens and every one it moves is written down in the run, by sender and subject, \
+             so you can see afterwards exactly what it touched."
+        } else {
+            "This task can now read your mail. It cannot move, delete or send anything, and \
+             every message it opens is written down in the run, by sender and subject, so you \
+             can see afterwards exactly what it read."
+        }
+    })))
+}
+
+/// Take the mail away from one task.
+async fn revoke_mail(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Manage is enough to take a permission away. Removing this can only ever
+    // mean a task seeing less.
+    require(&caller, Scope::Manage)?;
+    let gone = errand_core::db::revoke_mail(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?;
+    if !gone {
+        return Err(ApiError::not_found(
+            "This task could not see your mail anyway, so nothing changed.",
+        ));
+    }
+    state.emit(Event::TaskUpdated {
+        task_id: id.clone(),
+    });
+    Ok(Json(json!({
+        "task_id": id,
+        "granted": false,
+        "note": "This task can no longer see your mail: from its next run onwards the tools for \
+                 reading it are not even offered to it. Anything it has already read or moved is \
+                 not undone by this, and what it read is in the runs."
+    })))
+}
+
 /// Could this channel actually deliver to this address?
 ///
 /// Checked when it is typed rather than when a message is due. A typo found now
@@ -1711,7 +1865,8 @@ async fn list_channels(
             "telegram": "Where run outcomes go. This is the one Errand relies on.",
             "whatsapp": crate::channels::whatsapp::RISK_NOTICE,
             "apple_mail": "Needs macOS Automation permission, which Errand asks for when you \
-                           press Enable, so the prompt appears while you are looking at it.",
+                           press Enable, so the prompt appears while you are looking at it. \
+                           Reading your post is a separate card, under Apps on this Mac.",
             "imessage": "Needs Messages to be signed in, and the same Automation permission."
         }
     })))
@@ -1808,6 +1963,51 @@ async fn enable_channel(
     // The screen draws this the same way it draws the channel list, so it needs
     // the same fields: the name to show, and where a test would go.
     health.fill_self_address(state.pool()).await;
+    Ok(Json(serde_json::to_value(health).unwrap_or(json!({}))))
+}
+
+// ------------------------------------------ apps on this Mac, not channels --
+
+/// Which apps on this Mac Errand may drive, and what to do when it may not.
+///
+/// Asking macOS is the same act as checking, so loading this is itself what
+/// puts the prompt on the screen. That is the point of doing it here: the
+/// person is looking at the screen now, and at 03:00 they will not be.
+async fn list_automation(
+    Extension(caller): Extension<Caller>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Read)?;
+    Ok(Json(json!({
+        "apps": crate::channels::apple::all_app_consent().await,
+        "notes": {
+            "mail_reading":
+                "Sending your post and reading it are one macOS permission, because macOS decides \
+                 per app rather than per thing you do with it, so turning either on normally \
+                 turns both on. Errand checks each on its own rather than assuming that, so \
+                 believe what each line says over this one.",
+            "notes":
+                "Writing a note is how a task leaves you an answer you will actually see. \
+                 Without this a task can still save a file, and will say so.",
+        }
+    })))
+}
+
+/// Ask macOS for permission to drive one app, while somebody is watching.
+async fn enable_automation(
+    Extension(caller): Extension<Caller>,
+    Path(app): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    let Some(app) = crate::channels::apple::Automation::parse(&app) else {
+        return Err(ApiError::bad_request(format!(
+            "'{app}' is not an app Errand drives."
+        )));
+    };
+    // The same reason as enable_channel above: macOS grants Automation to the
+    // process that sends the Apple Event, so the asking has to happen in the
+    // daemon. Asking from the window grants it to the window, and the 03:00 run
+    // fails exactly as before.
+    let health = crate::channels::apple::app_consent(app).await;
     Ok(Json(serde_json::to_value(health).unwrap_or(json!({}))))
 }
 
@@ -2475,6 +2675,7 @@ async fn get_ai(
         .map_err(ApiError::from)?;
     let local_only = local_only_setting(&state).await;
     let seen = tools_seen(&state).await;
+    let claude = crate::models::claude_models(&state).await;
 
     // Each model with what Errand has found out about it, because "can this one
     // do the task" is the question the screen exists to answer and it must not
@@ -2489,6 +2690,11 @@ async fn get_ai(
                 "label": p.label,
                 "base_url": p.base_url,
                 "model": p.model,
+                // The command line tool has no model in its row: it answers to
+                // three, one per job. Without this the screen says "Claude" and
+                // stops, which is exactly the question nobody could answer.
+                "models_in_use": is_claude_cli(p)
+                    .then(|| errand_core::providers::claude_models_summary(&claude)),
                 "enabled": p.enabled,
                 "discovered": p.discovered,
                 "health": p.health,
@@ -2533,13 +2739,28 @@ async fn get_ai(
                 "not_used_because": role.not_wired_reason(),
                 "chosen": chosen,
                 "chosen_problem": chosen_problem,
-                "using": chain.first().map(|p| json!({
-                    "id": p.id,
-                    "label": p.label,
-                    "model": p.model.clone().unwrap_or_else(||
-                        errand_core::providers::default_model_for(role).to_string()),
-                    "local": p.is_local(),
-                })),
+                "using": chain.first().map(|p| {
+                    // A model choice is only offered where there is one to
+                    // make. The rule this screen lives under is that it never
+                    // shows a control that would change nothing.
+                    let cli = is_claude_cli(p);
+                    let model = if cli {
+                        errand_core::providers::claude_model_for(role, &claude).to_string()
+                    } else {
+                        p.model.clone().unwrap_or_else(||
+                            errand_core::providers::default_model_for(role).to_string())
+                    };
+                    let known = cli.then(|| errand_core::providers::claude_model(&model)).flatten();
+                    json!({
+                        "id": p.id,
+                        "label": p.label,
+                        "model": model,
+                        "model_name": known.map(|m| m.name),
+                        "model_says": known.map(|m| m.what_it_is_for),
+                        "can_choose_model": cli,
+                        "local": p.is_local(),
+                    })
+                }),
                 "fallbacks": chain.iter().skip(1).map(|p| p.label.clone()).collect::<Vec<_>>(),
                 "problem": chain.is_empty().then(||
                     errand_core::providers::explain_empty_chain(role, local_only, &providers)),
@@ -2550,8 +2771,16 @@ async fn get_ai(
     Ok(Json(json!({
         "providers": listed,
         "roles": roles,
+        // The three the command line tool answers to, so the screen offers
+        // exactly what Errand will accept rather than a list of its own.
+        "claude_models": errand_core::providers::CLAUDE_MODELS,
         "local_only": local_only,
     })))
+}
+
+/// Is this the Claude command line tool, the one endpoint with a model per job?
+fn is_claude_cli(p: &errand_core::providers::Provider) -> bool {
+    p.kind_enum() == Some(errand_core::providers::Kind::ClaudeCli)
 }
 
 // --------------------------------------------------- can it use tools? --
@@ -3072,6 +3301,65 @@ async fn bind_role(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Deserialize)]
+struct RoleModel {
+    /// Missing or empty means "whichever Errand would pick", so a job can be
+    /// put back on its default without anybody having to remember what it was.
+    model: Option<String>,
+}
+
+/// Choose which Claude does one job.
+///
+/// Only the command line tool has a choice here: everything else is one
+/// endpoint with one model, chosen where it was added.
+async fn set_role_model(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(role): Path<String>,
+    Json(body): Json<RoleModel>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    let role = errand_core::providers::Role::parse(&role)
+        .ok_or_else(|| ApiError::bad_request(format!("'{role}' is not one of Errand's jobs.")))?;
+
+    let mut chosen = crate::models::claude_models(&state).await;
+    match body
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+    {
+        Some(alias) => {
+            // Refused now rather than saved and used later: a name the tool
+            // does not know fails the run at the hour the task was meant to
+            // happen, with nobody watching.
+            let m = errand_core::providers::claude_model(alias).ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "Errand can ask the Claude command line tool for Opus, Sonnet or Haiku. It \
+                     does not know '{alias}'."
+                ))
+            })?;
+            chosen.insert(role.as_str().to_string(), m.alias.to_string());
+        }
+        None => {
+            chosen.remove(role.as_str());
+        }
+    }
+
+    errand_core::db::set_setting(
+        state.pool(),
+        errand_core::providers::CLAUDE_MODELS_KEY,
+        &errand_core::providers::write_claude_models(&chosen),
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    Ok(Json(json!({
+        "role": role.as_str(),
+        "model": errand_core::providers::claude_model_for(role, &chosen),
+    })))
 }
 
 #[derive(Deserialize)]
@@ -3742,6 +4030,145 @@ mod tests {
         assert!(theirs["items"].as_array().expect("a list").is_empty());
     }
 
+    // ------------------------------------------------- the mail a task may read --
+
+    #[tokio::test]
+    async fn a_task_starts_with_no_reach_into_the_mail_and_says_so() {
+        let api = testkit::start().await;
+        let id = a_ready_manual_task(&api).await;
+
+        let before = api.get(&format!("/v1/tasks/{id}/mail")).await;
+        assert_eq!(before["granted"], false);
+        assert_eq!(before["may_file"], false);
+
+        let (code, body) = api
+            .post(
+                &format!("/v1/tasks/{id}/mail"),
+                json!({ "may_file": false }),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+
+        let after = api.get(&format!("/v1/tasks/{id}/mail")).await;
+        assert_eq!(after["granted"], true);
+        assert_eq!(
+            after["may_file"], false,
+            "reading the mail must not quietly bring moving it along with it"
+        );
+
+        let (code, body) = api.delete(&format!("/v1/tasks/{id}/mail")).await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(
+            api.get(&format!("/v1/tasks/{id}/mail")).await["granted"],
+            false
+        );
+    }
+
+    #[tokio::test]
+    async fn the_screen_that_hands_over_your_mail_says_where_the_mail_then_goes() {
+        let api = testkit::start().await;
+        let id = a_ready_manual_task(&api).await;
+
+        // As Errand comes out of the box: a model over the internet, which is
+        // the case where this has to be said out loud rather than implied.
+        let said = api.get(&format!("/v1/tasks/{id}/mail")).await["where_it_goes"]
+            .as_str()
+            .expect("a plain sentence about where the mail goes")
+            .to_string();
+        assert!(
+            said.contains("leave this Mac"),
+            "a person handing over their post has to be told it leaves the machine: {said}"
+        );
+        assert!(
+            said.contains("Keep everything on this machine"),
+            "the way out has to be named, not left to be discovered: {said}"
+        );
+        assert!(
+            said.contains("runs on your own machine"),
+            "a local model is the private alternative and has to be offered: {said}"
+        );
+
+        // And the other way round, once nothing is allowed to leave.
+        errand_core::db::set_setting(&api.pool, "privacy.local_only", &json!(true))
+            .await
+            .expect("the setting");
+        let said = api.get(&format!("/v1/tasks/{id}/mail")).await["where_it_goes"]
+            .as_str()
+            .expect("a plain sentence")
+            .to_string();
+        assert!(
+            said.contains("nowhere else"),
+            "with everything kept local the person should be told that plainly: {said}"
+        );
+        assert!(
+            said.contains("If you ever turn that setting off"),
+            "the promise has to name what would end it: {said}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handing_a_task_your_mail_needs_the_permission_that_approves_things() {
+        let api = testkit::start().await;
+        let id = a_ready_manual_task(&api).await;
+
+        // A token that can change settings but not approve anything.
+        let settings_only = testkit::mint(&api.pool, "settings-only-mail", "read,manage").await;
+        let (code, body) = api
+            .as_token(
+                &settings_only,
+                reqwest::Method::POST,
+                &format!("/v1/tasks/{id}/mail"),
+                Some(json!({ "may_file": true })),
+                None,
+            )
+            .await;
+        assert_eq!(
+            code, 403,
+            "deciding that an unattended agent may read somebody's post is an approval: {body}"
+        );
+
+        let (code, body) = api
+            .post(&format!("/v1/tasks/{id}/mail"), json!({ "may_file": true }))
+            .await;
+        assert_eq!(code, 200, "{body}");
+
+        // Taking it away again is always safe, so managing is enough.
+        let (code, body) = api
+            .as_token(
+                &settings_only,
+                reqwest::Method::DELETE,
+                &format!("/v1/tasks/{id}/mail"),
+                None,
+                None,
+            )
+            .await;
+        assert_eq!(
+            code, 200,
+            "removing a permission must never be blocked: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_mail_is_granted_to_one_task_and_no_other_task_inherits_it() {
+        let api = testkit::start().await;
+        let allowed = a_ready_manual_task(&api).await;
+        let other = a_task(&api, json!({ "name": "Other", "description": "d" })).await;
+
+        let (code, body) = api
+            .post(
+                &format!("/v1/tasks/{allowed}/mail"),
+                json!({ "may_file": true }),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+
+        assert_eq!(
+            api.get(&format!("/v1/tasks/{other}/mail")).await["granted"],
+            false,
+            "a grant on one task must never reach another"
+        );
+    }
+
     // ------------------------------------------------------------------ settings --
 
     #[tokio::test]
@@ -3878,6 +4305,62 @@ mod tests {
         }
         assert_eq!(super::self_address_channel("messaging.self.fax"), None);
         assert_eq!(super::self_address_channel("messaging.quiet"), None);
+    }
+
+    /// Nothing in this test may ask the real Mac for anything. Asking is what
+    /// makes macOS prompt, and a suite that prompts is a suite that puts a
+    /// permission dialogue in front of whoever ran it.
+    fn nothing_touches_the_real_mac() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| std::env::set_var("ERRAND_APPLE_DRY", "1"));
+    }
+
+    #[tokio::test]
+    async fn the_screen_can_offer_an_enable_for_every_app_a_task_drives() {
+        // The gap this closes: the consent button existed for the two channels
+        // and for nothing else, so a task told to write a note met a prompt
+        // nobody could see and simply stopped.
+        nothing_touches_the_real_mac();
+        let api = testkit::start().await;
+
+        let listed = api.get("/v1/automation").await;
+        let apps = listed["apps"].as_array().expect("a list of apps").clone();
+        for app in ["notes", "mail_reading"] {
+            let shown = apps.iter().find(|a| a["app"] == app).unwrap_or_else(|| {
+                panic!("{app} is missing, so no screen can offer an Enable for it: {listed}")
+            });
+            assert!(
+                shown["display_name"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .starts_with("Apple"),
+                "the screen needs a name a person recognises: {shown}"
+            );
+
+            // Pressing Enable is the daemon asking macOS, and it answers with
+            // the same shape, so the card redraws itself from the reply.
+            let (code, answered) = api
+                .post(&format!("/v1/automation/{app}/enable"), json!({}))
+                .await;
+            assert_eq!(code, 200, "{answered}");
+            assert_eq!(answered["app"], app);
+            assert!(answered["display_name"].is_string(), "{answered}");
+        }
+
+        // Reading the post is listed apart from sending it, and the screen says
+        // how the two are related rather than quietly assuming one covers the
+        // other.
+        let note = listed["notes"]["mail_reading"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(note.contains("one macOS permission"), "{note}");
+        assert!(note.contains("checks each on its own"), "{note}");
+
+        let (code, body) = api
+            .post("/v1/automation/the-garage-door/enable", json!({}))
+            .await;
+        assert_eq!(code, 400, "{body}");
     }
 
     #[tokio::test]
@@ -4312,5 +4795,179 @@ mod tests {
         let explains = setup["roles"][0]["explains"].as_str().unwrap_or_default();
         assert!(!explains.contains("Claude"), "{explains}");
         assert!(explains.contains("call tools"), "{explains}");
+    }
+
+    // ------------------------------------------------- which Claude, exactly --
+    //
+    // The complaint: the screen said "Claude (command line tool)" and stopped,
+    // so somebody who picks between Opus, Sonnet and Haiku everywhere else had
+    // no way to find out which one Errand was using, let alone change it.
+
+    fn role_of<'a>(setup: &'a Value, name: &str) -> &'a Value {
+        setup["roles"]
+            .as_array()
+            .expect("the four jobs")
+            .iter()
+            .find(|r| r["role"] == name)
+            .unwrap_or_else(|| panic!("no job called {name}"))
+    }
+
+    /// The Claude row, added the same way a real install adds it.
+    async fn with_claude(api: &testkit::Api) {
+        crate::models::ensure_builtin(&api.pool)
+            .await
+            .expect("the built-in Claude row");
+    }
+
+    #[tokio::test]
+    async fn the_ai_screen_says_which_claude_is_doing_each_job() {
+        let api = testkit::start().await;
+        with_claude(&api).await;
+        let setup = api.get("/v1/ai").await;
+
+        // Next to the provider, which is where the question gets asked.
+        let claude = listed(&setup, crate::models::BUILTIN_CLAUDE);
+        let summary = claude["models_in_use"].as_str().unwrap_or_default();
+        assert!(
+            summary.contains("Sonnet") && summary.contains("Haiku"),
+            "the row has to name the models it is using: {claude}"
+        );
+
+        // And inside the job card, with what picking it means.
+        let executor = role_of(&setup, "executor");
+        assert_eq!(executor["using"]["model"], "sonnet");
+        assert_eq!(executor["using"]["model_name"], "Sonnet");
+        assert_eq!(executor["using"]["can_choose_model"], true);
+        assert!(
+            executor["using"]["model_says"]
+                .as_str()
+                .unwrap_or_default()
+                .len()
+                > 40,
+            "a choice with no explanation is not a choice: {executor}"
+        );
+        assert_eq!(role_of(&setup, "narrator")["using"]["model"], "haiku");
+
+        // The three on offer come from Errand, so the screen cannot offer one
+        // the command line tool would refuse.
+        let offered: Vec<&str> = setup["claude_models"]
+            .as_array()
+            .expect("the models on offer")
+            .iter()
+            .map(|m| m["alias"].as_str().unwrap_or_default())
+            .collect();
+        assert_eq!(offered, ["opus", "sonnet", "haiku"]);
+    }
+
+    #[tokio::test]
+    async fn choosing_opus_for_the_task_is_what_the_next_run_actually_asks_for() {
+        let api = testkit::start().await;
+        with_claude(&api).await;
+
+        let (code, body) = api
+            .post("/v1/ai/roles/executor/model", json!({ "model": "opus" }))
+            .await;
+        assert_eq!(code, 200, "choosing Opus failed: {body}");
+        assert_eq!(body["model"], "opus");
+
+        let setup = api.get("/v1/ai").await;
+        let executor = role_of(&setup, "executor");
+        assert_eq!(executor["using"]["model"], "opus");
+        assert_eq!(executor["using"]["model_name"], "Opus");
+        assert_eq!(
+            role_of(&setup, "narrator")["using"]["model"],
+            "haiku",
+            "changing one job must not change the others"
+        );
+        assert!(
+            listed(&setup, crate::models::BUILTIN_CLAUDE)["models_in_use"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Opus"),
+            "and the provider row has to agree with the job card"
+        );
+
+        // The part that makes it real: this is the exact call the executor
+        // makes before it starts the agent, so what was chosen is what the
+        // command line tool is asked for.
+        let asked_for = errand_core::providers::claude_model_for(
+            errand_core::providers::Role::Executor,
+            &crate::models::claude_models(&api.state).await,
+        );
+        assert_eq!(asked_for, "opus");
+    }
+
+    #[tokio::test]
+    async fn a_model_the_claude_tool_does_not_know_is_refused_with_the_ones_that_work() {
+        // Saved and used later, this would fail the run at the hour the task
+        // was meant to happen, with nobody watching.
+        let api = testkit::start().await;
+        with_claude(&api).await;
+
+        let (code, body) = api
+            .post("/v1/ai/roles/executor/model", json!({ "model": "gpt-4o" }))
+            .await;
+        assert_eq!(code, 400, "{body}");
+        let why = body["detail"].as_str().unwrap_or_default();
+        for name in ["Opus", "Sonnet", "Haiku"] {
+            assert!(
+                why.contains(name),
+                "the refusal has to say what works: {why}"
+            );
+        }
+
+        let setup = api.get("/v1/ai").await;
+        assert_eq!(
+            role_of(&setup, "executor")["using"]["model"],
+            "sonnet",
+            "a refused choice must not have been stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn putting_a_job_back_to_no_choice_returns_it_to_the_model_it_started_on() {
+        let api = testkit::start().await;
+        with_claude(&api).await;
+
+        api.post("/v1/ai/roles/fixer/model", json!({ "model": "opus" }))
+            .await;
+        assert_eq!(
+            role_of(&api.get("/v1/ai").await, "fixer")["using"]["model"],
+            "opus"
+        );
+
+        let (code, body) = api
+            .post("/v1/ai/roles/fixer/model", json!({ "model": Value::Null }))
+            .await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body["model"], "haiku", "back to what Errand would pick");
+        assert_eq!(
+            role_of(&api.get("/v1/ai").await, "fixer")["using"]["model"],
+            "haiku"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_model_of_your_own_is_not_offered_a_claude_to_choose_from() {
+        // The standing rule for this screen: never show a control that would
+        // change nothing. A model on your desk has one model, chosen when it
+        // was added.
+        let api = testkit::start().await;
+        let server = a_model_server(CALLS_A_TOOL).await;
+        let (id, _) = add_model(&api, "The model on my desk", &server.base).await;
+        api.post("/v1/ai/roles/narrator", json!({ "provider_id": id }))
+            .await;
+
+        let setup = api.get("/v1/ai").await;
+        let narrator = role_of(&setup, "narrator");
+        assert_eq!(narrator["using"]["id"], json!(id));
+        assert_eq!(narrator["using"]["can_choose_model"], false);
+        assert_eq!(narrator["using"]["model"], "qwen3.5-27b");
+        assert_eq!(narrator["using"]["model_name"], Value::Null);
+        assert_eq!(
+            listed(&setup, &id)["models_in_use"],
+            Value::Null,
+            "only the command line tool has a model per job"
+        );
     }
 }

@@ -146,7 +146,8 @@ export const hints = {
     long:
       "Anything else is refused, including a redirect from an allowed site. A task with no sites " +
       "listed cannot browse at all. This is also what stops a page that looks like your bank " +
-      "from being treated as your bank.",
+      "from being treated as your bank. The same list decides what a task may put on your screen: " +
+      "a page opened in front of you at 7am has to be on it too.",
   },
   "task.limits": {
     short: "Ceilings on how long a run may take and what it may spend.",
@@ -248,6 +249,24 @@ export const hints = {
     long:
       "macOS grants that permission to whichever program asks, so Errand asks while you are " +
       "looking at the screen rather than at three in the morning when nobody can click Allow.",
+  },
+  "automation.what": {
+    short: "Something a task may do on the Mac itself, once macOS allows it.",
+    long:
+      "Not a way of reaching you: nothing here messages anybody. It is what a task may do on this " +
+      "machine, such as writing an answer into Notes or going through your post. macOS asks " +
+      "before allowing it, and until somebody answers that question the task stops when it gets " +
+      "there.",
+  },
+  "automation.enable": {
+    short: "Ask macOS now, while you are here to answer it.",
+    long:
+      "macOS gives the permission to whichever program asks, so Errand asks from its background " +
+      "service rather than from this window: asking from the window would grant it to the window " +
+      "and the eight o'clock run would still fail. Nothing is written and nothing is read; it " +
+      "asks the app a harmless question to make the prompt appear. If no prompt appears, macOS " +
+      "was told no at some point, and the switch is in System Settings under Privacy and " +
+      "Security, Automation.",
   },
   "channel.test": {
     short: "Send a real message to yourself, to prove the channel works.",
@@ -398,6 +417,29 @@ export const hints = {
   "task.unlink_person": {
     short: "Stop telling this person about this task.",
   },
+  "task.mail_grant": {
+    short: "Let this one task read your mail. It can never send, reply or delete.",
+    long:
+      "It gets a list of who each message is from and what it is about, and it can open a " +
+      "message when the summary is not enough. The model doing the job is what reads them, so " +
+      "unless you have turned on 'Keep everything on this machine' on the AI page, your mail " +
+      "goes to that service. Every message it opens is written into the run, by sender and " +
+      "subject, so you can see afterwards exactly what it looked at. No other task is affected.",
+  },
+  "task.mail_file": {
+    short: "Also let it move messages between mailboxes, which is how spam gets tidied away.",
+    long:
+      "Off unless you press it: being allowed to read your mail is not the same as being " +
+      "allowed to rearrange it. Errand cannot put a message back, so a run may move each " +
+      "message once and no more, and the run says which ones went where. Nothing is ever " +
+      "deleted; a message that moves is still in the mailbox it was moved to.",
+  },
+  "task.mail_revoke": {
+    short: "Take the mail away from this task. Its next run cannot even see the mail tools.",
+    long:
+      "This does not undo anything already read or moved, and what it read is still in the runs " +
+      "for you to look at. Other tasks keep whatever they were given.",
+  },
   "task.notify_when": {
     short: "Whether this person hears about runs that worked, that failed, or both. Press to change.",
     long:
@@ -433,6 +475,15 @@ export const hints = {
       "down does not stop a task. A model Errand has asked and found cannot use tools is shown " +
       "but cannot be picked for the task, with the reason. One nobody has checked can be picked: " +
       "not having asked is not the same as knowing it cannot.",
+  },
+  "ai.model": {
+    short: "Which Claude does this job.",
+    long:
+      "Opus is the biggest: it is the best at working out a page it has never seen before, and " +
+      "the most expensive to run. Sonnet is the middle one, and what Errand uses for the task " +
+      "itself unless you say otherwise. Haiku is the smallest and cheapest, and is fine for " +
+      "summarising a run or explaining why one failed. This changes only which model is asked; " +
+      "it changes nothing about what Errand is allowed to do on your behalf.",
   },
   "ai.tools": {
     short: "Whether this model can carry out a task, as opposed to only answering questions.",

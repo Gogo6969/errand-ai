@@ -207,17 +207,52 @@ fn iso_in(secs: i64) -> String {
     (chrono::Utc::now() + chrono::Duration::seconds(secs)).to_rfc3339()
 }
 
+/// The next time it is this hour where the person actually is, as an instant.
+///
+/// The conversion at the end is the whole job and it used to be wrong: a naive
+/// local time was stamped as UTC rather than converted, so a message held until
+/// seven in the morning went out at nine in Vienna and the evening before at
+/// UTC-11. Quiet hours exist precisely so a message does not arrive at a rude
+/// hour, and a timezone slip here delivers the one thing they prevent.
+///
+/// Daylight saving is handled the way core/src/schedule.rs handles it, because
+/// two answers to "when is 02:30" in one program is worse than either answer:
+/// a local time that never happened runs just after the gap, and an ambiguous
+/// one takes the first occurrence.
 fn next_hour_utc(local_hour: u32) -> String {
-    // Good enough: wake at the next occurrence of that local hour.
+    use chrono::{TimeZone, Timelike};
+
     let now = chrono::Local::now();
-    let mut t = now
-        .date_naive()
-        .and_hms_opt(local_hour, 0, 0)
-        .unwrap_or_else(|| now.naive_local());
-    if t <= now.naive_local() {
-        t += chrono::Duration::days(1);
+    let mut day = now.date_naive();
+    if now.hour() >= local_hour {
+        day += chrono::Duration::days(1);
     }
-    t.and_utc().to_rfc3339()
+
+    for extra in 0..3 {
+        let wanted = (day + chrono::Duration::days(extra))
+            .and_hms_opt(local_hour, 0, 0)
+            .expect("an hour of the day is always a valid time");
+        match chrono::Local.from_local_datetime(&wanted) {
+            // The ordinary case, and the ambiguous one: earliest() takes the
+            // first occurrence when the clocks have just gone back.
+            chrono::LocalResult::Single(t) => return t.with_timezone(&chrono::Utc).to_rfc3339(),
+            chrono::LocalResult::Ambiguous(t, _) => {
+                return t.with_timezone(&chrono::Utc).to_rfc3339()
+            }
+            // An hour that never happened, because the clocks went forward
+            // through it. Wait for the first moment that did.
+            chrono::LocalResult::None => {
+                let after = wanted + chrono::Duration::hours(1);
+                if let Some(t) = chrono::Local.from_local_datetime(&after).earliest() {
+                    return t.with_timezone(&chrono::Utc).to_rfc3339();
+                }
+            }
+        }
+    }
+
+    // Unreachable in practice: three days without that hour existing is not a
+    // timezone, it is a bug. An hour from now is a safe thing to do about it.
+    (chrono::Utc::now() + chrono::Duration::hours(1)).to_rfc3339()
 }
 
 /// Tell everybody who is meant to hear how a run went.
@@ -680,6 +715,42 @@ async fn narrate(state: &AppState, run_id: &str, task: &str, ok: bool, summary: 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_message_held_until_morning_really_goes_out_in_the_morning() {
+        // This caught a real bug: a local time was stamped as UTC rather than
+        // converted, so a message held until seven went out at nine in Vienna
+        // and the evening before at UTC-11. Quiet hours exist so a message does
+        // not arrive at a rude hour; getting the conversion wrong delivers the
+        // one thing they prevent. Asserted in local terms, since that is what
+        // the person experiences, and so it holds in any timezone the test runs
+        // in rather than only the one this machine happens to be set to.
+        use chrono::Timelike;
+
+        for hour in [0u32, 7, 13, 23] {
+            let iso = next_hour_utc(hour);
+            let at = chrono::DateTime::parse_from_rfc3339(&iso)
+                .expect("a real instant")
+                .with_timezone(&chrono::Local);
+
+            // Round-tripped back to the clock on the wall, it is the hour asked
+            // for. Away from a daylight-saving jump the minute is zero too; a
+            // zone that shifts by half an hour can legitimately land elsewhere.
+            assert_eq!(
+                at.hour(),
+                hour,
+                "asked for {hour} o'clock, got {at} (from {iso})"
+            );
+            assert!(
+                at > chrono::Local::now(),
+                "a message must wait for the next {hour} o'clock, not one that has gone: {at}"
+            );
+            assert!(
+                at < chrono::Local::now() + chrono::Duration::hours(25),
+                "the next {hour} o'clock is always within a day: {at}"
+            );
+        }
+    }
 
     #[test]
     fn backoff_grows_and_then_gives_up() {

@@ -41,6 +41,16 @@ pub fn backups_dir() -> Result<PathBuf> {
     Ok(data_root()?.join("backups"))
 }
 
+/// The one folder a run may write a file into, and the only one.
+///
+/// Named for the person rather than for the code, because they are the ones who
+/// have to find it in Finder. Everything else under the data root is Errand's
+/// own bookkeeping, so a run that could write anywhere under it could overwrite
+/// the database. This folder holds nothing but what a task produced.
+pub fn files_dir() -> Result<PathBuf> {
+    Ok(data_root()?.join("Errand Files"))
+}
+
 /// Lock file guaranteeing a single daemon per user session.
 pub fn runner_lock() -> Result<PathBuf> {
     Ok(data_root()?.join("runner.lock"))
@@ -68,6 +78,7 @@ pub fn ensure_dirs() -> Result<()> {
         playbooks_dir()?,
         profiles_dir()?,
         backups_dir()?,
+        files_dir()?,
     ] {
         std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     }

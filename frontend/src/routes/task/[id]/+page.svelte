@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount, onDestroy } from "svelte";
   import { page } from "$app/state";
-  import { api, channelName, followRun, statusLabel, when, ApiError, type Task, type Run, type TaskRecipient, type Recipient } from "$lib/api";
+  import { api, channelName, followRun, statusLabel, when, ApiError, type Task, type Run, type TaskRecipient, type Recipient, type MailGrant } from "$lib/api";
   import Hint from "$lib/components/Hint.svelte";
   import { headlineFor, hintFor, ranHeadline } from "$lib/taskState";
   import ScheduleEditor from "$lib/components/ScheduleEditor.svelte";
@@ -29,6 +29,10 @@
   let mustConfirm = $state<{ detail: string; patch: any } | null>(null);
   let people = $state<TaskRecipient[]>([]);
   let everyone = $state<Recipient[]>([]);
+  // Null means the daemon would not say, so the section is left off the page
+  // rather than drawn as "not allowed", which would be a claim rather than a
+  // silence.
+  let mail = $state<MailGrant | null>(null);
   let channelNames = $state<Record<string, string>>({});
   const named = (channel: string) => channelNames[channel] ?? channel.replace(/_/g, " ");
 
@@ -100,6 +104,9 @@
       try {
         [people, everyone] = await Promise.all([api.taskRecipients(id), api.recipients()]);
       } catch { people = []; everyone = []; }
+      try {
+        mail = await api.mailGrant(id);
+      } catch { mail = null; }
       // A recipient carries only a channel's id, and "imessage" is not a word
       // anybody uses. The names come from the daemon rather than a second list
       // kept here, which would drift away from it.
@@ -193,6 +200,12 @@
   }
 
   const unlinked = $derived(everyone.filter((r) => !people.some((p) => p.id === r.id)));
+
+  // Granting again with a different answer is how the moving half is turned on
+  // and off, the same upsert the recipient links use.
+  async function setMailAccess(mayFile: boolean) {
+    await act(() => api.grantMail(id, mayFile));
+  }
 
   // The report a finished run sends shares the task's message budget with the
   // agent's own sends, so linking more people than the limit allows means some
@@ -507,6 +520,51 @@
       </p>
     {/if}
   </div>
+
+  <!-- The most personal permission in the app, so the screen that grants it
+       says where the mail actually goes before it offers the button. The
+       sentence itself comes from the daemon, because whether your post leaves
+       this Mac depends on which model is doing the job, and the daemon is what
+       knows that. -->
+  {#if mail}
+    <h2>Reading your mail</h2>
+    <div class="card">
+      <p class="muted" style="margin:0 0 10px">
+        Switched on, this task can see what is in a mailbox, who each message is from and what it
+        is about, and can open individual messages. It can never send a message, reply to one, or
+        delete one. Moving messages, which is how spam gets tidied into Junk, is a separate
+        answer below.
+      </p>
+
+      <div class="warnbox" style="margin:0 0 12px">{mail.where_it_goes}</div>
+
+      {#if mail.granted}
+        <div class="row spread">
+          <div>
+            <strong>This task can read your mail.</strong>
+            <span class="muted"> · every message it opens is written into the run, by who it was
+              from and what it was about, and never its contents</span>
+          </div>
+          <div class="row" style="gap:6px">
+            <Hint id="task.mail_file">
+              <button
+                class="pill toggle {mail.may_file ? 'warn' : ''}"
+                disabled={busy}
+                onclick={() => setMailAccess(!mail!.may_file)}
+              >{mail.may_file ? "may move messages" : "cannot move messages"}</button>
+            </Hint>
+            <Hint id="task.mail_revoke">
+              <button disabled={busy} onclick={() => act(() => api.revokeMail(id))}>Take the mail away</button>
+            </Hint>
+          </div>
+        </div>
+      {:else}
+        <Hint id="task.mail_grant">
+          <button disabled={busy} onclick={() => setMailAccess(false)}>Let this task read my mail</button>
+        </Hint>
+      {/if}
+    </div>
+  {/if}
 
   <h2>How it does this job</h2>
   {#if plan?.active}

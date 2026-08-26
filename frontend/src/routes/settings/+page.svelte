@@ -1,11 +1,20 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { api, ApiError, channelName, type ChannelHealth, type Health, type Recipient } from "$lib/api";
+  import {
+    api, ApiError, channelName,
+    type AutomationApp, type ChannelHealth, type Health, type Recipient,
+  } from "$lib/api";
   import Hint from "$lib/components/Hint.svelte";
 
   let health = $state<Health | null>(null);
   let channels = $state<ChannelHealth[]>([]);
   let notes = $state<Record<string, string>>({});
+
+  // Apps on this Mac a task drives, which are not channels: nothing here
+  // messages anybody. They need the same macOS permission and so they need the
+  // same button, in the same place, or nobody ever finds it.
+  let apps = $state<AutomationApp[]>([]);
+  let appNotes = $state<Record<string, string>>({});
   let creds = $state<any[]>([]);
   let problem = $state<string | null>(null);
   let busy = $state(false);
@@ -49,6 +58,12 @@
       // action on this page, and wiping a half-typed number would be its own
       // small betrayal.
       for (const ch of channels) selfDraft[ch.channel] ??= "";
+      // Defensive: an older daemon knows about channels and not about the apps
+      // a task drives, and the rest of this page is still worth showing.
+      try {
+        const a = await api.automation();
+        apps = a.apps; appNotes = a.notes;
+      } catch { apps = []; }
       creds = await api.credentials();
       try { people = await api.recipients(); } catch { people = []; }
       // Defensive: an older daemon has no settings endpoint, and the rest of
@@ -74,19 +89,20 @@
   }
 
   /**
-   * Do something to one channel and answer on that channel's own card.
+   * Do something to one card and answer on that card.
    *
-   * Deliberately not act(): a failure from this button belongs beside the
-   * button, not in the box at the top of the page where nobody watching the
-   * button will see it.
+   * Used by the channels and by the apps below them, because a permission
+   * refused reads the same either way. Deliberately not act(): a failure from
+   * this button belongs beside the button, not in the box at the top of the
+   * page where nobody watching the button will see it.
    */
-  async function channelAct(
-    channel: string,
+  async function cardAct(
+    card: string,
     what: string,
     fn: () => Promise<unknown>,
     said: (result: any) => string | { ok: boolean; text: string },
   ): Promise<boolean> {
-    working = `${channel}:${what}`;
+    working = `${card}:${what}`;
     busy = true;
     try {
       const result = await fn();
@@ -94,11 +110,11 @@
       // caller may say otherwise: macOS answers a permission request without
       // necessarily having granted it.
       const answer = said(result);
-      outcome[channel] = typeof answer === "string" ? { ok: true, text: answer } : answer;
+      outcome[card] = typeof answer === "string" ? { ok: true, text: answer } : answer;
       await load();
       return true;
     } catch (e) {
-      outcome[channel] = { ok: false, text: e instanceof ApiError ? e.message : String(e) };
+      outcome[card] = { ok: false, text: e instanceof ApiError ? e.message : String(e) };
       return false;
     } finally {
       working = ""; busy = false;
@@ -106,7 +122,7 @@
   }
 
   function enableChannel(c: ChannelHealth) {
-    return channelAct(
+    return cardAct(
       c.channel, "enable",
       () => api.enableChannel(c.channel),
       // The daemon's own words for what it found, rather than a hopeful
@@ -118,9 +134,23 @@
     );
   }
 
+  function enableApp(a: AutomationApp) {
+    return cardAct(
+      a.app, "enable",
+      () => api.enableAutomation(a.app),
+      // The daemon's own words for what it found. macOS can answer a request
+      // without having granted anything, and "Enabled" printed in green over
+      // that is a lie the person only discovers at three in the morning.
+      (h) => ({
+        ok: h?.status === "ok",
+        text: typeof h?.detail === "string" ? h.detail : `${a.display_name} is switched on.`,
+      }),
+    );
+  }
+
   function testChannel(c: ChannelHealth) {
     const to = c.self_address ?? (c.channel === "telegram" ? "your Telegram chat" : "you");
-    return channelAct(
+    return cardAct(
       c.channel, "test",
       () => api.testChannel(c.channel),
       () =>
@@ -132,7 +162,7 @@
   async function saveSelf(c: ChannelHealth) {
     const value = (selfDraft[c.channel] ?? "").trim();
     if (!value) return;
-    const saved = await channelAct(
+    const saved = await cardAct(
       c.channel, "self",
       () => api.configureChannel(c.channel, {}, { [`messaging.self.${c.channel}`]: value }),
       () => `Saved. Tests on ${channelName(c)} now go to ${value}.`,
@@ -318,6 +348,42 @@
         </button>
       </Hint>
     </div>
+  </div>
+{/each}
+
+<h2>Apps on this Mac</h2>
+<p class="deck">
+  What a task may do on the Mac itself: write you a note, or go through your post. macOS grants
+  this to whichever program asks, so Errand asks from here, while you are looking at the screen.
+  Asking at three in the morning puts the question where nobody can answer it, and the task simply
+  stops.
+</p>
+{#each apps as a}
+  <div class="card">
+    <div class="row spread">
+      <div>
+        <Hint id="automation.what"><strong>{a.display_name}</strong></Hint>
+        <div class="muted" style="margin-top:4px">{a.detail}</div>
+        {#if a.fix}<div class="muted" style="margin-top:4px; color:var(--warn)">{a.fix}</div>{/if}
+        {#if appNotes[a.app]}
+          <div class="muted" style="margin-top:6px">{appNotes[a.app]}</div>
+        {/if}
+      </div>
+      <div class="row">
+        <Hint id="automation.enable">
+          <button disabled={busy} onclick={() => enableApp(a)}>
+            {working === `${a.app}:enable` ? "Asking macOS…" : "Enable"}
+          </button>
+        </Hint>
+        <span class="pill {cls(a.status)}">{a.status.replace("_", " ")}</span>
+      </div>
+    </div>
+
+    <!-- What that button did, beside the button that did it. -->
+    {#if outcome[a.app]}
+      {@const o = outcome[a.app]}
+      <div class="result {o.ok ? 'good' : 'bad'}">{o.text}</div>
+    {/if}
   </div>
 {/each}
 

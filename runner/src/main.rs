@@ -17,9 +17,11 @@ mod agent;
 mod api;
 mod browser;
 mod channels;
+mod desktop;
 mod executor;
 mod fixer;
 mod lock;
+mod mail;
 mod mcp;
 mod models;
 mod outbox;
@@ -475,6 +477,11 @@ async fn doctor() -> Result<u32> {
     // each of which used to surface as the same shrug at 08:00.
     problems += browsing_checks().await;
 
+    // The apps a task drives on this Mac. Same shape of question as the browser
+    // above: not "is it installed" but "will this work at 03:00 when there is
+    // nobody here to answer a prompt".
+    problems += automation_checks().await;
+
     // API reachable.
     //
     // The same port the runner would bind, ERRAND_API_PORT included. A doctor
@@ -614,6 +621,41 @@ async fn browsing_checks() -> u32 {
         _ => println!("  -  browser to drive: not checked, because of the problem above"),
     }
 
+    problems
+}
+
+/// Whether macOS will let a task write a note or read the post. Returns the
+/// number of apps it will not.
+///
+/// Asking is what makes macOS put its prompt on the screen, and that is the
+/// reason to ask here: somebody running doctor is sitting in front of the
+/// machine, which is the only place the prompt can be answered. Asking again
+/// once permission has been given costs a read that changes nothing and shows
+/// nobody a second prompt.
+async fn automation_checks() -> u32 {
+    let mut problems = 0;
+    for app in channels::apple::all_app_consent().await {
+        // A machine that was never asked: not a Mac, or a rehearsal. Neither is
+        // something to fix, and a failing line with nothing to do underneath it
+        // is exactly what this command exists not to print.
+        if app.status == "not_configured" {
+            println!("  -  {}: {}", app.display_name, app.detail);
+            continue;
+        }
+        println!(
+            "  {}  {}: {}",
+            tick(app.is_ok()),
+            app.display_name,
+            app.detail
+        );
+        if app.is_ok() {
+            continue;
+        }
+        problems += 1;
+        if let Some(fix) = &app.fix {
+            print_fix(fix);
+        }
+    }
     problems
 }
 

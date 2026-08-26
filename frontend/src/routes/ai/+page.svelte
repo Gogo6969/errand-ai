@@ -124,6 +124,16 @@
   const toolsDot = (p: ListedProvider) =>
     p.tools === "yes" ? "ok" : p.cannot_carry_out_because ? "warn" : "";
 
+  /**
+   * Which model this endpoint is using, said next to its name.
+   *
+   * The complaint this answers: the row read "Claude (command line tool)" and
+   * stopped, so somebody who chooses between Opus, Sonnet and Haiku everywhere
+   * else could not find out which one Errand had picked. The command line tool
+   * has one per job, so its answer is a sentence rather than a name.
+   */
+  const modelLine = (p: ListedProvider) => p.models_in_use ?? p.model ?? "";
+
   async function runScan() {
     busy = true;
     try {
@@ -223,13 +233,35 @@
         {:else if r.using}
           <div class="using">
             <span class="pill ok">{r.using.label}</span>
-            <span class="mono">{r.using.model}</span>
+            <!-- The Claude command line tool answers to three models, so naming
+                 the provider does not answer "which one is it". Where there is
+                 a choice it is made here; where there is not, the model is
+                 still said rather than left to be guessed at. -->
+            {#if r.using.can_choose_model}
+              <Hint id="ai.model">
+                <select
+                  class="model"
+                  disabled={busy}
+                  value={r.using.model}
+                  onchange={(e) => act(() => api.setRoleModel(r.role, (e.currentTarget as HTMLSelectElement).value))}
+                >
+                  {#each setup.claude_models as m}
+                    <option value={m.alias}>{m.name}</option>
+                  {/each}
+                </select>
+              </Hint>
+            {:else}
+              <span class="mono">{r.using.model}</span>
+            {/if}
             <Hint id="ai.local">
               <span class="pill {r.using.local ? 'ok' : ''}">
                 {r.using.local ? "Stays on your machine" : "Leaves your machine"}
               </span>
             </Hint>
           </div>
+          {#if r.using.model_says}
+            <div class="muted">{r.using.model_says}</div>
+          {/if}
           {#if r.fallbacks.length}
             <div class="muted">If that is unavailable: {r.fallbacks.join(", ")}</div>
           {/if}
@@ -297,7 +329,7 @@
           </Hint>
           {#if !p.enabled}<span class="pill">Switched off</span>{/if}
         </div>
-        <div class="muted">{where(p)}{p.base_url ? ` · ${p.base_url}` : ""}{p.model ? ` · ${p.model}` : ""}</div>
+        <div class="muted">{where(p)}{p.base_url ? ` · ${p.base_url}` : ""}{modelLine(p) ? ` · ${modelLine(p)}` : ""}</div>
         {#if p.health_detail}<div class="muted detail">{p.health_detail}</div>{/if}
         {#if checked[p.id]}<div class="checked">{checked[p.id]}</div>{/if}
       </div>
@@ -499,6 +531,9 @@
   .role.idle { opacity: 0.72; }
   .rname { font-weight: 600; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
   .using { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  /* Sized to the name in it, so the model chooser sits on the line beside the
+     provider rather than pushing everything else onto its own row. */
+  .using select.model { width: auto; font-size: 12.5px; padding: 2px 6px; }
   .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px; color: var(--ink-soft); }
   .detail { word-break: break-word; }
   /* The answer to "Check", on the row that was asked. Stays visible until the

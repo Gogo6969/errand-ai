@@ -683,6 +683,147 @@ pub fn default_model_for(role: Role) -> &'static str {
     }
 }
 
+// ------------------------------------------------- which Claude, exactly --
+//
+// The Claude command line tool is one endpoint that answers to three models,
+// so "which model is Errand using" has no answer in its provider row: the
+// answer is per job. This is where that choice lives, so the screen and the
+// run read it from the same place and cannot disagree.
+
+/// One of the Claude models the command line tool will answer to.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct ClaudeModel {
+    /// The name passed to the tool. An alias rather than a dated id
+    /// ("sonnet", not "claude-sonnet-4-5-20250929") because the alias keeps
+    /// working when a new version lands, and a dated id stops existing at
+    /// seven in the morning in a run nobody is watching.
+    pub alias: &'static str,
+    /// What it is called where a person reads it.
+    pub name: &'static str,
+    /// What picking it means, said so somebody can act on it.
+    pub what_it_is_for: &'static str,
+}
+
+/// The three that exist, biggest first.
+pub const CLAUDE_MODELS: &[ClaudeModel] = &[
+    ClaudeModel {
+        alias: "opus",
+        name: "Opus",
+        what_it_is_for: "The biggest. Best at working out a page it has never seen before, and \
+                         the most expensive to run.",
+    },
+    ClaudeModel {
+        alias: "sonnet",
+        name: "Sonnet",
+        what_it_is_for: "The middle one, and what Errand uses for carrying out a task unless you \
+                         say otherwise.",
+    },
+    ClaudeModel {
+        alias: "haiku",
+        name: "Haiku",
+        what_it_is_for: "The smallest and cheapest. Fine for summarising a run or explaining why \
+                         one failed; it will struggle to find its way round an unfamiliar site.",
+    },
+];
+
+/// The model behind a name, if it is one Errand can ask for.
+pub fn claude_model(alias: &str) -> Option<&'static ClaudeModel> {
+    CLAUDE_MODELS.iter().find(|m| m.alias == alias)
+}
+
+/// The name to show for a model, so a sentence written for a person does not
+/// read "sonnet" in the middle of it.
+pub fn claude_model_name(alias: &str) -> &str {
+    claude_model(alias).map(|m| m.name).unwrap_or(alias)
+}
+
+/// Which Claude each job has been set to use, by role name.
+///
+/// A settings entry rather than a column on the provider, because the provider
+/// is one row and the choice is per job: the same tool is asked for Opus while
+/// it drives a browser and Haiku while it writes the summary afterwards.
+pub type ClaudeModels = std::collections::BTreeMap<String, String>;
+
+/// Where that choice is written down.
+pub const CLAUDE_MODELS_KEY: &str = "ai.claude_models";
+
+/// Read it back, keeping only what can actually be asked for.
+///
+/// Anything unrecognised is dropped rather than carried through, so the worst a
+/// stale or hand-edited entry can do is put a job back on its default. Passing
+/// a name the tool does not know would fail the run instead.
+pub fn read_claude_models(stored: Option<&serde_json::Value>) -> ClaudeModels {
+    let mut chosen = ClaudeModels::new();
+    let Some(obj) = stored.and_then(|v| v.as_object()) else {
+        return chosen;
+    };
+    for (role, value) in obj {
+        if Role::parse(role).is_none() {
+            continue;
+        }
+        if let Some(m) = value.as_str().and_then(claude_model) {
+            chosen.insert(role.clone(), m.alias.to_string());
+        }
+    }
+    chosen
+}
+
+/// The same choice, ready to be written back.
+pub fn write_claude_models(chosen: &ClaudeModels) -> serde_json::Value {
+    serde_json::Value::Object(
+        chosen
+            .iter()
+            .map(|(role, alias)| (role.clone(), serde_json::Value::String(alias.clone())))
+            .collect(),
+    )
+}
+
+/// Which Claude this job asks for: the choice if there is one, the default if
+/// not.
+///
+/// Always one of the three, whatever is in the settings entry, because this is
+/// what reaches the command line tool.
+pub fn claude_model_for(role: Role, chosen: &ClaudeModels) -> &'static str {
+    chosen
+        .get(role.as_str())
+        .and_then(|alias| claude_model(alias))
+        .map(|m| m.alias)
+        .unwrap_or_else(|| default_model_for(role))
+}
+
+/// What to say next to the Claude command line tool in a list of models.
+///
+/// Grouped by model rather than listed job by job, because four lines of "x
+/// does y" is a paragraph and the question actually being asked is only ever
+/// "which one is it".
+pub fn claude_models_summary(chosen: &ClaudeModels) -> String {
+    let mut groups: Vec<(&'static str, Vec<&'static str>)> = vec![];
+    for role in Role::ALL {
+        let name = claude_model_name(claude_model_for(role, chosen));
+        match groups.iter_mut().find(|(n, _)| *n == name) {
+            Some((_, jobs)) => jobs.push(role.plain()),
+            None => groups.push((name, vec![role.plain()])),
+        }
+    }
+    if let [(only, _)] = groups.as_slice() {
+        return (*only).to_string();
+    }
+    groups
+        .iter()
+        .map(|(name, jobs)| format!("{name} for {}", listed_plainly(jobs)))
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
+/// "a", "a and b", "a, b and c".
+fn listed_plainly(items: &[&str]) -> String {
+    match items {
+        [] => String::new(),
+        [one] => (*one).to_string(),
+        [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
+    }
+}
+
 /// Where a role's question should go, given what is configured.
 ///
 /// Returns the chain to try in order. A chain rather than one answer because a
@@ -1173,6 +1314,114 @@ mod tests {
         // Anthropic is deliberately absent: it does not speak this format, and
         // Errand talks to it properly through its own transport instead.
         assert!(known("anthropic").is_none());
+    }
+
+    #[test]
+    fn the_three_claudes_are_offered_by_the_names_the_tool_keeps_accepting() {
+        // A dated id works until the day it does not, and that day arrives in
+        // the middle of a run nobody is watching. Aliases do not expire.
+        let offered: Vec<&str> = CLAUDE_MODELS.iter().map(|m| m.alias).collect();
+        assert_eq!(offered, ["opus", "sonnet", "haiku"]);
+        for m in CLAUDE_MODELS {
+            assert!(!m.alias.contains('-'), "{} looks like a dated id", m.alias);
+            assert!(
+                !m.name.is_empty(),
+                "{} needs a name a person reads",
+                m.alias
+            );
+            assert!(
+                m.what_it_is_for.len() > 40,
+                "{} has to say what picking it means",
+                m.alias
+            );
+        }
+        assert!(claude_model("opus").is_some());
+        assert!(claude_model("claude-3-opus-20240229").is_none());
+        assert_eq!(claude_model_name("haiku"), "Haiku");
+    }
+
+    #[test]
+    fn a_person_who_never_touches_this_keeps_exactly_the_models_they_had() {
+        // The whole point of a default is that nothing changes for anybody who
+        // does not care that the choice now exists.
+        let untouched = ClaudeModels::new();
+        assert_eq!(claude_model_for(Role::Executor, &untouched), "sonnet");
+        assert_eq!(claude_model_for(Role::Planner, &untouched), "sonnet");
+        assert_eq!(claude_model_for(Role::Fixer, &untouched), "haiku");
+        assert_eq!(claude_model_for(Role::Narrator, &untouched), "haiku");
+        for role in Role::ALL {
+            assert_eq!(
+                claude_model_for(role, &untouched),
+                default_model_for(role),
+                "{} changed under somebody who never chose anything",
+                role.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn choosing_a_model_for_one_job_leaves_the_other_three_alone() {
+        let mut chosen = ClaudeModels::new();
+        chosen.insert("executor".into(), "opus".into());
+        assert_eq!(claude_model_for(Role::Executor, &chosen), "opus");
+        assert_eq!(claude_model_for(Role::Narrator, &chosen), "haiku");
+
+        // And it survives being written down and read back.
+        let stored = write_claude_models(&chosen);
+        assert_eq!(read_claude_models(Some(&stored)), chosen);
+        assert!(read_claude_models(None).is_empty());
+    }
+
+    #[test]
+    fn a_model_name_errand_cannot_ask_for_is_dropped_rather_than_passed_on() {
+        // Whatever is in the settings entry, what reaches the command line tool
+        // has to be a name it accepts, or the run fails at the moment the task
+        // was meant to happen.
+        let odd = serde_json::json!({
+            "executor": "claude-4-ultra",
+            "fixer": "opus",
+            "gardener": "opus",
+            "narrator": 3,
+        });
+        let back = read_claude_models(Some(&odd));
+        assert_eq!(back.get("fixer"), Some(&"opus".to_string()));
+        assert_eq!(
+            back.len(),
+            1,
+            "only what can be asked for survives: {back:?}"
+        );
+        assert_eq!(
+            claude_model_for(Role::Executor, &back),
+            "sonnet",
+            "a name that cannot be used falls back to the default"
+        );
+        for role in Role::ALL {
+            assert!(
+                claude_model(claude_model_for(role, &back)).is_some(),
+                "{} would be asked for something that does not exist",
+                role.as_str()
+            );
+        }
+    }
+
+    #[test]
+    fn the_list_of_models_can_say_which_claude_is_doing_what() {
+        // "Claude (command line tool)" with nothing after it is the complaint.
+        // This is the line that answers it next to the name.
+        let summary = claude_models_summary(&ClaudeModels::new());
+        assert!(summary.contains("Sonnet"), "{summary}");
+        assert!(summary.contains("Haiku"), "{summary}");
+        assert!(
+            summary.contains(Role::Executor.plain()),
+            "it has to say which job gets the better model: {summary}"
+        );
+
+        // One model everywhere is said once, not four times.
+        let mut all_opus = ClaudeModels::new();
+        for role in Role::ALL {
+            all_opus.insert(role.as_str().into(), "opus".into());
+        }
+        assert_eq!(claude_models_summary(&all_opus), "Opus");
     }
 
     #[test]

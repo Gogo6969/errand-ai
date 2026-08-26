@@ -82,6 +82,23 @@ export interface ChannelHealth {
 }
 
 /**
+ * One app on this Mac Errand may drive, and whether macOS will let it.
+ *
+ * Not a channel: nothing here messages anybody. The fields match ChannelHealth
+ * where they mean the same thing, so a card can be drawn the same way, and
+ * there is no self_address because this is not a way of reaching anyone.
+ */
+export interface AutomationApp {
+  /** The internal id, e.g. "mail_reading". For URLs, never for reading. */
+  app: string;
+  /** What a person calls it: "Apple Notes". This is what goes on screen. */
+  display_name: string;
+  status: string;
+  detail: string;
+  fix?: string;
+}
+
+/**
  * The name to put on screen for a channel.
  *
  * The daemon sends display_name, but the window and the daemon are updated
@@ -213,6 +230,13 @@ export const api = {
   testChannel: (c: string) =>
     call<{ queued: string; sent_to: string; note: string }>("POST", `/v1/channels/${c}/test`),
   enableChannel: (c: string) => call<ChannelHealth>("POST", `/v1/channels/${c}/enable`),
+
+  // Asking macOS is the same act as checking, so loading this is what puts the
+  // prompt on the screen. That is the point: somebody is looking at it now.
+  automation: () =>
+    call<{ apps: AutomationApp[]; notes: Record<string, string> }>("GET", "/v1/automation"),
+  enableAutomation: (app: string) =>
+    call<AutomationApp>("POST", `/v1/automation/${app}/enable`),
   configureChannel: (
     c: string,
     secrets: Record<string, string>,
@@ -237,6 +261,11 @@ export const api = {
   unlinkRecipient: (taskId: string, recipientId: string) =>
     call("DELETE", `/v1/tasks/${taskId}/recipients/${recipientId}`),
 
+  mailGrant: (taskId: string) => call<MailGrant>("GET", `/v1/tasks/${taskId}/mail`),
+  grantMail: (taskId: string, mayFile: boolean) =>
+    call<MailGrant>("POST", `/v1/tasks/${taskId}/mail`, { may_file: mayFile }),
+  revokeMail: (taskId: string) => call("DELETE", `/v1/tasks/${taskId}/mail`),
+
   ai: () => call<AiSetup>("GET", "/v1/ai"),
   aiCatalogue: () => call<{ services: KnownService[] }>("GET", "/v1/ai/catalogue").then((r) => r.services),
   saveProvider: (p: SaveProvider) => call<{ id: string; health: string; health_detail: string }>("POST", "/v1/ai/providers", p),
@@ -250,6 +279,9 @@ export const api = {
     call<ScanResult>("POST", `/v1/ai/discover?scan_network=${scanNetwork}`),
   bindRole: (role: string, providerId: string | null) =>
     call("POST", `/v1/ai/roles/${role}`, { provider_id: providerId }),
+  /** Which Claude does this job. Null puts it back on whichever Errand picks. */
+  setRoleModel: (role: string, model: string | null) =>
+    call<{ role: string; model: string }>("POST", `/v1/ai/roles/${role}/model`, { model }),
   setLocalOnly: (enabled: boolean) => call("POST", "/v1/ai/local-only", { enabled }),
   saveAnthropicKey: (key: string) => call("POST", "/v1/ai/anthropic-key", { key }),
 };
@@ -293,6 +325,22 @@ export interface TaskRecipient extends Recipient {
   on_failure: boolean;
 }
 
+/**
+ * What one task may do with the person's mail, and where that mail then goes.
+ *
+ * `where_it_goes` is written by the daemon and shown as it arrives. It is the
+ * one sentence in the app that must not drift: it says whether reading somebody's
+ * post means sending it off this Mac, and that depends on how the models are set
+ * up, which the daemon knows and this screen does not.
+ */
+export interface MailGrant {
+  granted: boolean;
+  may_file: boolean;
+  granted_at?: string | null;
+  local_only: boolean;
+  where_it_goes: string;
+}
+
 /** What a scan turned up, including what it could not use. */
 export interface ScanResult {
   found: Provider[];
@@ -332,6 +380,21 @@ export interface ListedProvider extends Provider {
   tools_says: string;
   /** Set only where Errand has actually found it wanting. Never for "not checked". */
   cannot_carry_out_because: string | null;
+  /**
+   * Which models this endpoint is using, where that is not one answer.
+   *
+   * Only the Claude command line tool: it answers to three, one per job, so its
+   * `model` is empty and this is what says which one is doing what.
+   */
+  models_in_use: string | null;
+}
+
+/** One of the Claude models the command line tool answers to. */
+export interface ClaudeModel {
+  /** What Errand asks for. An alias, so it survives a new version landing. */
+  alias: string;
+  name: string;
+  what_it_is_for: string;
 }
 
 export interface SaveProvider {
@@ -369,7 +432,19 @@ export interface RoleSetup {
   chosen: string | null;
   /** Why the model picked for this job cannot do it, when that turns out to be so. */
   chosen_problem: string | null;
-  using: { id: string; label: string; model: string; local: boolean } | null;
+  using: {
+    id: string;
+    label: string;
+    /** Exactly what Errand asks that endpoint for. */
+    model: string;
+    /** The same model as a person would name it. Null where there is no choice. */
+    model_name: string | null;
+    /** What using this one means. Null where there is no choice. */
+    model_says: string | null;
+    /** True only for the Claude command line tool, the one endpoint with a choice. */
+    can_choose_model: boolean;
+    local: boolean;
+  } | null;
   fallbacks: string[];
   problem: string | null;
 }
@@ -377,6 +452,8 @@ export interface RoleSetup {
 export interface AiSetup {
   providers: ListedProvider[];
   roles: RoleSetup[];
+  /** The three the Claude command line tool accepts, so no screen invents its own. */
+  claude_models: ClaudeModel[];
   local_only: boolean;
 }
 

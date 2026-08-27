@@ -170,6 +170,12 @@ pub struct Listing {
     /// your unread post" off the back of the first would be a lie that reads
     /// exactly like the truth.
     pub checked: usize,
+    /// Whether the walk gave up before it had looked everywhere it meant to.
+    ///
+    /// Said by the walk itself rather than worked out from the count, because
+    /// only the walk knows whether it stopped because it was finished or
+    /// because it ran out of time.
+    pub short: bool,
     /// Messages Mail handed over with no message id.
     ///
     /// Counted rather than dropped in silence: an id is the only way a later
@@ -391,6 +397,12 @@ fn from_stderr(stderr: &str) -> MailError {
 const HANDLERS: &str = r#"on findBox(boxName)
 	tell application "Mail"
 		if boxName is "" then return inbox
+		if boxName starts with "acct:" then
+			try
+				return mailbox "INBOX" of account (text 6 thru -1 of boxName)
+			end try
+			return missing value
+		end if
 		try
 			return mailbox boxName
 		end try
@@ -472,16 +484,87 @@ end clip
 /// or it got through the whole window. Otherwise a sentence naming how far it
 /// reached, because "your unread post" and "the unread post in the thirty I
 /// could look at" are different claims and only one of them is true.
-pub fn stopped_short(found: &Listing, limit: usize, unread_only: bool) -> Option<String> {
-    if !unread_only || found.messages.len() >= limit || found.checked >= SCAN_FOR_UNREAD {
+pub fn stopped_short(found: &Listing, limit: usize, _unread_only: bool) -> Option<String> {
+    if !found.short || found.messages.len() >= limit {
         return None;
     }
     Some(format!(
-        "Mail was slow enough that only the {} most recent messages could be looked at, out of \
-         the {SCAN_FOR_UNREAD} this search covers, so there may be older unread post it did not \
-         reach. Say so rather than calling this the whole of it.",
+        "Mail was slow enough that only {} messages could be looked at, out of the \
+         {SCAN_FOR_UNREAD} of the most recent that this search covers, so there may be older \
+         unread post it did not reach. Say so rather than calling this the whole of it.",
         found.checked
     ))
+}
+
+/// Turn what the script printed into a listing.
+///
+/// Split from the call for the same reason the script is: nothing in the suite
+/// can reach a real mailbox, so what this module can be held to is the shape of
+/// what it asks and what it makes of the answer.
+fn parse_listing(reply: &str) -> Listing {
+    let mut messages = vec![];
+    let mut stamps: Vec<i64> = vec![];
+    let mut unaddressable = 0;
+    let mut checked = 0usize;
+    let mut short = false;
+    for line in reply.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if line.trim() == "!no-id" {
+            unaddressable += 1;
+            continue;
+        }
+        if let Some(n) = line.trim().strip_prefix("!checked\t") {
+            checked = n.trim().parse().unwrap_or(0);
+            continue;
+        }
+        if line.trim() == "!short" {
+            short = true;
+            continue;
+        }
+        let mut f = line.split('\t');
+        let (Some(from_box), Some(at), Some(id), Some(sender), Some(subject), Some(date)) =
+            (f.next(), f.next(), f.next(), f.next(), f.next(), f.next())
+        else {
+            unaddressable += 1;
+            continue;
+        };
+        let Ok(at) = at.trim().parse::<usize>() else {
+            unaddressable += 1;
+            continue;
+        };
+        // The mailbox each message came from, not the one that was asked for:
+        // the inbox is walked per account, so "the inbox" is several mailboxes
+        // and an id has to name the one it belongs to.
+        let stamp: i64 = f.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
+        stamps.push(stamp);
+        messages.push(Summary {
+            id: locator_id(from_box.trim(), at, id.trim()),
+            sender: sender.trim().to_string(),
+            subject: subject.trim().to_string(),
+            date: date.trim().to_string(),
+            preview: f.next().unwrap_or_default().trim().to_string(),
+        });
+    }
+    // Newest first, across all of them.
+    //
+    // One mailbox hands its messages over in its own order and Errand leaves
+    // that alone. Several mailboxes have no shared order at all, and listing
+    // one account's post and then the next one's would put a fortnight-old
+    // message above this morning's. So when the walk covered more than one
+    // mailbox they are put back in the order a person means by "most recent".
+    if !stamps.is_empty() && stamps.iter().any(|&s| s != stamps[0]) {
+        let mut together: Vec<(i64, Summary)> = stamps.iter().copied().zip(messages).collect();
+        together.sort_by(|a, b| b.0.cmp(&a.0));
+        messages = together.into_iter().map(|(_, m)| m).collect();
+    }
+    Listing {
+        messages,
+        checked,
+        short,
+        unaddressable,
+    }
 }
 
 /// The script one listing runs, built where a test can read it.
@@ -490,94 +573,167 @@ pub fn stopped_short(found: &Listing, limit: usize, unread_only: bool) -> Option
 /// in the suite can reach a real mailbox, so what this module can be held to is
 /// the shape of what it asks Mail, and that is only checkable if it is a string
 /// somebody can get hold of.
-fn listing_script(box_line: &str, scan: usize, limit: usize, unread_only: bool) -> String {
+fn listing_script(box_name: &str, scan: usize, limit: usize, unread_only: bool) -> String {
+    // Which mailboxes to walk, and what to call each one in the ids it hands
+    // back.
+    //
+    // Mail's `inbox` is the one it aggregates across every account, and asking
+    // it for a message by index is far slower than asking an account's own
+    // INBOX: measured on this machine, the aggregate managed twenty-five
+    // messages in twenty-five seconds where an account's inbox got through two
+    // hundred and found an unread message the aggregate never reached. So the
+    // inbox is walked per account. Anything else is the one mailbox asked for.
+    //
+    // The tag is what goes into every id from that mailbox, so a later read
+    // comes back to the same account rather than to whichever account happens
+    // to answer to that mailbox name first.
+    let boxes = if box_name.is_empty() {
+        r#"set boxes to {}
+set tags to {}
+tell application "Mail"
+	repeat with a in accounts
+		try
+			set end of boxes to mailbox "INBOX" of a
+			set end of tags to ("acct:" & (name of a))
+		end try
+	end repeat
+	if (count of boxes) is 0 then
+		set boxes to {inbox}
+		set tags to {""}
+	end if
+end tell"#
+            .to_string()
+    } else {
+        format!(
+            "set theBox to my findBox(\"{}\")\n\
+             if theBox is missing value then return \"!no-mailbox\"\n\
+             set boxes to {{theBox}}\n\
+             set tags to {{\"{}\"}}",
+            escape(box_name),
+            escape(box_name)
+        )
+    };
+
+    // Picking which messages in one mailbox to hand back. Unread asks Mail
+    // about a chunk at a time and watches the clock; everything else takes them
+    // in the order the mailbox gives them and asks nothing about read status.
+    let picks = if unread_only {
+        format!(
+            "\t\t\trepeat with startAt from 1 to howMany by {UNREAD_CHUNK}\n\
+             \t\t\t\tset endAt to startAt + {UNREAD_CHUNK} - 1\n\
+             \t\t\t\tif endAt > howMany then set endAt to howMany\n\
+             \t\t\t\tset flags to read status of messages startAt thru endAt of theBox\n\
+             \t\t\t\trepeat with j from 1 to (count of flags)\n\
+             \t\t\t\t\tif item j of flags is false then\n\
+             \t\t\t\t\t\tset end of picks to (startAt + j - 1)\n\
+             \t\t\t\t\t\tif (count of picks) + found is {limit} then exit repeat\n\
+             \t\t\t\t\tend if\n\
+             \t\t\t\tend repeat\n\
+             \t\t\t\tset checked to checked + (endAt - startAt + 1)\n\
+             \t\t\t\tif (count of picks) + found is {limit} then exit repeat\n\
+             \t\t\t\tif ((current date) - t0) > {WALK_DEADLINE_S} then\n\
+             \t\t\t\t\tif endAt < howMany then set shortWalk to true\n\
+             \t\t\t\t\texit repeat\n\
+             \t\t\t\tend if\n\
+             \t\t\tend repeat"
+        )
+    } else {
+        format!(
+            "\t\t\trepeat with i from 1 to howMany\n\
+             \t\t\t\tset end of picks to i\n\
+             \t\t\t\tset checked to checked + 1\n\
+             \t\t\t\tif (count of picks) + found is {limit} then exit repeat\n\
+             \t\t\tend repeat"
+        )
+    };
+
     format!(
         r#"{handlers}
-{box_line}
-if theBox is missing value then return "!no-mailbox"
+{boxes}
 tell application "Mail"
-	set total to (count of messages of theBox)
-	set howMany to {scan}
-	if howMany > total then set howMany to total
 	set out to ""
-	set picks to {{}}
 	set checked to 0
-	if howMany > 0 then
+	set found to 0
+	set shortWalk to false
+	set t0 to current date
+	-- Something to measure dates against, built rather than parsed. A date
+	-- written out as text is read in this Mac's own language and format, so
+	-- `date "Thursday, 1 January 1970 at 00:00:00"` is a syntax error on a Mac
+	-- that does not write dates that way, and the listing failed with one.
+	-- Minutes rather than seconds because AppleScript turns integers this large
+	-- into reals, and a real reaches Errand as "1.767E+9", which is not a
+	-- number it can read back.
+	set zeroDate to current date
+	set day of zeroDate to 1
+	set year of zeroDate to 1970
+	set month of zeroDate to January
+	set time of zeroDate to 0
+	repeat with bi from 1 to (count of boxes)
+		if found is {limit} then exit repeat
+		if ((current date) - t0) > {WALK_DEADLINE_S} then
+			set shortWalk to true
+			exit repeat
+		end if
+		set theBox to item bi of boxes
+		set theTag to item bi of tags
+		set total to (count of messages of theBox)
+		set howMany to {scan}
+		if howMany > total then set howMany to total
+		set picks to {{}}
+		if howMany > 0 then
 {picks}
-	end if
-	repeat with i in picks
-		set i to i as integer
-		set m to missing value
-		try
-			set m to message i of theBox
-		end try
-		if m is missing value then
-			set out to out & "!no-id" & linefeed
-		else
-			set theId to ""
+		end if
+		repeat with i in picks
+			set i to i as integer
+			set m to missing value
 			try
-				set theId to my flat(message id of m)
+				set m to message i of theBox
 			end try
-			if theId is "" then
+			if m is missing value then
 				set out to out & "!no-id" & linefeed
 			else
-			set snd to ""
-			set subj to ""
-			set dt to ""
-			set pv to ""
-			try
-				set snd to my flat(sender of m)
-			end try
-			try
-				set subj to my flat(subject of m)
-			end try
-			try
-				set dt to my flat((date received of m) as string)
-			end try
-			try
-				set pv to my flat(my clip(content of m, {PREVIEW_CHARS}))
-			end try
-			set out to out & i & tab & theId & tab & snd & tab & subj & tab & dt & tab & pv & linefeed
+				set theId to ""
+				try
+					set theId to my flat(message id of m)
+				end try
+				if theId is "" then
+					set out to out & "!no-id" & linefeed
+				else
+					set snd to ""
+					set subj to ""
+					set dt to ""
+					set stamp to 0
+					set pv to ""
+					try
+						set snd to my flat(sender of m)
+					end try
+					try
+						set subj to my flat(subject of m)
+					end try
+					try
+						set dt to my flat((date received of m) as string)
+					end try
+					try
+						set stamp to ((date received of m) - zeroDate) div 60
+					end try
+					try
+						set pv to my flat(my clip(content of m, {PREVIEW_CHARS}))
+					end try
+					set found to found + 1
+					set out to out & theTag & tab & i & tab & theId & tab & snd & tab & subj & tab & dt & tab & stamp & tab & pv & linefeed
+				end if
 			end if
-		end if
+		end repeat
 	end repeat
+	if shortWalk then set out to out & "!short" & linefeed
 	return out & "!checked" & tab & checked & linefeed
 end tell
 "#,
         handlers = HANDLERS,
+        boxes = boxes,
+        picks = picks,
         scan = scan,
-        picks = if unread_only {
-            // A chunk at a time, and it gives up on its own clock rather than
-            // on Errand's. One question covers a chunk's read status; only the
-            // few that come back unread are then asked about themselves.
-            format!(
-                "\t\tset t0 to current date\n\
-                 \t\trepeat with startAt from 1 to howMany by {UNREAD_CHUNK}\n\
-                 \t\t\tset endAt to startAt + {UNREAD_CHUNK} - 1\n\
-                 \t\t\tif endAt > howMany then set endAt to howMany\n\
-                 \t\t\tset flags to read status of messages startAt thru endAt of theBox\n\
-                 \t\t\trepeat with j from 1 to (count of flags)\n\
-                 \t\t\t\tif item j of flags is false then\n\
-                 \t\t\t\t\tset end of picks to (startAt + j - 1)\n\
-                 \t\t\t\t\tif (count of picks) is {limit} then exit repeat\n\
-                 \t\t\t\tend if\n\
-                 \t\t\tend repeat\n\
-                 \t\t\tset checked to endAt\n\
-                 \t\t\tif (count of picks) is {limit} then exit repeat\n\
-                 \t\t\tif ((current date) - t0) > {WALK_DEADLINE_S} then exit repeat\n\
-                 \t\tend repeat"
-            )
-        } else {
-            // Nothing to select on, so nothing is asked about read status at
-            // all: the cheap path stays the cheap path.
-            format!(
-                "\t\trepeat with i from 1 to howMany\n\
-                 \t\t\tset end of picks to i\n\
-                 \t\t\tset checked to i\n\
-                 \t\t\tif (count of picks) is {limit} then exit repeat\n\
-                 \t\tend repeat"
-            )
-        },
+        limit = limit,
     )
 }
 
@@ -600,7 +756,6 @@ pub async fn list(
     // An empty name means the inbox, here and in every id this listing hands
     // out, so a message can be found again the same way it was found first.
     let box_name = mailbox.unwrap_or("");
-    let box_line = format!("set theBox to my findBox(\"{}\")", escape(box_name));
     // Reach for messages one at a time by index, never the whole collection.
     //
     // `messages of theBox` asks Mail to hand over every message in the mailbox
@@ -625,7 +780,7 @@ pub async fn list(
     // asked about themselves.
     let scan = if unread_only { SCAN_FOR_UNREAD } else { limit };
 
-    let script = listing_script(&box_line, scan, limit, unread_only);
+    let script = listing_script(box_name, scan, limit, unread_only);
 
     let reply = osascript(&script).await?;
     if reply.trim() == "!no-mailbox" {
@@ -634,47 +789,8 @@ pub async fn list(
         ));
     }
 
-    let mut messages = vec![];
-    let mut unaddressable = 0;
-    let mut checked = 0usize;
-    for line in reply.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if line.trim() == "!no-id" {
-            unaddressable += 1;
-            continue;
-        }
-        if let Some(n) = line.trim().strip_prefix("!checked\t") {
-            checked = n.trim().parse().unwrap_or(0);
-            continue;
-        }
-        let mut f = line.split('\t');
-        let (Some(at), Some(id), Some(sender), Some(subject), Some(date)) =
-            (f.next(), f.next(), f.next(), f.next(), f.next())
-        else {
-            unaddressable += 1;
-            continue;
-        };
-        let Ok(at) = at.trim().parse::<usize>() else {
-            unaddressable += 1;
-            continue;
-        };
-        messages.push(Summary {
-            id: locator_id(box_name, at, id.trim()),
-            sender: sender.trim().to_string(),
-            subject: subject.trim().to_string(),
-            date: date.trim().to_string(),
-            preview: f.next().unwrap_or_default().trim().to_string(),
-        });
-    }
-    Ok(Listing {
-        messages,
-        checked,
-        unaddressable,
-    })
+    Ok(parse_listing(&reply))
 }
-
 /// One message, in full, because somebody decided this one was worth opening.
 pub async fn read(id: &str) -> Result<Message, MailError> {
     check_id(id)?;
@@ -888,6 +1004,7 @@ fn rehearsal_listing(mailbox: Option<&str>, limit: usize, unread_only: bool) -> 
         return Listing {
             messages: vec![],
             checked: 0,
+            short: false,
             unaddressable: 0,
         };
     }
@@ -899,6 +1016,7 @@ fn rehearsal_listing(mailbox: Option<&str>, limit: usize, unread_only: bool) -> 
     Listing {
         // A rehearsal invents what it hands back, so it looked at all of it.
         checked: messages.len(),
+        short: false,
         messages,
         unaddressable: 0,
     }
@@ -998,7 +1116,7 @@ mod tests {
         let script = listing_script("set theBox to my findBox(\"\")", 200, 5, true);
         assert!(script.contains("set t0 to current date"), "{script}");
         assert!(
-            script.contains(&format!("> {WALK_DEADLINE_S} then exit repeat")),
+            script.contains(&format!("((current date) - t0) > {WALK_DEADLINE_S}")),
             "the walk has no deadline of its own: {script}"
         );
         assert!(
@@ -1009,16 +1127,98 @@ mod tests {
     }
 
     #[test]
+    fn the_inbox_is_walked_one_account_at_a_time_and_not_through_the_aggregate() {
+        // Measured on a real Mac: Mail's aggregate inbox managed twenty-five
+        // messages in twenty-five seconds, where one account's own INBOX got
+        // through two hundred and turned up an unread message the aggregate
+        // never reached. Asking the aggregate for a message by index is the
+        // slow thing, so the inbox is several mailboxes now.
+        let script = listing_script("", 200, 5, true);
+        assert!(
+            script.contains("set end of boxes to mailbox \"INBOX\" of a"),
+            "the inbox is back to the aggregate: {script}"
+        );
+        assert!(
+            script.contains("set boxes to {inbox}"),
+            "nothing to fall back on when no account exposes an INBOX: {script}"
+        );
+        // Every id says which account it came from, or a later read goes to
+        // whichever account answers to that name first.
+        assert!(script.contains("(\"acct:\" & (name of a))"), "{script}");
+        assert!(
+            HANDLERS.contains("mailbox \"INBOX\" of account (text 6 thru -1 of boxName)"),
+            "an id that names an account cannot be resolved back"
+        );
+
+        // A named mailbox is still just that one.
+        let one = listing_script("Junk", 5, 5, false);
+        assert!(one.contains("set boxes to {theBox}"), "{one}");
+        assert!(!one.contains("repeat with a in accounts"), "{one}");
+    }
+
+    #[test]
+    fn no_script_ever_writes_a_date_out_as_text() {
+        // A date written as text is read back in this Mac's own language and
+        // format. `date "Thursday, 1 January 1970 at 00:00:00"` was a syntax
+        // error on the first Mac it met, and the listing failed with a message
+        // about a broken date on somebody's mail, which was nobody's mail and
+        // nothing to do with dates on messages at all.
+        let script = listing_script("", 200, 5, true);
+        // Comments may name the trap; only lines that run may not fall into it.
+        let runs: String = script
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("--"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !runs.contains("date \""),
+            "a date is being parsed from text: {runs}"
+        );
+        assert!(script.contains("set year of zeroDate to 1970"), "{script}");
+        // Minutes, because AppleScript hands back seconds this large as a real
+        // and a real arrives as "1.767E+9", which parses as nothing.
+        assert!(script.contains("div 60"), "{script}");
+    }
+
+    #[test]
+    fn messages_from_several_accounts_come_back_newest_first() {
+        // One mailbox has its own order and Errand leaves it alone. Several
+        // have no shared order, and handing over one account's post and then
+        // the next one's puts a fortnight-old message above this morning's.
+        let line = |tag: &str, stamp: &str, subject: &str| {
+            format!("{tag}\t1\tid-{subject}\tsomebody\t{subject}\twhenever\t{stamp}\ta preview")
+        };
+        let reply = format!(
+            "{}\n{}\n!checked\t400\n",
+            line("acct:One", "1735689600", "the older one"),
+            line("acct:Two", "1767225600", "the newer one"),
+        );
+        let got = parse_listing(&reply);
+        assert_eq!(
+            got.messages[0].subject, "the newer one",
+            "{:?}",
+            got.messages
+        );
+        assert_eq!(got.messages[1].subject, "the older one");
+        // And each id remembers the account it came from.
+        assert_eq!(
+            parse_locator(&got.messages[0].id).unwrap().mailbox,
+            "acct:Two"
+        );
+    }
+
+    #[test]
     fn a_walk_that_was_cut_short_says_so_and_one_that_was_not_says_nothing() {
-        let two = |checked: usize| Listing {
+        let two = |checked: usize, short: bool| Listing {
             messages: vec![rehearsal_messages()[0].clone()],
             checked,
+            short,
             unaddressable: 0,
         };
         // Stopped at thirty of two hundred, with fewer than asked for: worth
         // saying, because the answer is about thirty messages and not two
         // hundred.
-        let said = stopped_short(&two(30), 5, true).expect("a short walk says so");
+        let said = stopped_short(&two(30, true), 5, true).expect("a short walk says so");
         assert!(said.contains("30"), "{said}");
         assert!(
             said.contains("Say so"),
@@ -1026,11 +1226,9 @@ mod tests {
         );
 
         // Got through the whole window: nothing to explain.
-        assert_eq!(stopped_short(&two(SCAN_FOR_UNREAD), 5, true), None);
+        assert_eq!(stopped_short(&two(SCAN_FOR_UNREAD, false), 5, true), None);
         // Found everything it was asked for: the window is beside the point.
-        assert_eq!(stopped_short(&two(30), 1, true), None);
-        // And a listing that never wanted unread has no window at all.
-        assert_eq!(stopped_short(&two(5), 5, false), None);
+        assert_eq!(stopped_short(&two(30, true), 1, true), None);
     }
 
     #[test]

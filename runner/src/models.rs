@@ -40,6 +40,43 @@ pub async fn claude_models(state: &AppState) -> errand_core::providers::ClaudeMo
 ///
 /// Walks the chain in order, so a local model being switched off falls through
 /// to the next rather than failing the run.
+/// Would every other job this run needs also be done on this machine?
+///
+/// Carrying out the task is only one of the model's jobs. Writing the plan
+/// afterwards, explaining a failure and wording a notification are three more,
+/// and each resolves on its own -- against the global choice, never against the
+/// model a task named for itself. So a task pointed at a model on the desk can
+/// still have its journal, which for a mail task is a list of who wrote to the
+/// person and about what, handed to a service on the internet a second later.
+///
+/// This is what the line in the run view has to be told before it promises that
+/// nothing left the machine.
+pub async fn other_jobs_stay_here(state: &AppState) -> bool {
+    let Ok(providers) = errand_core::db::list_providers(state.pool()).await else {
+        // Unknown is not the same as safe, and this sentence is a promise.
+        return false;
+    };
+    let Ok(bindings) = errand_core::db::list_role_bindings(state.pool()).await else {
+        return false;
+    };
+    let local_only = errand_core::db::get_setting(state.pool(), "privacy.local_only")
+        .await
+        .ok()
+        .flatten()
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+    if local_only {
+        return true;
+    }
+    [Role::Planner, Role::Fixer, Role::Narrator]
+        .iter()
+        .all(|r| {
+            errand_core::providers::resolve_chain(&providers, &bindings, *r, false)
+                .iter()
+                .all(|p| p.is_local())
+        })
+}
+
 pub async fn ask(state: &AppState, role: Role, prompt: &str) -> anyhow::Result<Answer> {
     let claude = claude_models(state).await;
     let providers = errand_core::db::list_providers(state.pool()).await?;
@@ -116,6 +153,23 @@ pub async fn ask(state: &AppState, role: Role, prompt: &str) -> anyhow::Result<A
     )
 }
 
+/// What could carry out one task, and what that task asked for.
+///
+/// Both answers come out of the same call because they are one decision. A
+/// task's own choice is only a choice if it goes in front of the chain, and a
+/// run that could not have what it was asked for owes somebody an explanation
+/// rather than a different model and no comment.
+pub struct Executors {
+    /// Everything that could be asked, best first.
+    pub chain: Vec<Provider>,
+    /// The model this task names, when it names one that is still in the list.
+    /// Carried even when it cannot be used, so the run can say what it wanted.
+    pub asked_for: Option<Provider>,
+    /// Why what the task asked for is not first, when it is not. `None` means
+    /// it is, or that the task asked for nothing.
+    pub asked_for_problem: Option<String>,
+}
+
 /// The models that could carry out a task, best first.
 ///
 /// Not `resolve_chain(Role::Executor)`, which asks each provider whether it
@@ -125,9 +179,11 @@ pub async fn ask(state: &AppState, role: Role, prompt: &str) -> anyhow::Result<A
 /// tools, the budget and the fence in both, so the question here is which loop
 /// to use rather than whether to refuse.
 ///
-/// The person's own choice comes first, then anything else that is switched on,
-/// so a machine that is asleep does not stop a run before it starts.
-pub async fn executor_chain(state: &AppState) -> anyhow::Result<Vec<Provider>> {
+/// The task's own choice comes first, then the person's global one, then
+/// anything else that is switched on, so a machine that is asleep does not stop
+/// a run before it starts. Pass `None` for the task where there is no task:
+/// the answer is then the global chain, exactly as before.
+pub async fn executor_chain(state: &AppState, task_id: Option<&str>) -> anyhow::Result<Executors> {
     let providers = errand_core::db::list_providers(state.pool()).await?;
     let bindings = errand_core::db::list_role_bindings(state.pool()).await?;
     let local_only = errand_core::db::get_setting(state.pool(), "privacy.local_only")
@@ -137,13 +193,52 @@ pub async fn executor_chain(state: &AppState) -> anyhow::Result<Vec<Provider>> {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // What this task asks for, if anything. It goes in front of the global
+    // choice because it is the more specific answer to the same question:
+    // whichever model does the work is the one that sees what the tools return,
+    // and only the task knows whether that matters.
+    let named = match task_id {
+        Some(id) => errand_core::db::get_task(state.pool(), id)
+            .await?
+            .and_then(|t| t.model_id),
+        None => None,
+    };
+    let asked_for = named
+        .as_deref()
+        .and_then(|id| providers.iter().find(|p| p.id == id))
+        .cloned();
+    // A model can be chosen for a task and only afterwards be switched off,
+    // removed, or put out of reach by the local-only setting. None of that is
+    // worth failing a run over, so it falls through to the next model exactly
+    // as the global choice does, and the reason is kept to be said out loud.
+    //
+    // Each reason names the model itself, because both places that repeat one
+    // (the run journal and the failure at the end of the walk) put it after a
+    // clause of their own, and neither can be sure the name has been said yet.
+    let asked_for_problem = match (&named, &asked_for) {
+        (Some(_), None) => {
+            Some("The model this task asks for is no longer in Errand's list".to_string())
+        }
+        (Some(_), Some(p)) if !p.enabled => Some(format!("{} is switched off", p.label)),
+        (Some(_), Some(p)) if local_only && !p.is_local() => Some(format!(
+            "{} is not on your own machine, and Errand is set to keep everything on it",
+            p.label
+        )),
+        _ => None,
+    };
+
     let mut chain: Vec<Provider> = vec![];
+    if asked_for_problem.is_none() {
+        if let Some(p) = &asked_for {
+            chain.push(p.clone());
+        }
+    }
     for (role, id) in &bindings {
         if *role != Role::Executor {
             continue;
         }
         if let Some(p) = providers.iter().find(|p| &p.id == id) {
-            if p.enabled {
+            if p.enabled && !chain.iter().any(|c| c.id == p.id) {
                 chain.push(p.clone());
             }
         }
@@ -162,17 +257,22 @@ pub async fn executor_chain(state: &AppState) -> anyhow::Result<Vec<Provider>> {
         if local_only {
             anyhow::bail!(
                 "This task is set to stay on your own machine, and no model on this machine is \
-                 switched on. Add one in Settings under Models, or turn that setting off for this \
-                 task."
+                 switched on. Add one on the AI screen, or turn off 'Keep everything on this \
+                 machine' there. That switch covers every task, not just this one."
             );
         }
         anyhow::bail!(
-            "Errand has no model switched on to carry out this task. Open Settings and either \
-             install the Claude command line tool and run 'claude /login' once, or add a model of \
+            "Errand has no model switched on to carry out this task. Open the AI screen and \
+             either install the Claude command line tool and run 'claude /login' once, or add a \
+             model of \
              your own by address and choose it for \"Doing the task\"."
         );
     }
-    Ok(chain)
+    Ok(Executors {
+        chain,
+        asked_for,
+        asked_for_problem,
+    })
 }
 
 /// Anything speaking the OpenAI chat format.
@@ -478,7 +578,7 @@ fn read_turn(msg: &Value) -> Turn {
 async fn ask_anthropic(model: &str, prompt: &str) -> Result<String, String> {
     let key = crate::secrets::get_internal("anthropic.api_key")
         .await
-        .map_err(|_| "no Anthropic key is saved. Add one in Settings.".to_string())?;
+        .map_err(|_| "no Anthropic key is saved. Add one on the AI screen.".to_string())?;
 
     let res = reqwest::Client::new()
         .post("https://api.anthropic.com/v1/messages")
@@ -1281,7 +1381,10 @@ mod tests {
             .unwrap();
 
         let state = AppState::new(pool);
-        let chain = executor_chain(&state).await.expect("something can do it");
+        let chain = executor_chain(&state, None)
+            .await
+            .expect("something can do it")
+            .chain;
 
         assert_eq!(
             chain.first().map(|p| p.id.as_str()),
@@ -1322,9 +1425,10 @@ mod tests {
             .unwrap();
 
         let state = AppState::new(pool);
-        let e = executor_chain(&state)
+        let e = executor_chain(&state, None)
             .await
-            .expect_err("nothing local is switched on")
+            .err()
+            .expect("nothing local is switched on")
             .to_string();
         assert!(
             e.contains("stay on your own machine"),

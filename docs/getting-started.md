@@ -3,8 +3,12 @@
 ## What you need
 
 - **macOS 12 or later.** Windows and Linux are later work.
-- **The Claude command line tool**, signed in. This is what actually carries out
-  a task. Install it and run `claude /login` once.
+- **An AI that can call tools.** Any of: the Claude command line tool, signed in
+  (`claude /login` once); a hosted service that speaks the OpenAI chat format;
+  or a model on your own machine or network, such as Ollama, LM Studio or
+  llama.cpp. Errand does not care which, and a task can name its own. What it
+  needs is a model that can call tools: one that only writes prose cannot carry
+  out a task, and Errand checks before it starts rather than failing halfway.
 - **A Chrome-family browser.** Errand drives one you already have rather than
   downloading a 300 MB one of its own. It uses a separate profile, so your
   windows, tabs, history and saved logins are untouched.
@@ -25,36 +29,47 @@ errandd doctor
 It checks everything that has to be true for a task to run and prints the fix
 for anything that is not.
 
-## Teaching it one task
+## Your first task
 
 Start with something small and reversible. A booking is a poor first task; a
 research or triage job is a good one.
 
 **1. Describe it.** Write the job the way you would explain it to a person, and
 say what to do when the obvious path is not there. This text is what the agent
-actually reads, so vagueness costs you a run.
+actually reads, so vagueness costs you a run. A name is optional.
 
-**2. Say which sites it may open.** A task with no sites cannot browse at all.
-Type the plain form (`example.com`, not `www.example.com`), because subdomains
-are included but it only works downwards.
+**2. Press Create and do it.** Errand reads what you wrote and fills in what it
+can: which sites the job needs, when it should run if you said, and whether it
+is about your mail. It shows you what it set up, in a line or two, and only where
+that differs from a bare task. Then it does the job.
 
-**3. Teach it once.** Press **Teach it once** and watch. The agent works only
-from your description this time. You can follow every step as it happens.
+Anything it will not decide for you is listed under the gear: signing in
+anywhere, messaging a person, spending money, and being told when a task fails.
+Those stay yours.
 
-**4. Read the plan.** At the end it writes down what worked: each step as an
-*intent* separately from the *hint* it used. Read it. Nothing runs on a schedule
-until you approve it: that is the line between "it tried something once" and
-"it does this alone while you are asleep".
+**3. Read the answer.** It appears on the task, whole, above everything else. If
+that is not what you meant, press **Change what you asked for**, reword it, and
+it does the job again with the new wording. That is the loop: the description is
+the task, and correcting it is one thought rather than a trip to a settings
+screen.
 
-**5. Give it a schedule.** Pick when it should run. Underneath, Errand shows
-what the schedule really means and the next few times it will fire. If that
-sentence is not what you meant, change the form until it is.
+**4. Put it on a schedule.** Offered once it has really done the job with you
+there. Not "you approved a plan" but "it worked", and a rehearsal does not count,
+because a rehearsal is told to carry on as though everything worked and touches
+nothing. Errand shows what the schedule really means and the next few times it
+will fire.
+
+If the job books, sends, buys or moves anything, press **Rehearse it first**
+before any of this. It is the same run, watched the same way, and it writes the
+same plan at the end: the difference is that anything it cannot take back is
+recorded as what it would have done rather than happening.
 
 ## Before you trust it with something irreversible
 
 **Rehearse it.** A rehearsal runs the task normally but records anything
 irreversible instead of doing it. Nothing is booked, sent or deleted. It is the
-cheapest way to find out that a site has changed.
+cheapest way to find out that a site has changed. Rehearse the very first run too:
+that is the run nobody has watched before.
 
 **Save the login properly.** Add it in Settings, bound to one site. Errand can
 use it and cannot show it to you, and it will be refused on any other site, so

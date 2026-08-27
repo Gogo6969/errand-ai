@@ -126,6 +126,10 @@ fn task_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<crate::models::Task> {
         notify: parse(r.try_get("notify_json")?),
         limits: parse(r.try_get("limits_json")?),
         allowed_domains: parse(r.try_get("allowed_domains_json")?),
+        model_id: crate::providers::read_task_model(
+            r.try_get::<Option<String>, _>("model_roles_json")?
+                .as_deref(),
+        ),
         playbook_version: r.try_get("active_playbook_version")?,
         next_run_at: r.try_get("next_run_at")?,
         paused_reason: r.try_get("paused_reason")?,
@@ -207,6 +211,12 @@ pub struct TaskPatch {
     /// route by which an entry the run-time check could never match gets
     /// written to the database.
     pub allowed_domains: Option<Vec<String>>,
+    /// Which model carries this task out. Its own three-valued type rather than
+    /// an `Option`, because here the difference between "not mentioned" and
+    /// "put it back on the default" is the difference between a task keeping
+    /// the model it was given and quietly losing it when somebody edits its
+    /// sites.
+    pub model: crate::providers::ModelChoice,
 }
 
 /// Lay a patch over a stored settings object, one key at a time.
@@ -271,7 +281,8 @@ pub async fn update_task(pool: &Pool, id: &str, patch: TaskPatch) -> Result<crat
     let mut tx = pool.begin().await?;
 
     let row = sqlx::query(
-        "SELECT status, schedule_json, notify_json, limits_json FROM tasks WHERE id = ?",
+        "SELECT status, schedule_json, notify_json, limits_json, model_roles_json
+         FROM tasks WHERE id = ?",
     )
     .bind(id)
     .fetch_optional(&mut *tx)
@@ -303,6 +314,25 @@ pub async fn update_task(pool: &Pool, id: &str, patch: TaskPatch) -> Result<crat
         &row.try_get::<String, _>("limits_json")?,
         patch.limits.as_ref(),
     )?;
+
+    // Which model carries the task out. Read inside the transaction like the
+    // two above, and rewritten rather than replaced, so naming a model cannot
+    // take the rest of that column with it. An edit that says nothing about the
+    // model leaves the column untouched: a task told to use the machine under
+    // the desk must still be using it after somebody edits its sites.
+    let model_changing = patch.model != crate::providers::ModelChoice::Unchanged;
+    let model_roles_json = {
+        let stored: Option<String> = row.try_get("model_roles_json")?;
+        match &patch.model {
+            crate::providers::ModelChoice::Unchanged => None,
+            crate::providers::ModelChoice::Default => {
+                crate::providers::write_task_model(stored.as_deref(), None)
+            }
+            crate::providers::ModelChoice::Named(model_id) => {
+                crate::providers::write_task_model(stored.as_deref(), Some(model_id))
+            }
+        }
+    };
 
     let mut floor_at: Option<String> = None;
     let mut next_run_at: Option<String> = None;
@@ -381,6 +411,10 @@ pub async fn update_task(pool: &Pool, id: &str, patch: TaskPatch) -> Result<crat
             notify_json          = COALESCE(?, notify_json),
             limits_json          = COALESCE(?, limits_json),
             allowed_domains_json = COALESCE(?, allowed_domains_json),
+            -- Not COALESCE, because putting a task back on the default means
+            -- writing NULL here, and COALESCE cannot tell that apart from an
+            -- edit that never mentioned the model.
+            model_roles_json     = CASE WHEN ? = 1 THEN ? ELSE model_roles_json END,
             catch_up_floor_at    = CASE WHEN ? = 1 THEN ? ELSE catch_up_floor_at END,
             next_run_at          = CASE WHEN ? = 1 THEN ? ELSE next_run_at END,
             updated_at           = ?
@@ -393,6 +427,8 @@ pub async fn update_task(pool: &Pool, id: &str, patch: TaskPatch) -> Result<crat
     .bind(&notify_json)
     .bind(&limits_json)
     .bind(&domains_json)
+    .bind(i64::from(model_changing))
+    .bind(&model_roles_json)
     .bind(i64::from(schedule_changing))
     .bind(&floor_at)
     .bind(i64::from(schedule_changing))
@@ -518,6 +554,7 @@ fn run_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<crate::models::Run> {
         (Some(c), Some(h)) => Some(crate::models::Failure {
             code: c,
             plain_reason: h,
+            fix: r.try_get("failure_fix")?,
             technical: r.try_get("failure_technical")?,
         }),
         _ => None,
@@ -527,6 +564,11 @@ fn run_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<crate::models::Run> {
         task_id: r.try_get("task_id")?,
         occurrence_id: r.try_get("occurrence_id")?,
         mode: r.try_get("mode")?,
+        // The mode is read as well as the flag, and once, here. A run recorded
+        // as a rehearsal before the flag existed says so in its mode alone, and
+        // this is the only place that has to know it.
+        rehearsal: r.try_get::<i64, _>("rehearsal")? != 0
+            || r.try_get::<String, _>("mode")? == crate::models::RunMode::REHEARSAL.stored(),
         trigger: r.try_get("trigger")?,
         triggered_by: r.try_get("triggered_by")?,
         status: r.try_get("status")?,
@@ -534,6 +576,7 @@ fn run_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<crate::models::Run> {
         started_at: r.try_get("started_at")?,
         finished_at: r.try_get("finished_at")?,
         summary: r.try_get("summary_md")?,
+        answer: r.try_get("answer_md")?,
         failure,
         tokens_in: r.try_get("tokens_in")?,
         tokens_out: r.try_get("tokens_out")?,
@@ -568,18 +611,20 @@ pub async fn try_create_run(
     task_id: &str,
     occurrence_id: &str,
     trigger: &str,
-    mode: &str,
+    mode: crate::models::RunMode,
     triggered_by: Option<&str>,
 ) -> std::result::Result<crate::models::Run, CreateRunError> {
     let id = crate::new_id();
     let res = sqlx::query(
-        "INSERT INTO runs (id, task_id, occurrence_id, mode, trigger, triggered_by, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
+        "INSERT INTO runs (id, task_id, occurrence_id, mode, rehearsal, trigger, triggered_by,
+                           status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
     )
     .bind(&id)
     .bind(task_id)
     .bind(occurrence_id)
-    .bind(mode)
+    .bind(mode.stored())
+    .bind(i64::from(mode.is_rehearsal()))
     .bind(trigger)
     .bind(triggered_by)
     .bind(crate::now_iso())
@@ -617,18 +662,20 @@ pub async fn create_run(
     task_id: &str,
     occurrence_id: &str,
     trigger: &str,
-    mode: &str,
+    mode: crate::models::RunMode,
     triggered_by: Option<&str>,
 ) -> Result<crate::models::Run> {
     let id = crate::new_id();
     sqlx::query(
-        "INSERT INTO runs (id, task_id, occurrence_id, mode, trigger, triggered_by, status, created_at)
-         VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)",
+        "INSERT INTO runs (id, task_id, occurrence_id, mode, rehearsal, trigger, triggered_by,
+                           status, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, 'queued', ?)",
     )
     .bind(&id)
     .bind(task_id)
     .bind(occurrence_id)
-    .bind(mode)
+    .bind(mode.stored())
+    .bind(i64::from(mode.is_rehearsal()))
     .bind(trigger)
     .bind(triggered_by)
     .bind(crate::now_iso())
@@ -781,12 +828,24 @@ pub async fn set_run_status(pool: &Pool, run_id: &str, status: &str) -> Result<(
     Ok(())
 }
 
-pub async fn finish_run_ok(pool: &Pool, run_id: &str, summary: &str) -> Result<()> {
+/// Close a run as done, with the story of the work and the answer it produced.
+///
+/// The two are separate columns because they are separate things, and the app
+/// had only the first of them for too long: a person opening a finished task
+/// was shown what it did and never what it found.
+pub async fn finish_run_ok(
+    pool: &Pool,
+    run_id: &str,
+    summary: &str,
+    answer: Option<&str>,
+) -> Result<()> {
     sqlx::query(
-        "UPDATE runs SET status = 'succeeded', finished_at = ?, summary_md = ? WHERE id = ?",
+        "UPDATE runs SET status = 'succeeded', finished_at = ?, summary_md = ?, answer_md = ?
+         WHERE id = ?",
     )
     .bind(crate::now_iso())
     .bind(summary)
+    .bind(answer)
     .bind(run_id)
     .execute(pool)
     .await?;
@@ -803,19 +862,132 @@ pub async fn finish_run_failed(
     human: &str,
     technical: Option<&str>,
 ) -> Result<()> {
+    finish_run_failed_with_answer(pool, run_id, code, human, technical, None).await
+}
+
+/// The same, for a run that failed holding an answer anyway.
+///
+/// That combination is not a curiosity, it is the common case: a run reads the
+/// mail, works out the summary, and only then finds that macOS will not let it
+/// write the note it was told to write. The run is genuinely a failure, and
+/// throwing away what it found would make a person do the work again by hand.
+pub async fn finish_run_failed_with_answer(
+    pool: &Pool,
+    run_id: &str,
+    code: &str,
+    human: &str,
+    technical: Option<&str>,
+    answer: Option<&str>,
+) -> Result<()> {
+    finish_run_failed_fully(pool, run_id, code, human, None, technical, answer).await
+}
+
+/// Close a run as failed, with everything a person and a screen need.
+///
+/// `human` is one line about what stopped it and `fix` one line about what to
+/// do. They are separate because the screen shows them differently, and because
+/// a failure with nothing to be done about it should say nothing rather than
+/// pad.
+pub async fn finish_run_failed_fully(
+    pool: &Pool,
+    run_id: &str,
+    code: &str,
+    human: &str,
+    fix: Option<&str>,
+    technical: Option<&str>,
+    answer: Option<&str>,
+) -> Result<()> {
     sqlx::query(
         "UPDATE runs SET status = 'failed', finished_at = ?, failure_code = ?,
-                         failure_human = ?, failure_technical = ?
+                         failure_human = ?, failure_fix = ?, failure_technical = ?,
+                         answer_md = COALESCE(?, answer_md)
          WHERE id = ?",
     )
     .bind(crate::now_iso())
     .bind(code)
     .bind(human)
+    .bind(fix)
     .bind(technical)
+    .bind(answer)
     .bind(run_id)
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// Where a run put a copy of its answer, and what it is called.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AnswerCopy {
+    pub id: String,
+    pub kind: String,
+    pub label: String,
+    /// Never sent to a browser. Opening one goes through the delivery's id, so
+    /// a caller cannot name a file of its own choosing and have it opened.
+    #[serde(skip_serializing)]
+    pub locator: String,
+}
+
+/// Write down that a run left a copy of its answer somewhere.
+///
+/// Called by the tool that did it, at the point it succeeded, so a link on
+/// screen always corresponds to something that really happened.
+pub async fn record_answer_copy(
+    pool: &Pool,
+    run_id: &str,
+    kind: &str,
+    label: &str,
+    locator: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO run_answer_copies (id, run_id, kind, label, locator, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)",
+    )
+    .bind(crate::new_id())
+    .bind(run_id)
+    .bind(kind)
+    .bind(label)
+    .bind(locator)
+    .bind(crate::now_iso())
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+pub async fn list_answer_copies(pool: &Pool, run_id: &str) -> Result<Vec<AnswerCopy>> {
+    let rows = sqlx::query(
+        "SELECT id, kind, label, locator FROM run_answer_copies
+         WHERE run_id = ? ORDER BY created_at, rowid",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    rows.into_iter()
+        .map(|r| {
+            Ok(AnswerCopy {
+                id: r.try_get("id")?,
+                kind: r.try_get("kind")?,
+                label: r.try_get("label")?,
+                locator: r.try_get("locator")?,
+            })
+        })
+        .collect()
+}
+
+/// One copy, by its own id, for opening it.
+pub async fn get_answer_copy(pool: &Pool, id: &str) -> Result<Option<AnswerCopy>> {
+    let row = sqlx::query("SELECT id, kind, label, locator FROM run_answer_copies WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await?;
+    match row {
+        None => Ok(None),
+        Some(r) => Ok(Some(AnswerCopy {
+            id: r.try_get("id")?,
+            kind: r.try_get("kind")?,
+            label: r.try_get("label")?,
+            locator: r.try_get("locator")?,
+        })),
+    }
 }
 
 pub async fn record_usage(
@@ -1003,6 +1175,137 @@ pub async fn record_audit(pool: &Pool, e: AuditEntry<'_>) -> Result<()> {
 
 /// Pause a task because the system decided to, not because the user did.
 /// Distinguished from a user pause in the UI so the reason is visible.
+/// How many of this task's most recent finished runs failed, one after another.
+///
+/// The loop nothing bounded. Every ceiling in the app is a ceiling on ONE run:
+/// steps, minutes, money, heal cycles, turns. A task on an hourly schedule
+/// whose site has changed fails inside every one of those ceilings and then
+/// does it again in an hour, for ever, and each failure is individually
+/// well behaved.
+///
+/// Counts backwards from the newest and stops at the first run that did not
+/// fail, so one success genuinely clears the count rather than merely diluting
+/// it. Runs still in flight are not counted: an unfinished run has not failed.
+/// Make the plan a run just wrote the one this task follows, where that is safe.
+///
+/// The rule, which is narrower than it looks and deliberately so: a playbook a
+/// run wrote becomes active only when the task had none at all, the run was
+/// real rather than a rehearsal, and the run succeeded.
+///
+/// The narrowness is the point. A playbook is distilled from pages written by
+/// strangers and then handed back to the agent as trusted instruction;
+/// scrubbing removes secrets, not instructions. Letting a later run replace a
+/// plan that is already in force would turn one run against a changed or
+/// hostile page into standing orders for every unattended run afterwards. A
+/// revision therefore waits, and a person reads it: revising a document
+/// somebody already relied on is exactly the case where review is worth
+/// something.
+///
+/// Returns the version that became active, if any.
+pub async fn adopt_plan_written_by(
+    pool: &Pool,
+    task_id: &str,
+    run_id: &str,
+) -> Result<Option<i64>> {
+    let Some(task) = get_task(pool, task_id).await? else {
+        return Ok(None);
+    };
+    if task.playbook_version.is_some() {
+        return Ok(None);
+    }
+    let row = sqlx::query(
+        "SELECT version FROM playbook_versions
+         WHERE task_id = ? AND created_by_run_id = ?
+         ORDER BY version DESC LIMIT 1",
+    )
+    .bind(task_id)
+    .bind(run_id)
+    .fetch_optional(pool)
+    .await?;
+    let Some(row) = row else { return Ok(None) };
+    let version: i64 = row.try_get("version")?;
+    set_active_playbook(pool, task_id, version).await?;
+    Ok(Some(version))
+}
+
+/// What this run has already committed to spending, in dollars.
+///
+/// Read back out of the fence's own evidence rather than counted separately,
+/// because the fence is the record of what really happened: a purchase that was
+/// armed and never confirmed is not spending that can be undone by forgetting
+/// it. Anything unparseable counts as nothing, which is the wrong way round for
+/// safety, so the caller must treat an unknown amount as a refusal rather than
+/// as zero.
+pub async fn spent_so_far(pool: &Pool, run_id: &str) -> Result<f64> {
+    let rows = sqlx::query(
+        "SELECT evidence_json FROM side_effects
+         WHERE run_id = ? AND action_kind = 'purchase' AND state = 'committed'",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    let mut total = 0.0;
+    for r in rows {
+        let raw: Option<String> = r.try_get("evidence_json")?;
+        let Some(raw) = raw else { continue };
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            total += v.get("amount_usd").and_then(|a| a.as_f64()).unwrap_or(0.0);
+        }
+    }
+    Ok(total)
+}
+
+/// Has this task ever really done the job?
+///
+/// The evidence that replaced "a person approved a plan" as the thing standing
+/// between a task and an unattended schedule. Proven beats reviewed, but only
+/// if the proof was real: a rehearsal is told to carry on as though everything
+/// worked and lands in the same 'succeeded' column having touched nothing, so
+/// it is excluded here by the same predicate the run reader uses. The mode
+/// clause catches rows written before the flag existed, and a teach run that
+/// was also a rehearsal stores mode 'teach' with the flag set, which is why
+/// both halves are needed.
+pub async fn has_really_worked_once(pool: &Pool, task_id: &str) -> Result<bool> {
+    let row = sqlx::query(
+        "SELECT 1 FROM runs
+         WHERE task_id = ? AND status = 'succeeded'
+           AND rehearsal = 0 AND mode <> 'dry_run'
+         LIMIT 1",
+    )
+    .bind(task_id)
+    .fetch_optional(pool)
+    .await?;
+    Ok(row.is_some())
+}
+
+pub async fn consecutive_failures(pool: &Pool, task_id: &str) -> Result<i64> {
+    // Only runs that actually tried. The scheduler manufactures 'skipped' runs
+    // of its own for a task that was still running, collided with a catch-up,
+    // or missed its window, and a task on a short cron produces those between
+    // its failures. Counting them as "not a failure" would silently reset the
+    // count on exactly the tasks that fire most often, which is to say the ones
+    // this ceiling exists for. 'cancelled' is left out for the same reason: a
+    // person stopping a run is not the task working.
+    let rows = sqlx::query(
+        "SELECT status FROM runs
+         WHERE task_id = ? AND status IN ('succeeded','failed')
+         ORDER BY created_at DESC, id DESC
+         LIMIT 50",
+    )
+    .bind(task_id)
+    .fetch_all(pool)
+    .await?;
+    let mut n = 0i64;
+    for r in rows {
+        if r.try_get::<String, _>("status")? == "failed" {
+            n += 1;
+        } else {
+            break;
+        }
+    }
+    Ok(n)
+}
+
 pub async fn auto_pause_task(pool: &Pool, task_id: &str, reason: &str) -> Result<()> {
     sqlx::query(
         "UPDATE tasks SET status = 'paused', auto_paused = 1, paused_reason = ?, updated_at = ?
@@ -1739,6 +2042,123 @@ pub async fn recent_commit_of_any_scope(
         ))),
         None => Ok(None),
     }
+}
+
+/// Put a task away: gone from the list, never runs again, history kept.
+///
+/// The default way to get rid of one, and not the same as deleting it. A task
+/// that has booked, bought or filed something leaves rows in the side-effect
+/// record, and those rows are what stop a future run doing the same thing
+/// twice. Throwing them away to tidy a list is throwing away the evidence.
+///
+/// Reversible by hand, because "I did not mean that one" is a thing people say.
+pub async fn archive_task(pool: &Pool, task_id: &str) -> Result<bool> {
+    let res = sqlx::query(
+        "UPDATE tasks SET status = 'archived', updated_at = ? WHERE id = ? AND status <> 'archived'",
+    )
+    .bind(crate::now_iso())
+    .bind(task_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Really remove a task and everything it left behind.
+///
+/// For a task that never should have existed: a test, a mistake, a duplicate.
+/// Says how many runs went with it, because that is the number somebody wants
+/// to have been told before it is gone rather than after.
+///
+/// Refuses while a run is in flight. Deleting the row under a running agent
+/// leaves it writing steps to a task that is not there.
+pub async fn forget_task(pool: &Pool, task_id: &str) -> Result<i64> {
+    if busy_run_for_task(pool, task_id).await?.is_some() {
+        anyhow::bail!(
+            "That task is running right now. Wait for it to finish, or stop it, then remove it."
+        );
+    }
+    let runs: i64 = sqlx::query("SELECT COUNT(*) AS n FROM runs WHERE task_id = ?")
+        .bind(task_id)
+        .fetch_one(pool)
+        .await?
+        .try_get("n")?;
+
+    // In one transaction, so a half-removed task cannot be left behind: rows
+    // pointing at a task that no longer exists are worse than the task was.
+    let mut tx = pool.begin().await?;
+    // Written out rather than looped: sqlx refuses a SQL string built at
+    // runtime, which is the right refusal, and naming each table here means a
+    // table that gets renamed breaks the build instead of quietly leaving rows
+    // behind that point at a task which is gone.
+    sqlx::query("DELETE FROM run_steps WHERE run_id IN (SELECT id FROM runs WHERE task_id = ?)")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(
+        "DELETE FROM run_artifacts WHERE run_id IN (SELECT id FROM runs WHERE task_id = ?)",
+    )
+    .bind(task_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM run_answer_copies WHERE run_id IN (SELECT id FROM runs WHERE task_id = ?)",
+    )
+    .bind(task_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM side_effects WHERE task_id = ?")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM playbook_versions WHERE task_id = ?")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM task_recipients WHERE task_id = ?")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM task_mail_grants WHERE task_id = ?")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM task_credentials WHERE task_id = ?")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM msg_outbox WHERE task_id = ?")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM runs WHERE task_id = ?")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM tasks WHERE id = ?")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(runs)
+}
+
+/// Let a task run itself again, after a run of it worked.
+///
+/// Only ever clears a pause Errand set for itself. A pause somebody set by hand
+/// means "stop doing this", and a task quietly starting again because one run
+/// happened to work would be the program overruling them.
+///
+/// Returns whether anything changed, so the caller can say so.
+pub async fn clear_auto_pause(pool: &Pool, task_id: &str) -> Result<bool> {
+    let res = sqlx::query(
+        "UPDATE tasks SET status = 'ready', auto_paused = 0, paused_reason = NULL, updated_at = ?
+         WHERE id = ? AND auto_paused = 1 AND status = 'paused'",
+    )
+    .bind(crate::now_iso())
+    .bind(task_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
 }
 
 /// Move a task from draft to ready so the scheduler will consider it.
@@ -2545,6 +2965,243 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn a_plan_a_run_wrote_becomes_the_way_the_job_is_done() {
+        // Nobody is asked to read and approve a document before the task may
+        // be used. It has just been watched doing the job, which is better
+        // evidence than a reading of a plan.
+        let pool = open_memory().await.unwrap();
+        let task = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        let run = create_run(
+            &pool,
+            &task.id,
+            "occ-1",
+            "manual",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let pb = crate::playbook::Playbook {
+            version: next_playbook_version(&pool, &task.id).await.unwrap(),
+            goal: "Book a court.".into(),
+            sites: vec!["example.com".into()],
+            preconditions: vec![],
+            steps: vec![crate::playbook::Step {
+                intent: "Open the grid.".into(),
+                hint: None,
+                decision: None,
+            }],
+            success: vec![],
+            known_failures: vec![],
+            never: vec![],
+        };
+        add_playbook_version(
+            &pool,
+            &task.id,
+            &pb,
+            crate::playbook::Source::Teach,
+            Some(&run.id),
+            None,
+            false,
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            adopt_plan_written_by(&pool, &task.id, &run.id)
+                .await
+                .unwrap(),
+            Some(1)
+        );
+        assert_eq!(
+            get_task(&pool, &task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .playbook_version,
+            Some(1),
+            "the task is not following the plan its own run wrote"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_later_run_cannot_quietly_replace_a_plan_already_in_force() {
+        // A playbook is distilled from pages written by strangers and handed
+        // back to the agent as trusted instruction. Scrubbing removes secrets,
+        // not instructions. One run against a changed page must not become
+        // standing orders for every unattended run after it.
+        let pool = open_memory().await.unwrap();
+        let task = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+
+        for (occ, adopted) in [("occ-1", Some(1)), ("occ-2", None)] {
+            let run = create_run(
+                &pool,
+                &task.id,
+                occ,
+                "manual",
+                crate::models::RunMode::NORMAL,
+                None,
+            )
+            .await
+            .unwrap();
+            let pb = crate::playbook::Playbook {
+                version: next_playbook_version(&pool, &task.id).await.unwrap(),
+                goal: "Book a court.".into(),
+                sites: vec![],
+                preconditions: vec![],
+                steps: vec![crate::playbook::Step {
+                    intent: "Open the grid.".into(),
+                    hint: None,
+                    decision: None,
+                }],
+                success: vec![],
+                known_failures: vec![],
+                never: vec![],
+            };
+            add_playbook_version(
+                &pool,
+                &task.id,
+                &pb,
+                crate::playbook::Source::Refine,
+                Some(&run.id),
+                None,
+                false,
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                adopt_plan_written_by(&pool, &task.id, &run.id)
+                    .await
+                    .unwrap(),
+                adopted,
+                "at {occ}"
+            );
+        }
+        // Still following the first, with the second waiting to be read.
+        assert_eq!(
+            get_task(&pool, &task.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .playbook_version,
+            Some(1)
+        );
+        assert_eq!(
+            list_playbook_versions(&pool, &task.id).await.unwrap().len(),
+            2
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_that_only_ever_fails_stops_running_itself() {
+        // The loop nothing bounded. Every ceiling in this program bounds one
+        // run: steps, minutes, money, heal cycles, turns. A task on an hourly
+        // schedule whose site has changed fails inside all of them and then
+        // does it again in an hour, for ever, each failure perfectly well
+        // behaved.
+        let pool = open_memory().await.unwrap();
+        let task = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        set_task_status(&pool, &task.id, "ready").await.unwrap();
+
+        for i in 0..crate::limits::FAILURES_BEFORE_PAUSING {
+            let r = create_run(
+                &pool,
+                &task.id,
+                &format!("occ-{i}"),
+                "schedule",
+                crate::models::RunMode::NORMAL,
+                None,
+            )
+            .await
+            .unwrap();
+            finish_run_failed(
+                &pool,
+                &r.id,
+                "target_unavailable",
+                "The site is gone.",
+                None,
+            )
+            .await
+            .unwrap();
+        }
+        assert_eq!(
+            consecutive_failures(&pool, &task.id).await.unwrap(),
+            crate::limits::FAILURES_BEFORE_PAUSING
+        );
+
+        // A run the scheduler skipped is not the task working. It manufactures
+        // those for a task that was still running or missed its window, so on a
+        // short cron they land between the failures, and counting them would
+        // reset the ceiling on exactly the tasks it exists for.
+        let skipped = create_run(
+            &pool,
+            &task.id,
+            "occ-skipped",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
+        finish_run_skipped(&pool, &skipped.id, "it was still running", "")
+            .await
+            .unwrap();
+        assert_eq!(
+            consecutive_failures(&pool, &task.id).await.unwrap(),
+            crate::limits::FAILURES_BEFORE_PAUSING,
+            "a skipped run reset the count that stops a task failing for ever"
+        );
+
+        // One success clears the count outright rather than diluting it, or a
+        // task that works four times out of five would creep up to the ceiling
+        // and stop for no reason.
+        let ok = create_run(
+            &pool,
+            &task.id,
+            "occ-good",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
+        finish_run_ok(&pool, &ok.id, "Done.", Some("Here it is."))
+            .await
+            .unwrap();
+        assert_eq!(consecutive_failures(&pool, &task.id).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_pause_somebody_set_by_hand_is_never_undone_by_a_run_that_worked() {
+        // Errand may undo its own guess. It may not overrule a person who
+        // said stop.
+        let pool = open_memory().await.unwrap();
+        let task = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
+        // Only a task that runs itself can be stopped from running itself; a
+        // draft was never going to.
+        set_task_status(&pool, &task.id, "ready").await.unwrap();
+
+        auto_pause_task(&pool, &task.id, "it kept failing")
+            .await
+            .unwrap();
+        assert!(
+            clear_auto_pause(&pool, &task.id).await.unwrap(),
+            "its own pause should lift"
+        );
+
+        set_task_status(&pool, &task.id, "paused").await.unwrap();
+        assert!(
+            !clear_auto_pause(&pool, &task.id).await.unwrap(),
+            "a person's pause was overruled by a successful run"
+        );
+        assert_eq!(
+            get_task(&pool, &task.id).await.unwrap().unwrap().status,
+            "paused"
+        );
+    }
+
+    #[tokio::test]
     async fn migrations_apply_and_quick_check_passes() {
         let pool = open_memory().await.unwrap();
         assert_eq!(quick_check(&pool).await.unwrap(), "ok");
@@ -2566,9 +3223,16 @@ mod tests {
         .unwrap();
         assert_eq!(t.status, "draft");
 
-        let run = create_run(&pool, &t.id, "occ-1", "manual", "normal", None)
-            .await
-            .unwrap();
+        let run = create_run(
+            &pool,
+            &t.id,
+            "occ-1",
+            "manual",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
         append_step(&pool, &run.id, "plan", "Loaded playbook", true, None)
             .await
             .unwrap();
@@ -2603,10 +3267,25 @@ mod tests {
         )
         .await
         .unwrap();
-        create_run(&pool, &t.id, "2026-08-26T08:00", "schedule", "normal", None)
-            .await
-            .unwrap();
-        let second = create_run(&pool, &t.id, "2026-08-26T08:00", "schedule", "normal", None).await;
+        create_run(
+            &pool,
+            &t.id,
+            "2026-08-26T08:00",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
+        let second = create_run(
+            &pool,
+            &t.id,
+            "2026-08-26T08:00",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await;
         assert!(second.is_err(), "duplicate occurrence must be rejected");
     }
 
@@ -2626,9 +3305,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let run = create_run(&pool, &t.id, "occ", "manual", "normal", None)
-            .await
-            .unwrap();
+        let run = create_run(
+            &pool,
+            &t.id,
+            "occ",
+            "manual",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         let bare = sqlx::query("UPDATE runs SET status = 'failed' WHERE id = ?")
             .bind(&run.id)
@@ -2689,7 +3375,7 @@ mod tests {
             &t.id,
             "2026-08-26T08:00Z",
             "schedule",
-            "normal",
+            crate::models::RunMode::NORMAL,
             None,
         )
         .await
@@ -2733,9 +3419,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let r1 = create_run(&pool, &t.id, "slot-A", "schedule", "normal", None)
-            .await
-            .unwrap();
+        let r1 = create_run(
+            &pool,
+            &t.id,
+            "slot-A",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         // First attempt books court 2.
         let FenceVerdict::Armed(id) =
@@ -2774,9 +3467,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = create_run(&pool, &t.id, "slot-B", "schedule", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "slot-B",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         // Armed, then the process died. Nobody knows if it went through.
         arm_side_effect(&pool, &r.id, &t.id, "slot-B", "booking", "")
@@ -2807,9 +3507,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = create_run(&pool, &t.id, "slot-C", "schedule", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "slot-C",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         let FenceVerdict::Armed(id) = arm_side_effect(&pool, &r.id, &t.id, "slot-C", "booking", "")
             .await
@@ -2845,9 +3552,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = create_run(&pool, &t.id, "w1", "schedule", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "w1",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         let FenceVerdict::Armed(a) = arm_side_effect(&pool, &r.id, &t.id, "w1", "booking", "")
             .await
@@ -2889,9 +3603,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = create_run(&pool, &t.id, "manual/one", "manual", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "manual/one",
+            "manual",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert!(recent_commit(&pool, &t.id, "booking", "", 10)
             .await
@@ -2910,9 +3631,16 @@ mod tests {
             .unwrap();
 
         // A second manual run is a different occurrence, so the fence allows it.
-        let r2 = create_run(&pool, &t.id, "manual/two", "manual", "normal", None)
-            .await
-            .unwrap();
+        let r2 = create_run(
+            &pool,
+            &t.id,
+            "manual/two",
+            "manual",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
         assert!(matches!(
             arm_side_effect(&pool, &r2.id, &t.id, "manual/two", "booking", "")
                 .await
@@ -2944,9 +3672,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = create_run(&pool, &t.id, "old", "manual", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "old",
+            "manual",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
         let FenceVerdict::Armed(id) = arm_side_effect(&pool, &r.id, &t.id, "old", "booking", "")
             .await
             .unwrap()
@@ -2981,10 +3716,25 @@ mod tests {
         )
         .await
         .unwrap();
-        try_create_run(&pool, &t.id, "slot", "schedule", "normal", None)
-            .await
-            .unwrap();
-        let again = try_create_run(&pool, &t.id, "slot", "schedule", "normal", None).await;
+        try_create_run(
+            &pool,
+            &t.id,
+            "slot",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
+        let again = try_create_run(
+            &pool,
+            &t.id,
+            "slot",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await;
         assert!(
             matches!(again, Err(CreateRunError::AlreadyExists)),
             "a second run for one slot must be reported as a duplicate, not a fault"
@@ -2992,7 +3742,15 @@ mod tests {
 
         // A genuine fault must NOT masquerade as a duplicate, or the occurrence
         // is lost silently.
-        let bad = try_create_run(&pool, "no-such-task", "slot2", "schedule", "normal", None).await;
+        let bad = try_create_run(
+            &pool,
+            "no-such-task",
+            "slot2",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await;
         assert!(
             matches!(bad, Err(CreateRunError::Other(_))),
             "a foreign key failure must not be read as 'already ran'"
@@ -3036,9 +3794,16 @@ mod tests {
         .await
         .unwrap();
         activate_task(&pool, &t.id).await.unwrap();
-        let r = create_run(&pool, &t.id, "slot", "schedule", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "slot",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
         set_run_status(&pool, &r.id, "running").await.unwrap();
         arm_side_effect(&pool, &r.id, &t.id, "slot", "booking", "")
             .await
@@ -3080,14 +3845,21 @@ mod tests {
         .await
         .unwrap();
         assert!(busy_run_for_task(&pool, &t.id).await.unwrap().is_none());
-        let r = create_run(&pool, &t.id, "s", "manual", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "s",
+            "manual",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             busy_run_for_task(&pool, &t.id).await.unwrap(),
             Some(r.id.clone())
         );
-        finish_run_ok(&pool, &r.id, "done").await.unwrap();
+        finish_run_ok(&pool, &r.id, "done", None).await.unwrap();
         assert!(busy_run_for_task(&pool, &t.id).await.unwrap().is_none());
     }
 
@@ -3105,9 +3877,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = create_run(&pool, &t.id, "slot", "schedule", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "slot",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
         arm_side_effect(&pool, &r.id, &t.id, "slot", "booking", "")
             .await
             .unwrap();
@@ -3143,9 +3922,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = create_run(&pool, &t.id, "slot", "schedule", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "slot",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
         arm_side_effect(&pool, &r.id, &t.id, "slot", "booking", "")
             .await
             .unwrap();
@@ -3244,10 +4030,17 @@ mod tests {
         .await
         .unwrap();
         for (i, note) in ["older", "newer"].iter().enumerate() {
-            let r = create_run(&pool, &t.id, &format!("s{i}"), "manual", "normal", None)
-                .await
-                .unwrap();
-            finish_run_ok(&pool, &r.id, "ok").await.unwrap();
+            let r = create_run(
+                &pool,
+                &t.id,
+                &format!("s{i}"),
+                "manual",
+                crate::models::RunMode::NORMAL,
+                None,
+            )
+            .await
+            .unwrap();
+            finish_run_ok(&pool, &r.id, "ok", None).await.unwrap();
             set_run_notes(&pool, &r.id, note).await.unwrap();
         }
         let notes = recent_notes(&pool, &t.id, 5).await.unwrap();
@@ -3665,7 +4458,7 @@ mod tests {
             &t.id,
             "2099-01-01T08:00:00Z",
             "schedule",
-            "normal",
+            crate::models::RunMode::NORMAL,
             None,
         )
         .await
@@ -3675,7 +4468,7 @@ mod tests {
             &t.id,
             &format!("manual/{}", crate::new_id()),
             "manual",
-            "normal",
+            crate::models::RunMode::NORMAL,
             None,
         )
         .await
@@ -4036,7 +4829,7 @@ mod tests {
             &t.id,
             "2026-08-26T08:00:00Z",
             "schedule",
-            "normal",
+            crate::models::RunMode::NORMAL,
             None,
         )
         .await
@@ -4064,9 +4857,16 @@ mod tests {
     async fn a_scope_the_person_chose_gets_its_own_go_ahead() {
         let pool = open_memory().await.unwrap();
         let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
-        let r = create_run(&pool, &t.id, "slot", "schedule", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "slot",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         // Telling two people about one booking is two separate promises, and
         // neither is a repeat of the other.
@@ -4094,9 +4894,16 @@ mod tests {
     async fn a_repeat_check_for_one_person_ignores_what_was_sent_to_another() {
         let pool = open_memory().await.unwrap();
         let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
-        let r = create_run(&pool, &t.id, "slot", "schedule", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "slot",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         let FenceVerdict::Armed(id) =
             arm_side_effect(&pool, &r.id, &t.id, "slot", "message", "recipient-a")
@@ -4124,9 +4931,16 @@ mod tests {
     async fn a_message_to_one_person_still_counts_as_something_this_task_has_just_done() {
         let pool = open_memory().await.unwrap();
         let t = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
-        let r = create_run(&pool, &t.id, "slot", "schedule", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "slot",
+            "schedule",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         let FenceVerdict::Armed(id) =
             arm_side_effect(&pool, &r.id, &t.id, "slot", "message", "recipient-mum")
@@ -4406,9 +5220,16 @@ mod tests {
         )
         .await
         .unwrap();
-        let r = create_run(&pool, &t.id, "s", "manual", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "s",
+            "manual",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         let artifact = record_artifact(&pool, &r.id, "screenshot", "runs/x/shots/y.png", 1234)
             .await
@@ -4447,9 +5268,16 @@ mod tests {
         };
         let t = mk("T").await.unwrap();
         let other = mk("U").await.unwrap();
-        let r = create_run(&pool, &t.id, "s", "manual", "normal", None)
-            .await
-            .unwrap();
+        let r = create_run(
+            &pool,
+            &t.id,
+            "s",
+            "manual",
+            crate::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(count_open_holds(&pool, &t.id).await.unwrap(), 0);
         assert!(open_hold_counts(&pool).await.unwrap().is_empty());

@@ -107,10 +107,25 @@ impl Api {
         self.as_token(&admin, Method::GET, path, None, None).await.1
     }
 
+    /// The same, keeping the status code, for asking whether something is
+    /// there at all rather than what it says.
+    pub async fn get_status(&self, path: &str) -> (u16, Value) {
+        let admin = self.admin.clone();
+        self.as_token(&admin, Method::GET, path, None, None).await
+    }
+
     pub async fn post(&self, path: &str, body: Value) -> (u16, Value) {
         let admin = self.admin.clone();
         self.as_token(&admin, Method::POST, path, Some(body), None)
             .await
+    }
+
+    /// A POST with no body at all, the way everything written before an
+    /// endpoint took one still sends it. An endpoint that grows an optional
+    /// body has to keep answering these.
+    pub async fn post_with_no_body(&self, path: &str) -> (u16, Value) {
+        let admin = self.admin.clone();
+        self.as_token(&admin, Method::POST, path, None, None).await
     }
 
     pub async fn patch(&self, path: &str, body: Value) -> (u16, Value) {
@@ -139,13 +154,15 @@ pub async fn a_task(api: &Api, body: Value) -> String {
     task["id"].as_str().expect("a task id").to_string()
 }
 
-/// Give a task an approved playbook, which is the one gate between "somebody
-/// watched it try once" and "it does this alone at eight in the morning".
+/// Put a task in the state where it is allowed to run unattended.
 ///
-/// This is the call the executor makes when a teach run finishes and the person
-/// approves what it wrote; running a real teach run in a test would need a
-/// model and a browser.
+/// That state used to be "a person approved a playbook" and is now "it has
+/// really done the job once": proven rather than reviewed. So this writes both
+/// the plan such a run would leave behind and the successful run itself, which
+/// is what the gate actually asks about. Doing the real thing in a test would
+/// need a model and a browser.
 pub async fn taught(api: &Api, task_id: &str) {
+    proven(api, task_id).await;
     let version = errand_core::db::next_playbook_version(&api.pool, task_id)
         .await
         .expect("the next version number");
@@ -174,6 +191,32 @@ pub async fn taught(api: &Api, task_id: &str) {
     )
     .await
     .expect("storing the playbook");
+}
+
+/// Record one real, successful run, the evidence the schedule gate asks for.
+///
+/// Deliberately not a rehearsal: a rehearsal is told to carry on as though
+/// everything worked and lands in the same 'succeeded' column having touched
+/// nothing, so it proves nothing and the gate excludes it.
+pub async fn proven(api: &Api, task_id: &str) {
+    let run = errand_core::db::create_run(
+        &api.pool,
+        task_id,
+        &format!("proof/{task_id}"),
+        "manual",
+        errand_core::models::RunMode::NORMAL,
+        None,
+    )
+    .await
+    .expect("a run to prove it works");
+    errand_core::db::finish_run_ok(
+        &api.pool,
+        &run.id,
+        "Did the job.",
+        Some("Here is what it found."),
+    )
+    .await
+    .expect("finishing the proof run");
 }
 
 /// A task that is taught, active, and only ever runs when asked.

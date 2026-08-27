@@ -12,6 +12,8 @@
 -->
 <script lang="ts">
   import { onMount } from "svelte";
+  import Trouble from "$lib/components/Trouble.svelte";
+  import { reconnecting } from "$lib/reconnect.svelte";
   import {
     api,
     ApiError,
@@ -52,14 +54,18 @@
     narrator: "Writing the message you get",
   };
 
-  async function load() {
-    try {
+  const conn = reconnecting(
+    async () => {
       setup = await api.ai();
       if (!services.length) services = await api.aiCatalogue();
-      problem = null;
-    } catch (e) { problem = e instanceof ApiError ? e.message : String(e); }
-  }
-  onMount(load);
+    },
+    (p) => (problem = p),
+  );
+  const load = conn.run;
+  onMount(() => {
+    conn.run();
+    return conn.stop;
+  });
 
   async function act(fn: () => Promise<unknown>) {
     busy = true;
@@ -205,7 +211,9 @@
   you see which one, and change it.
 </p>
 
-{#if problem}<div class="err"><h3>Something went wrong</h3><div>{problem}</div></div>{/if}
+{#if problem}
+  <Trouble {problem} retrying={conn.retrying} onRetry={() => conn.run(true)} />
+{/if}
 
 {#if setup}
   <h2>What is doing each job</h2>
@@ -310,6 +318,15 @@
               Any model that can use tools can do this job. One that only answers questions cannot
               drive a browser. Being able to is not the same as being good at it: a small model
               will misread a page and give up half way through, so use the best one you have.
+            </div>
+
+            <!-- Said from this end as well as from the task's, because whoever
+                 is looking at one of the two screens is the one who needs to
+                 know that the other exists. -->
+            <div class="muted">
+              This is the default for every task. A single task can name a model of its own on its
+              page, and that choice wins for that task: worth doing where a task reads your mail
+              or anything else private, since the model doing the job is what reads it.
             </div>
           {/if}
         {/if}

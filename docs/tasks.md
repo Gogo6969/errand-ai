@@ -86,6 +86,22 @@ when the task finishes counts against it too. A task linked to more people than
 its limit allows will tell the first few and say in the timeline who it did not
 tell.
 
+## Which AI does it
+
+Every task follows the model chosen on the AI screen unless it names one of its
+own. **Which AI does this task** on the task's page holds that choice, with
+*Default* first, naming what the default currently is.
+
+It is worth setting where the work is private. Whichever model carries the task
+out is the model that reads what the task reads, so a task that goes through
+your mail can be kept on a model running on your own machine while everything
+else uses a service.
+
+A model Errand has asked and found unable to use tools cannot be picked, because
+it cannot drive a browser. One that is merely switched off can: if it is not
+available when the task runs, the run goes ahead on the next model that works
+and says in its timeline what it was asked for and why it could not have it.
+
 ## Teaching it
 
 The first run works only from your description, with you watching. At the end
@@ -97,8 +113,27 @@ You read that plan and approve it. **Nothing runs on a schedule until a plan is
 approved**, and that gate applies whether you arm the task or change it onto a
 schedule afterwards.
 
+There are two ways to teach it, and the difference is whether the job really
+happens:
+
+- **Teach it once, for real.** It books the court, sends the message, moves the
+  post. Right for a job where nothing is lost by doing it.
+- **Teach it as a rehearsal.** The same run, watched the same way, writing the
+  same plan, with anything irreversible recorded as what it would have done.
+  Nothing is booked, sent, bought or moved.
+
+**If the job books, sends, buys or moves anything, rehearse it first.** A task
+cannot run at all until it has been taught, so the teaching run is the first
+run of the job and the only one you watch from the beginning.
+
+A plan written by a rehearsal says so, above the Approve button, so you always
+know whether the run behind a plan really did what it describes.
+
 ## Rehearsing
 
 *Rehearse* runs the task normally but records anything irreversible instead of
 doing it. Nothing is booked, sent or deleted. It is the cheapest way to find out
 that a site has changed.
+
+Rehearsing is available at both ends: on the first run, as a way of teaching it
+(above), and on any later run of a task that already has an approved plan.

@@ -8,16 +8,17 @@ whether your task text leaves the machine.
 
 | Job | What it does | Needs |
 |---|---|---|
-| Doing the task | Opens the browser, signs in, decides what to click | Claude |
+| Doing the task | Opens the browser, signs in, decides what to click | A model that can use tools |
 | Working out why something failed | Reads a failed run, suggests what to try | Any model |
 | Writing the message you get | Turns an outcome into a sentence | Any model |
 | Writing down what it learned | Writes the plan when a run leaves none | Any model |
 
-Only the first needs a model that can drive a browser over many turns and call
-tools. That is the Claude command line tool, which brings its own agent loop.
-Making a plain chat endpoint do it means writing the loop, the tool protocol and
-the containment again, and claiming otherwise would be a lie you only discover
-at eight on a Wednesday.
+Only the first has to drive a browser over many turns, and the one thing that
+asks of a model is tool calling. Errand owns the loop, the tools, the budget and
+the fence, whether the work is done by the Claude command line tool or by a
+model on the machine under your desk, so anything that will call a tool can do
+this job. Being able to is not the same as being good at it: a small model
+misreads a page and gives up half way through a booking.
 
 The other jobs are one question with one answer, so any competent model can do
 them, including one on your own machine, where your run history never leaves
@@ -32,6 +33,23 @@ used to leave nothing at all, and a task with no plan can never be armed, so the
 only remedy was to teach it again and hope. Now the plan is worked out from the
 record of the run instead, by whichever model you choose. It is labelled as
 inferred, and it arrives unapproved like any other, and you still read it first.
+
+## The default, and one task at a time
+
+The AI screen holds the default: whichever model is chosen for *doing the task*
+is what every task uses. A single task can name a model of its own on its page,
+and that choice wins for that task.
+
+That is not a preference. Whichever model carries a task out is the model that
+reads whatever the task reads, so a task that opens your mail wants one on your
+own machine, while a task that books a tennis court may as well use the best one
+you have. Bound globally, choosing a local model for the mail would put every
+other task on it too.
+
+A task's choice is a preference in one direction only: if the model it names is
+switched off, removed, or put out of reach by *keep everything on this machine*,
+the run falls through to the next model that works rather than failing, and says
+in its journal what it was asked for and why it could not have it.
 
 ## Services
 
@@ -84,8 +102,9 @@ A machine name usually beats a number, because numbers change:
 
 *Keep everything on this machine* is a real restriction, not a preference: with
 it on, Errand refuses to send anything to a model it does not reach on your own
-machine or network. Tasks that need a browser stop working, because that needs
-Claude. Errand will not let you turn it on until there is a local model to use.
+machine or network. Browsing still works: a model on your own network drives the
+browser through the same tools the Claude command line tool uses. Errand will not
+let you turn it on until there is a local model to use.
 
 ## What leaves your machine
 

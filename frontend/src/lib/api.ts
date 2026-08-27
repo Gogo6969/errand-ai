@@ -19,6 +19,14 @@ export interface Task {
   auto_paused: boolean;
   playbook_version?: number | null;
   allowed_domains: string[];
+  /**
+   * Which model carries this task out, by its id in the AI screen's list.
+   *
+   * Null means the task has not said, so it follows the default. Worth setting
+   * where it matters: whichever model does the work is the one that reads
+   * whatever the task reads.
+   */
+  model_id?: string | null;
   schedule?: unknown;
   notify?: Record<string, boolean>;
   limits?: Record<string, number>;
@@ -33,8 +41,20 @@ export interface Task {
 
 export interface Failure {
   code: string;
+  /** One line: what stopped it. */
   plain_reason: string;
+  /** One line: the single thing to do about it, where there is one. */
+  fix?: string | null;
   technical?: string;
+}
+
+/** Somewhere a run also put its answer, because the task asked for a copy. */
+export interface AnswerCopy {
+  id: string;
+  /** "note" | "file" | "message" */
+  kind: string;
+  /** What to call it on screen: a note title, a file name, a person. */
+  label: string;
 }
 
 export interface Run {
@@ -42,8 +62,22 @@ export interface Run {
   task_id: string;
   status: string;
   mode: string;
+  /**
+   * Was everything irreversible recorded rather than done? Separate from the
+   * mode, because a teach run can be a rehearsal too: read this, never the mode.
+   */
+  rehearsal?: boolean;
   trigger: string;
+  /** One line about the work: where it went, what it had to do. */
   summary?: string | null;
+  /**
+   * What the run produced: the thing the task was set up to get.
+   *
+   * Separate from the summary because they are separate things, and for a long
+   * while only the summary existed, so a task that was asked to find something
+   * out reported the filing and not the finding.
+   */
+  answer?: string | null;
   failure?: Failure | null;
   cost_usd: number;
   started_at?: string | null;
@@ -199,9 +233,22 @@ export const api = {
   health: () => call<Health>("GET", "/v1/health/detail"),
   tasks: () => call<{ items: Task[] }>("GET", "/v1/tasks").then((r) => r.items),
   task: (id: string) => call<Task>("GET", `/v1/tasks/${id}`),
+  /**
+   * Create a task. The name is optional: leave it empty and Errand works one
+   * out from the description, the same way it works out which sites the job
+   * needs. The reply carries `set_up`, which is what it decided and why.
+   */
   createTask: (name: string, description: string, emoji?: string, allowed_domains?: string[]) =>
-    call<Task>("POST", "/v1/tasks", { name, description, emoji, allowed_domains }),
-  teach: (id: string) => call<Run>("POST", `/v1/tasks/${id}/teach`),
+    call<Task & { set_up?: { what: string; because: string }[] }>("POST", "/v1/tasks", {
+      name: name.trim() || undefined,
+      description,
+      emoji,
+      // Sent only when the person named some, so an empty list is not mistaken
+      // for "this task may open nothing".
+      allowed_domains: allowed_domains?.length ? allowed_domains : undefined,
+    }),
+  teach: (id: string, rehearse = false) =>
+    call<Run>("POST", `/v1/tasks/${id}/teach`, { dry_run: rehearse }),
   run: (id: string, dryRun = false) => call<Run>("POST", `/v1/tasks/${id}/run`, { dry_run: dryRun }),
   pause: (id: string, reason?: string) => call("POST", `/v1/tasks/${id}/pause`, { reason }),
   resume: (id: string) => call("POST", `/v1/tasks/${id}/resume`),
@@ -211,10 +258,39 @@ export const api = {
 
   runs: (taskId?: string) =>
     call<{ items: Run[] }>("GET", taskId ? `/v1/runs?task_id=${taskId}` : "/v1/runs").then((r) => r.items),
-  runDetail: (id: string) => call<Run & { steps: Step[] }>("GET", `/v1/runs/${id}`),
+  runDetail: (id: string) =>
+    call<Run & { steps: Step[]; answer_copies: AnswerCopy[] }>("GET", `/v1/runs/${id}`),
+  /** Show the person a copy of an answer where the run also put it. */
+  openAnswerCopy: (id: string) => call("POST", `/v1/answer-copies/${id}/open`),
+  /** Answer the question a run stopped to ask. Run the task again afterwards. */
+  /**
+   * Get rid of a task. By default it is put away: it stops for good and what
+   * it did is kept, because the record of a booking is what stops a later run
+   * making the same one twice. `forget` removes that too, for a task that
+   * should never have existed.
+   */
+  removeTask: (id: string, forget = false) =>
+    call<{ archived?: string; forgotten?: string; runs_removed?: number }>(
+      "DELETE",
+      `/v1/tasks/${id}${forget ? "?forget=true" : ""}`,
+    ),
+  answerQuestion: (runId: string, answer: string) =>
+    call<{ answered: string; task_id: string }>("POST", `/v1/runs/${runId}/answer`, { answer }),
 
   playbook: (id: string) =>
-    call<{ active: { version: number; goal: string; markdown: string } | null; versions: any[]; note: string }>(
+    call<{
+      active: { version: number; goal: string; markdown: string } | null;
+      versions: {
+        version: number;
+        source: string;
+        approved: boolean;
+        changelog: string | null;
+        created_at: string;
+        /** The plan itself. Present whether or not anybody has approved it. */
+        markdown: string | null;
+      }[];
+      note: string;
+    }>(
       "GET",
       `/v1/tasks/${id}/playbook`,
     ),
@@ -295,6 +371,14 @@ export interface TaskPatch {
   notify?: unknown;
   limits?: unknown;
   allowed_domains?: string[];
+  /**
+   * Which model carries the task out. Null puts it back on the default.
+   *
+   * Leaving it out is not the same as sending null, and that difference is
+   * load-bearing: every other save on the task page leaves this out, and a task
+   * must keep the model it was given when somebody edits its sites.
+   */
+  model_id?: string | null;
   /** Set after a schedule_change_may_repeat refusal, once the person has read it. */
   acknowledge_repeat?: boolean;
 }

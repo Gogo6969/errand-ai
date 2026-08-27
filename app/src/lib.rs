@@ -314,6 +314,59 @@ async fn artifact(state: tauri::State<'_, Daemon>, id: String) -> Result<String,
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
+/// Put the background service in place, if it is not already.
+///
+/// Runs on every launch and does nothing when there is nothing to do, which is
+/// the normal case. Installing is idempotent: `Launchd::install` writes the
+/// same plist and reloads it, so a repaired or updated app quietly corrects a
+/// LaunchAgent pointing at an older copy.
+///
+/// Deliberately never blocks the window. A person opening the app should see it
+/// open; whether the service came up is the frontend's story to tell, and it
+/// retries by itself while this works.
+fn make_sure_the_daemon_is_installed() {
+    let Some(exe) = daemon_beside_the_app() else {
+        tracing_note("could not work out where this app keeps its background service");
+        return;
+    };
+    // Gatekeeper runs a quarantined download from a randomised read-only path.
+    // Writing that path into a LaunchAgent means the service never starts again
+    // after the next login, silently, so this refuses rather than half-works.
+    if errand_core::paths::is_translocated(&exe) {
+        tracing_note(
+            "Errand is running from a temporary copy, which macOS does to apps opened straight \
+             from a download or a disk image. Move Errand-AI to your Applications folder and \
+             open it from there.",
+        );
+        return;
+    }
+    use errand_core::launchd::ServiceManager;
+    match errand_core::launchd::Launchd.install(&exe) {
+        Ok(plist) => tracing_note(&format!(
+            "background service installed at {}",
+            plist.display()
+        )),
+        Err(e) => tracing_note(&format!("could not install the background service: {e}")),
+    }
+}
+
+/// The daemon that ships inside this app bundle.
+///
+/// Tauri puts an `externalBin` beside the app's own executable, so it is a
+/// sibling of whatever is running now. Derived rather than searched for,
+/// because a wrong guess here writes a wrong path into a file that outlives
+/// the app.
+fn daemon_beside_the_app() -> Option<std::path::PathBuf> {
+    let me = std::env::current_exe().ok()?;
+    let beside = me.parent()?.join("errandd");
+    beside.exists().then_some(beside)
+}
+
+/// One line in the log, since there is no window to say it in yet.
+fn tracing_note(msg: &str) {
+    eprintln!("errand-app: {msg}");
+}
+
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
@@ -326,6 +379,14 @@ pub fn run() {
             if let Some(w) = app.get_webview_window("main") {
                 let _ = w.show();
             }
+            // The app brings its own background service and, until now, never
+            // started it. Everything this program does happens in that service,
+            // so a person who downloaded the app and opened it got a window
+            // where every screen said the background service was not answering,
+            // and the only instructions were to run a command that is not on
+            // anybody's PATH. Nothing in here was reachable from the other side
+            // of that.
+            std::thread::spawn(make_sure_the_daemon_is_installed);
             Ok(())
         })
         .run(tauri::generate_context!())

@@ -28,16 +28,17 @@ sites, deciding as it goes, repairing itself when a page changes, and reporting 
 Not a cron scheduler. Every run is executed by an AI that reads your task description and
 decides what to do, which is what lets it cope with a site that moved a button since last week.
 
-The loop is: **describe, teach, approve, repeat.**
+The loop is: **describe, watch it once, put it on a schedule.**
 
-1. **Describe.** You write the task the way you would explain it to a person.
-2. **Teach.** A visible browser opens and the agent attempts the job while narrating. You can
-   pause, take over, or correct it mid-run.
-3. **Approve.** The agent distils what it learned into a playbook, in markdown, that you read and
-   approve. Nothing is ever scheduled before you approve it.
-4. **Repeat.** It runs on your schedule. When a page changes it tries to repair its own approach.
-   When it genuinely cannot finish, it stops and tells you what it was doing, why it could not,
-   and what you can do about it.
+1. **Describe.** You write the task the way you would explain it to a person. Errand reads it,
+   works out what it needs (which sites, when to run, what it may touch) and tells you in a line
+   or two what it set up.
+2. **It does the job.** No approval step and nothing to read first: it works the job out and does
+   it while you watch, and shows you the answer. If it goes wrong it tries another way, and it
+   stops itself rather than going round for ever. What it learned becomes how the job is done.
+3. **Put it on a schedule.** Only offered once it has really done the job with you there: proven,
+   rather than approved. From then on it runs on its own, repairs its own approach when a page
+   changes, and stops itself if it fails three times in a row.
 
 ## Design commitments
 
@@ -107,14 +108,20 @@ Requires a stable Rust toolchain and macOS.
 ```bash
 cargo test --workspace       # 307 tests, including a real keychain round-trip
 ./scripts/smoke.sh           # drives the real daemon through the real API
-cargo tauri build            # produces Errand-AI.app and a DMG
 ```
 
-The bundle carries the browser helper, so building it also needs Node 20 and the helper's own
-dependencies:
+Building the app bundle needs three more things first, in this order. It is the order that
+matters: the bundler copies the daemon in by target triple, so a bundle built before that file
+exists is a bundle with nothing inside it.
 
 ```bash
+npm --prefix frontend install
 npm --prefix sidecars/browser-agent install
+cargo install tauri-cli --version "^2" --locked
+cargo build --release -p errand-runner --bin errandd
+mkdir -p app/binaries
+cp target/release/errandd "app/binaries/errandd-$(rustc -vV | sed -n 's/host: //p')"
+cd app && cargo tauri build   # produces Errand-AI.app and a DMG
 ```
 
 Errand drives a Chrome-family browser you already have rather than downloading its own. It uses a
@@ -129,18 +136,27 @@ cargo run -p errand-runner -- --foreground
 Install it as a background agent that starts at login:
 
 ```bash
-./target/debug/errandd install "$(pwd)/target/debug/errandd"
+./scripts/dev-install.sh
 ```
+
+Never point the agent at `target/debug` yourself. cargo rewrites that file on
+every build, and macOS deadlocks a launchd-spawned process in dyld while it
+tries to validate a signature that changed underneath it: the process sits on
+its own binary for ever, alive but never reaching main, with no log and nothing
+listening. The script builds, copies to a stable path, signs it there, and
+points the agent at the copy.
 
 Diagnose anything that is not working:
 
 ```bash
-./target/debug/errandd doctor
+"$HOME/Library/Application Support/com.errandai.app/bin/errandd" doctor
 ```
 
 ## The API
 
-Loopback only, on `http://127.0.0.1:4477`. Bearer token, minted on first boot into your keychain.
+Loopback only, on `http://127.0.0.1:4477`. Bearer token, minted on first boot. A signed build keeps it in the keychain; a
+build from source keeps it in a file next to the database, so a rebuild does not
+ask for permission again.
 
 ```bash
 TOKEN=$(errandd token)

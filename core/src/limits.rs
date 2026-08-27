@@ -27,6 +27,19 @@ pub struct Limits {
     /// than one that fails.
     #[serde(default = "d_messages")]
     pub max_messages: i64,
+    /// Real money, in dollars, that this task may commit in one run.
+    ///
+    /// Zero by default, and zero means "may not spend anything". Every other
+    /// limit here is a ceiling on something a task does anyway; this one is a
+    /// permission. A task cannot buy so much as a paperclip until somebody has
+    /// written down a number, and the number is the most it may spend on one
+    /// run, not per item.
+    ///
+    /// Deliberately not the same thing as `max_usd`, which is what the models
+    /// cost. Those two numbers have nothing to do with each other and sharing
+    /// one would let a cheap run buy an expensive thing.
+    #[serde(default)]
+    pub max_spend_usd: f64,
 }
 
 fn d_steps() -> i64 {
@@ -41,6 +54,15 @@ fn d_usd() -> f64 {
 fn d_heal() -> i64 {
     2
 }
+/// How many times in a row a task may fail before it stops running itself.
+///
+/// Not a per-run ceiling like the others: this is the one that stops a task
+/// from failing the same way every hour for a week. Three, because two can be
+/// a site having a bad afternoon and three is a pattern. It only stops the
+/// scheduled runs; pressing Run now still works, which is what somebody
+/// fixing it will be doing.
+pub const FAILURES_BEFORE_PAUSING: i64 = 3;
+
 fn d_messages() -> i64 {
     3
 }
@@ -53,6 +75,9 @@ impl Default for Limits {
             max_usd: d_usd(),
             max_heal_cycles: d_heal(),
             max_messages: d_messages(),
+            // Not a default anybody chose: a task that has never been given a
+            // spending limit has not been given permission to spend.
+            max_spend_usd: 0.0,
         }
     }
 }

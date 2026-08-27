@@ -28,10 +28,15 @@ pub fn router(state: AppState) -> Router {
     let private = Router::new()
         .route("/v1/health/detail", get(health_detail))
         .route("/v1/tasks", get(list_tasks).post(create_task))
-        .route("/v1/tasks/{id}", get(get_task).patch(patch_task))
+        .route(
+            "/v1/tasks/{id}",
+            get(get_task).patch(patch_task).delete(remove_task),
+        )
         .route("/v1/schedule/preview", post(preview_schedule))
         .route("/v1/tasks/{id}/activate", post(activate_task))
         .route("/v1/tasks/{id}/teach", post(teach_task))
+        .route("/v1/runs/{id}/answer", post(answer_a_question))
+        .route("/v1/answer-copies/{id}/open", post(open_answer_copy))
         .route("/v1/tasks/{id}/playbook", get(get_playbook))
         .route(
             "/v1/tasks/{id}/playbook/{version}/approve",
@@ -132,9 +137,10 @@ const PREVIEW_COUNT: usize = 3;
 /// differently, a person meeting the second would think they had hit a
 /// different problem.
 const NOT_TAUGHT: &str =
-    "This task has no approved playbook, so putting it on a schedule would send an unattended \
-     agent at a site with no agreed way of doing the job. Teach it once and approve what it \
-     wrote first.";
+    "This task has never actually done the job, so putting it on a schedule would send an \
+     unattended agent at a site having never once seen it work. Press Run now and let it \
+     finish first. A rehearsal does not count, because a rehearsal is told to carry on as \
+     though everything worked and touches nothing.";
 
 /// A task, plus its schedule said in words and the next few times it will run.
 ///
@@ -158,10 +164,18 @@ fn task_json(
             "id": r.id,
             "status": r.status,
             "mode": r.mode,
+            // Said separately from the mode, because a teach run can be a
+            // rehearsal too and a screen reading only the mode would call it a
+            // run that did things for real.
+            "rehearsal": r.rehearsal,
             "trigger": r.trigger,
             "created_at": r.created_at,
             "finished_at": r.finished_at,
             "summary": r.summary,
+            // What it produced. Sent even when null, because "this run recorded
+            // no answer" is a fact the screen has to be able to tell from an
+            // older build that never had the field.
+            "answer": r.answer,
             "failure": r.failure,
         }),
         None => serde_json::Value::Null,
@@ -255,7 +269,11 @@ async fn get_task(
 
 #[derive(Deserialize)]
 struct CreateTask {
-    name: String,
+    /// Optional. A person describing a job has already said what it is, and
+    /// making them name it too is asking for the same thing twice. When it is
+    /// left out, one is worked out from the description.
+    #[serde(default)]
+    name: Option<String>,
     description: String,
     emoji: Option<String>,
     #[serde(default)]
@@ -274,9 +292,6 @@ async fn create_task(
     Json(body): Json<CreateTask>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require(&caller, Scope::Manage)?;
-    if body.name.trim().is_empty() {
-        return Err(ApiError::bad_request("A task needs a name."));
-    }
     if body.description.trim().is_empty() {
         return Err(ApiError::bad_request(
             "A task needs a description. That description is what the agent actually reads, \
@@ -288,7 +303,39 @@ async fn create_task(
             &label,
         )));
     }
-    let schedule = body.schedule.unwrap_or_else(|| json!({ "kind": "manual" }));
+    // Work out what the job needs before anything is stored.
+    //
+    // Two halves. What the description says outright, which is exact and free;
+    // and what it does not, which a model is asked about. "Show me the latest
+    // Bitcoin news" names no site, and a task written that way used to fail on
+    // its first run saying it had no approved websites, while the same agent
+    // listed three it would have used. It knew. It had no way to say so in
+    // time.
+    let read = errand_core::setup::infer(&body.description);
+    let given_name = body
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .map(str::to_string);
+    let suggested = crate::setup::suggest(
+        &state,
+        &body.description,
+        given_name.is_none(),
+        read.mail.is_some(),
+    )
+    .await;
+    let name = given_name
+        .or(suggested.name)
+        .unwrap_or_else(|| crate::setup::name_from_description(&body.description));
+
+    // A schedule the caller gave always wins; one read out of the words is
+    // only used where they said nothing.
+    let inferred_schedule = body.schedule.is_none() && read.schedule.is_some();
+    let schedule = body
+        .schedule
+        .or(read.schedule.clone())
+        .unwrap_or_else(|| json!({ "kind": "manual" }));
     errand_core::schedule::ScheduleSpec::from_json(&schedule)
         .and_then(|s| s.validate())
         .map_err(|e| ApiError::bad_request(e.to_string()))?;
@@ -303,10 +350,32 @@ async fn create_task(
         None => (None, vec![]),
     };
 
+    // Sites worked out for them, only where they listed none of their own.
+    //
+    // Never merged into a list somebody typed: the first entry decides which
+    // browser profile a run uses, and that profile is where its saved logins
+    // live. Quietly putting a guess at the front of that list would hand a run
+    // a different signed-in identity than the one they meant.
+    let found_sites: Vec<String> = if domains.as_ref().is_some_and(|d| !d.is_empty()) {
+        vec![]
+    } else {
+        let mut all = read.domains.clone();
+        for s in &suggested.sites {
+            if !all.contains(s) {
+                all.push(s.clone());
+            }
+        }
+        all
+    };
+    let domains = match (&domains, found_sites.is_empty()) {
+        (Some(_), _) | (None, true) => domains,
+        (None, false) => Some(found_sites.clone()),
+    };
+
     let task = errand_core::db::create_task(
         state.pool(),
         errand_core::db::NewTask {
-            name: body.name,
+            name,
             description: body.description,
             emoji: body.emoji,
             schedule,
@@ -335,6 +404,14 @@ async fn create_task(
         task
     };
 
+    // Reaching into somebody's mail is the one inferred setting that is a
+    // permission, so it is granted only as far as the words go: reading when
+    // the job is about the mailbox, moving only when it asks for moving and
+    // nothing in the same description forbids it.
+    if let Some(mail) = read.mail {
+        let _ = errand_core::db::grant_mail(state.pool(), &task.id, mail.may_file).await;
+    }
+
     state.emit(Event::TaskUpdated {
         task_id: task.id.clone(),
     });
@@ -346,6 +423,28 @@ async fn create_task(
         .map_err(ApiError::from)?;
     let mut out = task_json(&task, holds, latest.get(&task.id));
     out["warnings"] = json!(warnings);
+
+    // What was decided for them, in the fewest lines that still explain
+    // themselves. Only what differs from a bare task appears here: a list that
+    // repeats the defaults is a list nobody reads twice.
+    let mut set_up: Vec<serde_json::Value> = vec![];
+    if !found_sites.is_empty() && !suggested.sites.is_empty() {
+        set_up.push(json!({
+            "what": format!("It may open {}", found_sites.join(", ")),
+            "because": "the job needs a website and you did not name one",
+        }));
+    }
+    for n in &read.notes {
+        // The sites line is already said above when they were worked out.
+        if n.what.starts_with("It may open") && !found_sites.is_empty() {
+            continue;
+        }
+        set_up.push(json!({ "what": n.what, "because": n.because }));
+    }
+    if !inferred_schedule {
+        set_up.retain(|n| n["what"] != json!("It runs on a schedule"));
+    }
+    out["set_up"] = json!(set_up);
     Ok(Json(out))
 }
 
@@ -366,6 +465,55 @@ struct PatchTask {
     /// it, change the schedule anyway.
     #[serde(default)]
     acknowledge_repeat: bool,
+    // `model_id` is deliberately not here. Its three answers cannot be told
+    // apart once a body has been parsed into this: leaving it out, sending it
+    // as null and sending an id all have to mean different things, and only the
+    // body as it arrived still knows which one was sent. See below.
+}
+
+/// What an edit says about the model that carries this task out.
+///
+/// Read from the body as it arrived rather than from `PatchTask`, because the
+/// distinction that matters here is between a field that is absent and a field
+/// that is null. Absent means the edit is about something else and the task
+/// keeps the model it was given: without that, saving a task's sites would
+/// forget which model it was told to use. Null, or the empty string an HTML
+/// menu sends for its first option, means "go back to the default".
+async fn read_model_choice(
+    state: &AppState,
+    raw: &serde_json::Value,
+) -> ApiResult<errand_core::providers::ModelChoice> {
+    use errand_core::providers::ModelChoice;
+
+    let named = match raw.get("model_id") {
+        None => return Ok(ModelChoice::Unchanged),
+        Some(serde_json::Value::Null) => return Ok(ModelChoice::Default),
+        Some(serde_json::Value::String(s)) if s.trim().is_empty() => {
+            return Ok(ModelChoice::Default)
+        }
+        Some(serde_json::Value::String(s)) => s.trim().to_string(),
+        Some(_) => {
+            return Err(ApiError::bad_request(
+                "The model for a task is named by its id, as text. Nothing was changed.",
+            ))
+        }
+    };
+
+    // Refused now rather than saved and used later, the same way choosing a
+    // model on the AI screen is. A choice that could never work is worse than
+    // no choice: it fails at the hour the task was meant to happen, with
+    // nobody watching.
+    let providers = errand_core::db::list_providers(state.pool())
+        .await
+        .map_err(ApiError::from)?;
+    let p = providers
+        .iter()
+        .find(|p| p.id == named)
+        .ok_or_else(|| ApiError::not_found("There is no such model in the list."))?;
+    if let Some(why) = p.cannot_carry_out_tasks(p.tools(&tools_seen(state).await)) {
+        return Err(ApiError::bad_request(why));
+    }
+    Ok(ModelChoice::Named(named))
 }
 
 /// Change a task's settings.
@@ -464,6 +612,8 @@ async fn patch_task(
         None => None,
     };
 
+    let model = read_model_choice(&state, &raw).await?;
+
     let new_spec = match &body.schedule {
         Some(v) => Some(
             errand_core::schedule::ScheduleSpec::from_json(v)
@@ -481,10 +631,9 @@ async fn patch_task(
         // one thing that gate exists to prevent.
         if spec.is_scheduled()
             && matches!(task.status.as_str(), "ready" | "paused")
-            && errand_core::db::active_playbook(state.pool(), &id)
+            && !errand_core::db::has_really_worked_once(state.pool(), &id)
                 .await
                 .map_err(ApiError::from)?
-                .is_none()
         {
             return Err(ApiError::conflict("task_not_taught", NOT_TAUGHT));
         }
@@ -522,6 +671,7 @@ async fn patch_task(
             notify: body.notify,
             limits: body.limits,
             allowed_domains: domains,
+            model,
         },
     )
     .await
@@ -746,11 +896,12 @@ async fn activate_task(
         .map_err(|e| ApiError::bad_request(e.to_string()))?
         .map(|occurrence| crate::scheduler::start_instant(&task, &spec, occurrence));
 
+    // The gate that is worth keeping: nothing runs unattended until it has
+    // really done the job once with somebody there.
     if spec.is_scheduled()
-        && errand_core::db::active_playbook(state.pool(), &id)
+        && !errand_core::db::has_really_worked_once(state.pool(), &id)
             .await
             .map_err(ApiError::from)?
-            .is_none()
     {
         return Err(ApiError::conflict("task_not_taught", NOT_TAUGHT));
     }
@@ -2000,8 +2151,8 @@ async fn list_automation(
                  turns both on. Errand checks each on its own rather than assuming that, so \
                  believe what each line says over this one.",
             "notes":
-                "Writing a note is how a task leaves you an answer you will actually see. \
-                 Without this a task can still save a file, and will say so.",
+                "Lets a task write into Apple Notes when you ask it for a note. The answer \
+                 itself always appears on the task, with or without this.",
         }
     })))
 }
@@ -2025,14 +2176,30 @@ async fn enable_automation(
     Ok(Json(serde_json::to_value(health).unwrap_or(json!({}))))
 }
 
+/// What a teach run may be asked for. Nothing is required: teaching for real is
+/// what this endpoint has always done with no body at all, and callers written
+/// before rehearsing existed must keep working exactly as they did.
+#[derive(Deserialize, Default)]
+struct TeachBody {
+    #[serde(default)]
+    dry_run: bool,
+}
+
 /// Start the supervised first run of a task.
 ///
 /// A teach run is how a task learns. It works from the description alone and
 /// writes down what actually worked, which a person then approves.
+///
+/// `{"dry_run": true}` teaches it as a rehearsal: the agent works the job out
+/// and writes its plan exactly as it would otherwise, and everything
+/// irreversible is recorded instead of done. That matters here more than
+/// anywhere, because a task may not run until it has been taught, so without
+/// this the first run of "clean my mailbox of spam" really moves the post.
 async fn teach_task(
     State(state): State<AppState>,
     Extension(caller): Extension<Caller>,
     Path(id): Path<String>,
+    body: Option<Json<TeachBody>>,
 ) -> ApiResult<Json<errand_core::models::Run>> {
     require(&caller, Scope::Run)?;
     let task = errand_core::db::get_task(state.pool(), &id)
@@ -2050,13 +2217,14 @@ async fn teach_task(
         ));
     }
 
+    let rehearsing = body.map(|b| b.0.dry_run).unwrap_or(false);
     let occurrence = format!("teach/{}", errand_core::new_id());
     let run = errand_core::db::try_create_run(
         state.pool(),
         &id,
         &occurrence,
         "teach",
-        "teach",
+        errand_core::models::RunMode::teach(rehearsing),
         Some(&caller.token_name),
     )
     .await
@@ -2073,8 +2241,13 @@ async fn teach_task(
         &run.id,
         "plan",
         &format!(
-            "Teaching '{}': working it out from the description",
-            task.name
+            "Teaching '{}': working it out from the description{}",
+            task.name,
+            if rehearsing {
+                ", as a rehearsal, so nothing that cannot be undone will really happen"
+            } else {
+                ""
+            }
         ),
         true,
         None,
@@ -2115,6 +2288,14 @@ async fn get_playbook(
             "goal": p.goal,
             "markdown": p.to_markdown(),
         })),
+        // Every version carries its own text, approved or not.
+        //
+        // The note below tells a person to read what the task wrote and then
+        // approve it. Until now only the approved version came back with any
+        // text in it, so the one thing they were being asked to read was the
+        // one thing they could not see -- which turns the approval gate, the
+        // single line between "tried once while somebody watched" and "runs
+        // alone at three in the morning", into a button people press blind.
         "versions": versions.iter().map(|v| json!({
             "version": v.version,
             "source": v.source,
@@ -2123,12 +2304,16 @@ async fn get_playbook(
             "created_by_run_id": v.created_by_run_id,
             "created_at": v.created_at,
             "sha256": v.sha256,
+            "markdown": errand_core::playbook::read(&id, v.version)
+                .ok()
+                .map(|p| p.to_markdown()),
         })).collect::<Vec<_>>(),
         "note": if active.is_none() {
-            "Nothing is approved yet, so scheduled runs will not start. Teach the task once, \
-             read what it wrote, then approve it."
+            "It has not worked out how to do this yet. Press Run now: it works the job out, does \
+             it, and writes down what worked."
         } else {
-            "Runs follow the approved version."
+            "This is how it does the job. A run wrote it after doing the job successfully, and a \
+             later run cannot replace it without you reading the new one first."
         }
     })))
 }
@@ -2328,20 +2513,17 @@ async fn run_task(
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found(format!("No task with id {id}.")))?;
 
-    // The single gate between "the agent tried this once" and "the agent does
-    // this alone". A task with no approved playbook may only be taught.
-    if errand_core::db::active_playbook(state.pool(), &id)
-        .await
-        .map_err(ApiError::from)?
-        .is_none()
-    {
-        return Err(ApiError::conflict(
-            "task_not_taught",
-            "This task has no approved playbook, so there is nothing to follow yet. Teach it \
-             once with POST /v1/tasks/{id}/teach, read what it wrote down, and approve that \
-             before it runs on its own.",
-        ));
-    }
+    // No gate here on purpose.
+    //
+    // This used to refuse a run on a task with no approved playbook, which
+    // read as a safety check and was not one: teach_task has never had such a
+    // gate and a teach run does the job for real, so a brand new task could
+    // already book, buy, file and message on its first run. All the check did
+    // was force that first run to be called "teach" and make somebody read a
+    // document first. Somebody pressing Run is watching; what protects them is
+    // the side-effect fence, the holds, the domain allowlist and the budgets,
+    // and none of those reads a playbook. The gate that matters is the one on
+    // getting onto a schedule, which is still there.
 
     // Refuse to start a second agent on a task that is already running one.
     // Two agents on the same task can each book the same slot, and the unique
@@ -2396,7 +2578,7 @@ async fn run_task(
         &id,
         &occurrence,
         "api",
-        if dry { "dry_run" } else { "normal" },
+        errand_core::models::RunMode::run(dry),
         Some(&caller.token_name),
     )
     .await
@@ -2491,9 +2673,155 @@ async fn get_run(
     let steps = errand_core::db::list_steps(state.pool(), &id)
         .await
         .map_err(ApiError::from)?;
+    let copies = errand_core::db::list_answer_copies(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?;
     let mut body = serde_json::to_value(&run).unwrap_or(json!({}));
     body["steps"] = serde_json::to_value(steps).unwrap_or(json!([]));
+    // Where else this run put its answer, if the task asked for a copy. The
+    // answer itself is above; these are the extra places it also went.
+    body["answer_copies"] = serde_json::to_value(copies).unwrap_or(json!([]));
     Ok(Json(body))
+}
+
+#[derive(Deserialize)]
+struct HowToRemove {
+    /// Really delete it, rather than putting it away. Off by default.
+    #[serde(default)]
+    forget: bool,
+}
+
+/// Get rid of a task.
+///
+/// Two different things, and the difference is worth a query parameter rather
+/// than a guess. Putting a task away stops it for good and keeps what it did:
+/// a task that has booked or bought something leaves rows in the side-effect
+/// record, and those rows are what stop a later run doing the same thing twice.
+/// Forgetting it removes those too, which is right for a test or a mistake and
+/// wrong for anything that ever touched the world.
+async fn remove_task(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(how): Query<HowToRemove>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    let task = errand_core::db::get_task(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found(format!("No task with id {id}.")))?;
+
+    if how.forget {
+        let runs = errand_core::db::forget_task(state.pool(), &id)
+            .await
+            .map_err(|e| ApiError::conflict("task_busy", e.to_string()))?;
+        state.emit(Event::TaskUpdated {
+            task_id: id.clone(),
+        });
+        return Ok(Json(json!({
+            "forgotten": task.name,
+            "runs_removed": runs,
+            "note": "Gone, along with everything it did. Nothing is kept.",
+        })));
+    }
+
+    let changed = errand_core::db::archive_task(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?;
+    state.emit(Event::TaskUpdated {
+        task_id: id.clone(),
+    });
+    Ok(Json(json!({
+        "archived": task.name,
+        "changed": changed,
+        "note": "Put away. It will not run again, and what it did is kept. \
+                 Add ?forget=true to remove it and its history for good.",
+    })))
+}
+
+#[derive(Deserialize)]
+struct AnswerToAQuestion {
+    answer: String,
+}
+
+/// Answer the question a run stopped to ask, and do the job again.
+///
+/// The answer becomes a note on the run that asked, which is the channel that
+/// already exists for one run telling the next one something: the next run is
+/// handed recent notes before it starts. So nothing new has to be threaded
+/// through the agent, and the answer is on the record beside the question.
+///
+/// This only records the answer. Starting the run is the caller's next call,
+/// because there is exactly one place that knows how to start one properly and
+/// a second copy of it here would be a second thing to get wrong.
+async fn answer_a_question(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(body): Json<AnswerToAQuestion>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Answering is not merely reading: it decides what the next run does.
+    require(&caller, Scope::Approve)?;
+    let answer = body.answer.trim();
+    if answer.is_empty() {
+        return Err(ApiError::bad_request("An answer cannot be empty."));
+    }
+    let run = errand_core::db::get_run(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found(format!("No run with id {id}.")))?;
+    let question = run
+        .failure
+        .as_ref()
+        .map(|f| f.plain_reason.clone())
+        .unwrap_or_default();
+    if run.failure.as_ref().map(|f| f.code.as_str()) != Some("needs_answer") {
+        return Err(ApiError::bad_request(
+            "That run did not stop to ask anything, so there is nothing to answer.",
+        ));
+    }
+
+    errand_core::db::set_run_notes(
+        state.pool(),
+        &id,
+        &format!("You asked: {question}\nThey answered: {answer}"),
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    Ok(Json(json!({
+        "answered": question,
+        "task_id": run.task_id,
+        "note": "Kept. Run the task again and it will be given your answer.",
+    })))
+}
+
+/// Show the person one of the places a run left a copy of its answer.
+///
+/// The id is the whole request. What gets opened comes from the row, never from
+/// the caller, so this cannot be talked into opening a file somebody names.
+async fn open_answer_copy(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Read)?;
+    let copy = errand_core::db::get_answer_copy(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found("No copy with that id."))?;
+
+    let opened = match copy.kind.as_str() {
+        "note" => crate::desktop::open_note(&copy.locator).await,
+        "file" => crate::desktop::open_file(std::path::Path::new(&copy.locator)).await,
+        other => {
+            return Err(ApiError::bad_request(format!(
+                "A {other} is not something Errand can open for you."
+            )))
+        }
+    };
+    opened.map_err(|e| ApiError::from(anyhow::anyhow!(e)))?;
+    Ok(Json(json!({ "opened": copy.label })))
 }
 
 /// One file a run left behind, such as a screenshot, served by id.
@@ -3599,7 +3927,7 @@ mod tests {
             body["detail"]
                 .as_str()
                 .unwrap_or_default()
-                .contains("Teach it once"),
+                .contains("Press Run now"),
             "the refusal must say what to do about it: {body}"
         );
 
@@ -3624,6 +3952,125 @@ mod tests {
         assert_eq!(body["task"]["schedule"]["kind"], "cron");
     }
 
+    // ------------------------------------------------ teaching it as a rehearsal --
+
+    /// The first run of a task is always a teach run, because nothing else is
+    /// allowed until a plan is approved. So this is the only way to watch a
+    /// task that books, sends or moves things without any of it happening.
+    #[tokio::test]
+    async fn a_task_can_be_taught_as_a_rehearsal() {
+        let api = testkit::start().await;
+        let id = a_task(
+            &api,
+            json!({ "name": "Tidy the inbox", "description": "File anything that is junk." }),
+        )
+        .await;
+
+        let (code, run) = api
+            .post(&format!("/v1/tasks/{id}/teach"), json!({ "dry_run": true }))
+            .await;
+        assert_eq!(code, 200, "{run}");
+        assert_eq!(
+            run["mode"], "teach",
+            "a rehearsed teach is still teaching, or it would never write a plan"
+        );
+        assert_eq!(
+            run["rehearsal"], true,
+            "everything irreversible must be recorded rather than done: {run}"
+        );
+
+        let detail = api
+            .get(&format!("/v1/runs/{}", run["id"].as_str().unwrap()))
+            .await;
+        let first = detail["steps"][0]["title"].as_str().unwrap_or_default();
+        assert!(
+            first.contains("rehearsal"),
+            "somebody watching has to be told nothing will really happen: {first}"
+        );
+    }
+
+    #[tokio::test]
+    async fn teaching_a_task_the_ordinary_way_still_does_the_job_for_real() {
+        let api = testkit::start().await;
+        let id = a_task(
+            &api,
+            json!({ "name": "Tidy the inbox", "description": "File anything that is junk." }),
+        )
+        .await;
+
+        // No body at all, which is how every caller written before rehearsing
+        // existed asks for this.
+        let (code, run) = api
+            .post_with_no_body(&format!("/v1/tasks/{id}/teach"))
+            .await;
+        assert_eq!(code, 200, "{run}");
+        assert_eq!(run["mode"], "teach");
+        assert_eq!(
+            run["rehearsal"], false,
+            "teaching without asking for a rehearsal must do the job for real: {run}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_rehearsal_does_not_open_the_gate_to_running_unattended() {
+        // A rehearsal writes a plan, and that plan still waits for a person.
+        // A rehearsal is told to carry on as though everything worked and
+        // touches nothing, so it lands in the same 'succeeded' column having
+        // proved nothing. Rehearse, then put it on a schedule, would otherwise
+        // arm a live cron on the strength of a run that did not happen.
+        let api = testkit::start().await;
+        let id = a_task(
+            &api,
+            json!({ "name": "Court", "description": "Book the usual court." }),
+        )
+        .await;
+        // A rehearsal that finished perfectly, recorded the way one really is.
+        let run = errand_core::db::create_run(
+            &api.pool,
+            &id,
+            "rehearsal/1",
+            "manual",
+            errand_core::models::RunMode::REHEARSAL,
+            None,
+        )
+        .await
+        .expect("a rehearsal run");
+        errand_core::db::finish_run_ok(
+            &api.pool,
+            &run.id,
+            "Rehearsed it.",
+            Some("This is what it would have found."),
+        )
+        .await
+        .expect("finishing the rehearsal");
+
+        let (code, body) = api
+            .patch(
+                &format!("/v1/tasks/{id}"),
+                json!({ "schedule": { "kind": "cron", "expr": EVERY_MINUTE, "tz": "UTC" } }),
+            )
+            .await;
+        assert_eq!(
+            code, 200,
+            "a draft may carry a schedule; it just cannot run: {body}"
+        );
+
+        // Arming it is the moment that matters, and that is where the refusal
+        // has to come.
+        let (code, body) = api
+            .post(&format!("/v1/tasks/{id}/activate"), json!({}))
+            .await;
+        assert_eq!(code, 409, "a rehearsal armed a live schedule: {body}");
+        assert_eq!(body["code"], "task_not_taught");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("rehearsal does not count"),
+            "somebody who rehearsed successfully has to be told why it did not count: {body}"
+        );
+    }
+
     // ------------------------------------- doing something twice by moving the clock --
 
     #[tokio::test]
@@ -3638,7 +4085,7 @@ mod tests {
             &id,
             &format!("manual/{}", errand_core::new_id()),
             "manual",
-            "normal",
+            errand_core::models::RunMode::NORMAL,
             None,
         )
         .await
@@ -3716,7 +4163,7 @@ mod tests {
             &id,
             &format!("manual/{}", errand_core::new_id()),
             "manual",
-            "normal",
+            errand_core::models::RunMode::NORMAL,
             None,
         )
         .await
@@ -3865,6 +4312,100 @@ mod tests {
             .await;
         assert_eq!(code, 400, "{body}");
         assert_eq!(api.get(&format!("/v1/tasks/{id}")).await["name"], "Courts");
+    }
+
+    /// Somewhere to point a task's model choice at, without a model server.
+    ///
+    /// Nothing is asked of it here: these tests are about the choice being
+    /// remembered and offered honestly, not about a model doing any work.
+    async fn a_model_in_the_list(api: &testkit::Api, id: &str, label: &str) {
+        errand_core::db::upsert_provider(
+            &api.pool,
+            &errand_core::providers::Provider {
+                id: id.into(),
+                kind: "openai_compat".into(),
+                label: label.into(),
+                base_url: Some("http://127.0.0.1:11434/v1".into()),
+                model: Some("qwen3.5-27b".into()),
+                enabled: true,
+                discovered: false,
+                health: None,
+                health_detail: None,
+            },
+        )
+        .await
+        .expect("saving a model");
+    }
+
+    #[tokio::test]
+    async fn editing_a_task_s_sites_does_not_forget_which_model_it_uses() {
+        // The trap this closes: the task page saves one section at a time, so
+        // every save is an edit that says nothing about the model. If saying
+        // nothing meant "no model", a task would lose the model somebody chose
+        // for it the next time they added a site, and nothing would say so.
+        let api = testkit::start().await;
+        let id = a_task(
+            &api,
+            json!({ "name": "Post", "description": "Read the post." }),
+        )
+        .await;
+        a_model_in_the_list(&api, "mine", "The model on my desk").await;
+
+        let (code, body) = api
+            .patch(&format!("/v1/tasks/{id}"), json!({ "model_id": "mine" }))
+            .await;
+        assert_eq!(code, 200, "naming a model failed: {body}");
+
+        let (code, body) = api
+            .patch(
+                &format!("/v1/tasks/{id}"),
+                json!({ "allowed_domains": ["example.com"] }),
+            )
+            .await;
+        assert_eq!(code, 200, "changing the sites failed: {body}");
+
+        assert_eq!(
+            api.get(&format!("/v1/tasks/{id}")).await["model_id"],
+            "mine",
+            "editing the sites must leave the task's model alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_can_be_put_back_on_whichever_model_everything_else_uses() {
+        let api = testkit::start().await;
+        let id = a_task(&api, json!({ "name": "Court", "description": "Book it." })).await;
+        a_model_in_the_list(&api, "mine", "The model on my desk").await;
+
+        api.patch(&format!("/v1/tasks/{id}"), json!({ "model_id": "mine" }))
+            .await;
+        let (code, body) = api
+            .patch(&format!("/v1/tasks/{id}"), json!({ "model_id": null }))
+            .await;
+        assert_eq!(code, 200, "putting it back on the default failed: {body}");
+
+        assert_eq!(
+            api.get(&format!("/v1/tasks/{id}")).await["model_id"],
+            Value::Null,
+            "a task put back on the default must not still name a model"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_cannot_be_told_to_use_a_model_that_is_not_there() {
+        let api = testkit::start().await;
+        let id = a_task(&api, json!({ "name": "Court", "description": "Book it." })).await;
+        let (code, body) = api
+            .patch(
+                &format!("/v1/tasks/{id}"),
+                json!({ "model_id": "one-that-was-removed" }),
+            )
+            .await;
+        assert_eq!(code, 404, "{body}");
+        assert_eq!(
+            api.get(&format!("/v1/tasks/{id}")).await["model_id"],
+            Value::Null
+        );
     }
 
     #[tokio::test]
@@ -4042,6 +4583,136 @@ mod tests {
         );
         let theirs = api.get(&format!("/v1/tasks/{allowed}/recipients")).await;
         assert!(theirs["items"].as_array().expect("a list").is_empty());
+    }
+
+    // ------------------------------------------------------ reading a plan --
+
+    #[tokio::test]
+    async fn a_task_can_be_put_away_and_stays_away() {
+        let api = testkit::start().await;
+        let id = a_ready_manual_task(&api).await;
+
+        let (code, body) = api.delete(&format!("/v1/tasks/{id}")).await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(
+            api.get(&format!("/v1/tasks/{id}")).await["status"],
+            "archived",
+            "it should be put away, not merely hidden"
+        );
+        // Gone from the list a person looks at, still there when they ask.
+        let listed = api.get("/v1/tasks").await["items"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .any(|t| t["id"] == json!(id));
+        assert!(!listed, "an archived task is still on the list");
+        let with_archived = api.get("/v1/tasks?include_archived=true").await["items"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .any(|t| t["id"] == json!(id));
+        assert!(with_archived, "it should still be findable when asked for");
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_task_takes_its_history_with_it() {
+        // The difference that earns the extra word in the URL. Putting a task
+        // away keeps the side-effect record, which is what stops a later run
+        // booking the same thing twice. Forgetting it throws that away, which
+        // is right for a test and wrong for anything that touched the world.
+        let api = testkit::start().await;
+        // a_ready_manual_task already leaves the one successful run that
+        // stands as proof the task works, which is the history being tested.
+        let id = a_ready_manual_task(&api).await;
+        assert_eq!(
+            api.get(&format!("/v1/runs?task_id={id}")).await["items"]
+                .as_array()
+                .expect("a list")
+                .len(),
+            1
+        );
+
+        let (code, body) = api.delete(&format!("/v1/tasks/{id}?forget=true")).await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body["runs_removed"], 1, "{body}");
+
+        let (code, _) = api.get_status(&format!("/v1/tasks/{id}")).await;
+        assert_eq!(code, 404, "a forgotten task is still there");
+        assert!(
+            api.get(&format!("/v1/runs?task_id={id}")).await["items"]
+                .as_array()
+                .expect("a list")
+                .is_empty(),
+            "its runs outlived it"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_plan_can_be_read_before_it_is_approved() {
+        // The approval gate is the one line between "somebody watched it try
+        // once" and "it does this alone at three in the morning", and the API
+        // tells a person to read what the task wrote before crossing it. Only
+        // the approved version used to come back with any text, so the plan
+        // they were being asked to read was the one thing they could not see.
+        let api = testkit::start().await;
+        let id = a_task(
+            &api,
+            json!({ "name": "Tidy", "description": "Tidy the inbox." }),
+        )
+        .await;
+
+        let version = errand_core::db::next_playbook_version(&api.pool, &id)
+            .await
+            .expect("the next version number");
+        let pb = errand_core::playbook::Playbook {
+            version,
+            goal: "Move the daily digests to Junk.".into(),
+            sites: vec![],
+            preconditions: vec![],
+            steps: vec![errand_core::playbook::Step {
+                intent: "Look at the five most recent messages.".into(),
+                hint: None,
+                decision: None,
+            }],
+            success: vec![],
+            known_failures: vec![],
+            never: vec![],
+        };
+        errand_core::db::add_playbook_version(
+            &api.pool,
+            &id,
+            &pb,
+            errand_core::playbook::Source::Teach,
+            None,
+            Some("Written by a rehearsal, so nothing in it was actually done."),
+            false,
+        )
+        .await
+        .expect("storing a plan nobody has approved");
+
+        let body = api.get(&format!("/v1/tasks/{id}/playbook")).await;
+        assert!(
+            body["active"].is_null(),
+            "nothing should be approved yet: {body}"
+        );
+        let waiting = &body["versions"][0];
+        assert_eq!(waiting["approved"], false);
+        let text = waiting["markdown"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a plan awaiting approval has to carry its text: {body}"));
+        assert!(
+            text.contains("Move the daily digests to Junk")
+                && text.contains("Look at the five most recent messages"),
+            "the text has to be the plan itself, not a summary of it: {text}"
+        );
+        // And why it should be read with care, which is the other half of
+        // deciding whether to approve it.
+        assert!(
+            waiting["changelog"]
+                .as_str()
+                .is_some_and(|c| c.contains("rehearsal")),
+            "a plan written by a rehearsal has to say so: {body}"
+        );
     }
 
     // ------------------------------------------------- the mail a task may read --
@@ -4748,6 +5419,37 @@ mod tests {
             .post("/v1/ai/roles/narrator", json!({ "provider_id": id }))
             .await;
         assert_eq!(code, 200, "it can still write the messages: {body}");
+    }
+
+    #[tokio::test]
+    async fn a_model_that_cannot_carry_out_a_task_cannot_be_named_by_one_either() {
+        // The two ends have to agree. A model the AI screen refuses for the job
+        // of doing the task must be refused on a task's own page as well, or
+        // the way round the honest answer is to choose it one task at a time.
+        let api = testkit::start().await;
+        let server = a_model_server(ONLY_TALKS).await;
+        let (model_id, _) = add_model(&api, "Small local model", &server.base).await;
+        let task = a_task(&api, json!({ "name": "Court", "description": "Book it." })).await;
+
+        let (code, body) = api
+            .patch(
+                &format!("/v1/tasks/{task}"),
+                json!({ "model_id": model_id }),
+            )
+            .await;
+        assert_eq!(code, 400, "it cannot do this job, so it cannot be named");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("did not use the tools"),
+            "the refusal has to say what is wrong with this model: {body}"
+        );
+        assert_eq!(
+            api.get(&format!("/v1/tasks/{task}")).await["model_id"],
+            Value::Null,
+            "a refused choice must not be half saved"
+        );
     }
 
     #[tokio::test]

@@ -20,6 +20,13 @@ export interface Hint {
 
 export const hints = {
   // ---------------------------------------------------------------- tasks --
+  "app.retry": {
+    short: "Asks Errand's background service again.",
+    long:
+      "The service starts by itself and is briefly unreachable after an update or when the Mac \
+       wakes. This retries on its own a few times; the button is for when you would rather not \
+       wait. Nothing is lost while it is unreachable: your tasks are on disk.",
+  },
   "task.new": {
     short: "Describe a job in your own words. Errand works out how to do it.",
     long:
@@ -28,20 +35,21 @@ export const hints = {
       "job on its own.",
   },
   "task.create": {
-    short: "Save this as a draft. Nothing runs yet.",
+    short: "Sets it up and does the job.",
     long:
-      "Creating only saves what you wrote. The task cannot run, even once, until you press " +
-      "'Teach it once' on its page, and it cannot run on a schedule until you have approved " +
-      "what it learned.",
+      "Errand reads what you wrote, works out what the job needs, and does it. It cannot run on " +
+      "a schedule until you have seen it work once.",
   },
   // One per state, because a single sentence covering all of them explains the
   // one the reader is looking at least of all. The pill says what the task is;
   // these say what that means and what it is waiting for.
   "task.state.draft": {
-    short: "Written down, but never tried. It cannot run yet.",
+    short: "Written down, but never tried.",
     long:
-      "Press 'Teach it once' to watch it attempt the job from your description. Nothing runs on " +
-      "a schedule until you have read and approved what it works out.",
+      "Press Do it now and it works the job out from your description and does it. If the job " +
+      "books, sends, buys or moves anything, rehearse it once first: it goes through the whole " +
+      "thing with none of it really happening. Nothing runs while you are not watching until it " +
+      "has really done the job once.",
   },
   "task.state.teaching": {
     short: "Trying the job for the first time, from your description alone.",
@@ -50,10 +58,11 @@ export const hints = {
       "step as it happens.",
   },
   "task.state.awaiting_approval": {
-    short: "It finished, and wrote down how it did the job. That needs your approval.",
+    short: "It finished and wrote down how it did the job.",
     long:
-      "What it wrote is what future runs will follow while you are not watching, so it is worth " +
-      "reading. Until you approve it, this task will not run on its own.",
+      "What it wrote is what it will follow next time. You do not have to approve it: it just " +
+      "did the job that way and it worked. Read it under the gear if you want to change how it " +
+      "goes about it.",
   },
   "task.state.teach_failed": {
     short: "It tried the job and could not finish. The run says why.",
@@ -69,8 +78,8 @@ export const hints = {
   "task.state.ready": {
     short: "Armed. It will run on its schedule, or whenever you ask.",
     long:
-      "A plan has been approved, so it knows how to do the job. If it has no schedule it runs " +
-      "only when you press Run now.",
+      "It has done the job at least once, so it knows how. If it has no schedule it runs only " +
+      "when you ask.",
   },
   "task.state.paused": {
     short: "You paused it. Scheduled runs are skipped; nothing has been deleted.",
@@ -92,6 +101,38 @@ export const hints = {
     long:
       "The steps appear as they happen. If the count on this card has stopped moving, the run " +
       "itself says what it was in the middle of.",
+  },
+  "task.directive": {
+    short: "Change what you asked for, in your own words.",
+    long:
+      "This text is the task. It is what the agent reads and the only thing that decides what it \
+       does, so changing it is how you correct an outcome that was not what you meant.",
+  },
+  "task.directive_save": {
+    short: "Saves the new wording and does the job again with it.",
+    long:
+      "Straight away, because the only thing that settles whether the new wording is better is \
+       another outcome. What it learned before is kept until a run replaces it.",
+  },
+  "task.answer": {
+    short: "Sends your answer and does the job again.",
+    long:
+      "The answer is kept on the run that asked, so the question and what you said sit together, " +
+      "and the next run is given it. Never type a password or a card number here.",
+  },
+  "task.remove": {
+    short: "Stops this task for good and takes it off the list.",
+    long:
+      "What it did is kept, including the record that stops a later run repeating anything it " +
+      "booked or bought. A task that never ran has nothing worth keeping, and can be removed " +
+      "completely instead.",
+  },
+  "task.settings": {
+    short: "How this task works: when it runs, what it may open, which AI, who it tells.",
+    long:
+      "Kept out of the way on purpose. Errand fills these in from what you wrote and you can " +
+      "leave them alone; open this when you want to change the schedule, take a permission " +
+      "back, or point the task at a different model.",
   },
   "task.last_run": {
     short: "Open the newest run and see everything it did.",
@@ -118,12 +159,6 @@ export const hints = {
       "recorded as what it would have done instead of happening. Nothing is booked, sent or " +
       "deleted.",
   },
-  "task.teach": {
-    short: "Let it try the job once while you watch, and write down what worked.",
-    long:
-      "The first run works only from your description. At the end the agent writes a plan, which " +
-      "you read and approve. Nothing runs on a schedule until you have approved a plan.",
-  },
   "task.pause": {
     short: "Skip scheduled runs. Manual runs still work. Nothing is deleted.",
     long:
@@ -139,7 +174,9 @@ export const hints = {
   },
   "task.activate": {
     short: "Let this run on its own schedule from now on.",
-    long: "Only possible once a plan has been approved, so an unattended run always has an agreed way of doing the job.",
+    long:
+      "Only offered once it has really done the job with you there. Proven, rather than approved: " +
+      "a rehearsal does not count, because a rehearsal touches nothing.",
   },
   "task.allowed_sites": {
     short: "The only websites this task may open.",
@@ -164,6 +201,16 @@ export const hints = {
   "task.save_limits": {
     short: "Save them. They apply from the next run.",
   },
+  "task.model": {
+    short: "Which AI carries out this task. Saved as soon as you pick it.",
+    long:
+      "Whichever model does the job is the one that reads what the job reads, so a task that " +
+      "opens your mail is worth putting on a model that runs on your own machine, while a task " +
+      "that books a court can use anything. Leave it on Default and this task follows the " +
+      "choice on the AI screen. A model Errand has found cannot drive a browser is shown here " +
+      "but cannot be picked, and if the one you pick is later switched off, the task still runs " +
+      "on something that works and the run says what happened.",
+  },
 
   // ------------------------------------------------------------- playbook --
   "playbook.what": {
@@ -174,13 +221,27 @@ export const hints = {
       "last time, because sites move buttons and intentions do not change.",
   },
   "playbook.approve": {
-    short: "Agree that this is how the job should be done.",
+    short: "Use this way of doing the job instead of the current one.",
     long:
-      "This is the line between the agent having tried something once and the agent doing it " +
-      "alone while you are asleep. Nothing follows a plan until you approve it.",
+      "The first plan is adopted by itself, because the run that wrote it had just done the job. " +
+      "A later one waits for you: a plan is written from pages by strangers and then followed as " +
+      "instructions, so replacing one that already works is worth a look first.",
   },
 
   // ------------------------------------------------------------------ run --
+  "run.answer": {
+    short: "What the task produced, which is the reason you set it up.",
+    long:
+      "Separate from what the run did. If you asked to be told something, this is the telling. " +
+      "If you asked for something to be done, this is what is now true and the proof of it. " +
+      "A run that could not finish still shows what it found before it stopped.",
+  },
+  "run.answer_copy": {
+    short: "Opens the note or file where this run also put the answer.",
+    long:
+      "Errand makes a copy like this only when the task asked for one. The answer above is the " +
+      "original and is always here, whether or not a copy could be written.",
+  },
   "run.timeline": {
     short: "Everything the agent did, in order, in its own words.",
     long:
@@ -189,6 +250,13 @@ export const hints = {
   },
   "run.status": {
     short: "How this run ended.",
+  },
+  "run.rehearsal": {
+    short: "Nothing in this run really happened.",
+    long:
+      "It went through the whole job, and anything it could not have taken back was recorded as " +
+      "what it would have done. Nothing was booked, sent, bought or moved, so where the steps " +
+      "below say it did something, read that as what the first real run will do.",
   },
   "run.cost": {
     short: "What the AI for this run cost.",
@@ -254,7 +322,7 @@ export const hints = {
     short: "Something a task may do on the Mac itself, once macOS allows it.",
     long:
       "Not a way of reaching you: nothing here messages anybody. It is what a task may do on this " +
-      "machine, such as writing an answer into Notes or going through your post. macOS asks " +
+      "machine, such as writing into Notes or going through your post. macOS asks " +
       "before allowing it, and until somebody answers that question the task stops when it gets " +
       "there.",
   },

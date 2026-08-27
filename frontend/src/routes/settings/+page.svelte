@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import Trouble from "$lib/components/Trouble.svelte";
+  import { reconnecting } from "$lib/reconnect.svelte";
   import {
     api, ApiError, channelName,
     type AutomationApp, type ChannelHealth, type Health, type Recipient,
@@ -50,7 +52,7 @@
   let working = $state("");
 
   async function load() {
-    try {
+    {
       health = await api.health();
       const c = await api.channels();
       channels = c.channels; notes = c.notes;
@@ -76,10 +78,14 @@
           quietBreak = q.failures_break_through ?? quietBreak;
         }
       } catch { /* leave the defaults showing */ }
-      problem = null;
-    } catch (e) { problem = e instanceof ApiError ? e.message : String(e); }
+    }
   }
-  onMount(load);
+
+  const conn = reconnecting(load, (p) => (problem = p));
+  onMount(() => {
+    conn.run();
+    return conn.stop;
+  });
 
   async function act(fn: () => Promise<unknown>) {
     busy = true;
@@ -230,7 +236,9 @@
 </script>
 
 <h1>Settings</h1>
-{#if problem}<div class="err"><h3>Something went wrong</h3><div>{problem}</div></div>{/if}
+{#if problem}
+  <Trouble {problem} retrying={conn.retrying} onRetry={() => conn.run(true)} />
+{/if}
 
 <h2>The background service</h2>
 <div class="card">

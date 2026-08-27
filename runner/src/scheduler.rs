@@ -485,7 +485,7 @@ async fn fire(
         &task.id,
         &occurrence_id,
         "schedule",
-        "normal",
+        errand_core::models::RunMode::NORMAL,
         None,
     )
     .await
@@ -550,7 +550,7 @@ async fn record_skip(
         &task.id,
         &occurrence_id,
         "schedule",
-        "normal",
+        errand_core::models::RunMode::NORMAL,
         None,
     )
     .await
@@ -634,6 +634,25 @@ async fn record_skip(
 
 #[cfg(test)]
 mod tests {
+
+    /// The runs the scheduler itself started, which is what these tests are
+    /// about. A task cannot be put on a schedule until it has really done the
+    /// job once, so every scheduled task in here also has one manual run
+    /// standing as that proof, and counting it would make every assertion here
+    /// off by one.
+    async fn scheduled_runs(
+        api: &crate::api::testkit::Api,
+        task_id: &str,
+    ) -> Vec<serde_json::Value> {
+        let runs = api.get(&format!("/v1/runs?task_id={task_id}")).await;
+        runs["items"]
+            .as_array()
+            .expect("a list of runs")
+            .iter()
+            .filter(|r| r["trigger"] == "schedule")
+            .cloned()
+            .collect()
+    }
     use super::*;
     use crate::api::testkit::{self, a_ready_manual_task};
     use serde_json::json;
@@ -681,7 +700,7 @@ mod tests {
             task_id,
             &format!("manual/{}", errand_core::new_id()),
             "manual",
-            "normal",
+            errand_core::models::RunMode::NORMAL,
             None,
         )
         .await
@@ -696,6 +715,10 @@ mod tests {
             .as_array()
             .expect("a list of runs")
             .iter()
+            // Only the slots the scheduler filled. A task cannot be put on a
+            // schedule until it has really done the job once, so every task
+            // here also carries one manual run standing as that proof.
+            .filter(|r| r["trigger"] == "schedule")
             .filter_map(|r| r["occurrence_id"].as_str())
             .filter(|o| !o.starts_with("manual/"))
             .map(|o| o.to_string())
@@ -744,8 +767,8 @@ mod tests {
             .await
             .expect("the sweep ran");
 
-        let runs = api.get(&format!("/v1/runs?task_id={id}")).await;
-        let items = runs["items"].as_array().expect("a list of runs");
+        let items = scheduled_runs(&api, &id).await;
+        let runs = json!({ "items": items.clone() });
         assert!(
             items.is_empty(),
             "a task moved onto a schedule produced {} run(s) for slots it was never around for: \
@@ -780,8 +803,8 @@ mod tests {
             .await
             .expect("the sweep ran");
 
-        let runs = api.get(&format!("/v1/runs?task_id={id}")).await;
-        let items = runs["items"].as_array().expect("a list of runs");
+        let items = scheduled_runs(&api, &id).await;
+        let runs = json!({ "items": items.clone() });
         assert!(
             !items.is_empty(),
             "an occurrence after the floor must still be noticed: {runs}"
@@ -904,7 +927,7 @@ mod tests {
         );
 
         // The run that was in the way finishes, and the queue starts moving.
-        errand_core::db::finish_run_ok(&api.pool, &busy, "done")
+        errand_core::db::finish_run_ok(&api.pool, &busy, "done", None)
             .await
             .expect("closing the run");
         tick(

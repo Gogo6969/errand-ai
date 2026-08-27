@@ -67,13 +67,26 @@ pub async fn distil_if_missing(state: &AppState, run_id: &str) {
     }
 }
 
+/// Is a plan written from this run's journal worth having?
+///
+/// A rehearsal deliberately does nothing irreversible, so what it did is not
+/// what a real run would do: a task that already knows the job gains nothing
+/// from a plan distilled out of a run that held everything back.
+///
+/// Teaching is the exception, and the reason this asks the two questions
+/// separately rather than reading one word. A rehearsed teach was learning the
+/// job, it is the only run the task has ever had, and teaching that ends with
+/// nothing to approve has taught nobody anything: the task would be left unable
+/// to run at all, which is exactly the state teaching exists to get it out of.
+fn worth_writing_down(run: &errand_core::models::Run) -> bool {
+    !run.is_rehearsal() || run.is_teaching()
+}
+
 async fn distil(state: &AppState, run_id: &str) -> anyhow::Result<Option<i64>> {
     let Some(run) = errand_core::db::get_run(state.pool(), run_id).await? else {
         return Ok(None);
     };
-    // A rehearsal deliberately does nothing irreversible, so what it learned is
-    // not what a real run would learn.
-    if run.mode == "dry_run" {
+    if !worth_writing_down(&run) {
         return Ok(None);
     }
     let Some(task) = errand_core::db::get_task(state.pool(), &run.task_id).await? else {
@@ -140,9 +153,20 @@ async fn distil(state: &AppState, run_id: &str) -> anyhow::Result<Option<i64>> {
          confirmation that is not above. Separate the INTENT of each step from the HINT of how it \
          was done, because sites move their buttons and intentions do not. Where the record does \
          not say why something was done, write the intent as what it plainly achieved rather than \
-         guessing at a motive. Leave a list empty rather than filling it with something plausible.",
+         guessing at a motive. Leave a list empty rather than filling it with something \
+         plausible.{}",
         task.description,
         journal.join("\n"),
+        // A rehearsal's journal says WOULD HAVE against everything it held
+        // back. Those lines are the truth about the run and must not be
+        // rewritten into a claim that the thing happened.
+        if run.is_rehearsal() {
+            " This record is of a rehearsal: a line that begins WOULD HAVE was recorded and not \
+             carried out. Write those as steps the first real run will have to take, never as \
+             something that was already done."
+        } else {
+            ""
+        },
     );
 
     // Scrubbed like everything else that reaches a model: a journal can quote a
@@ -179,7 +203,7 @@ async fn distil(state: &AppState, run_id: &str) -> anyhow::Result<Option<i64>> {
 
     // Teach for a supervised first run, refine otherwise, the same distinction
     // the agent's own tool draws, so the history reads consistently.
-    let source = if run.mode == "teach" {
+    let source = if run.is_teaching() {
         Source::Teach
     } else {
         Source::Refine
@@ -187,9 +211,18 @@ async fn distil(state: &AppState, run_id: &str) -> anyhow::Result<Option<i64>> {
     let changelog = format!(
         "Written from the record of run {} by {}, because the run left no plan of its own. The \
          steps below are inferred from what happened rather than described by whoever did it, so \
-         read them before approving.",
+         read them before approving.{}",
         &run_id[..run_id.len().min(8)],
         answer.provider_label,
+        // Said even though the journal already says WOULD HAVE against each
+        // one, because the person approving this reads the plan and not the
+        // journal it came from.
+        if run.is_rehearsal() {
+            " That run was a rehearsal, so nothing in it was actually done: everything that \
+             cannot be undone was recorded instead."
+        } else {
+            ""
+        }
     );
 
     let version = errand_core::db::add_playbook_version(
@@ -225,6 +258,51 @@ fn parse_draft(raw: &str) -> anyhow::Result<Draft> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use errand_core::models::RunMode;
+
+    /// A run of a task, created the way the API creates one.
+    async fn a_run(api: &crate::api::testkit::Api, mode: RunMode) -> errand_core::models::Run {
+        let task_id = crate::api::testkit::a_task(
+            api,
+            serde_json::json!({ "name": "Tidy the inbox", "description": "File the junk." }),
+        )
+        .await;
+        errand_core::db::try_create_run(
+            &api.pool,
+            &task_id,
+            &format!("teach/{}", errand_core::new_id()),
+            "teach",
+            mode,
+            None,
+        )
+        .await
+        .expect("a run")
+    }
+
+    #[tokio::test]
+    async fn a_rehearsed_teach_still_gets_a_plan_written_for_it_and_a_plain_rehearsal_does_not() {
+        // Teaching that ends with no plan cannot be approved, and a task with
+        // no approved plan may not run at all, so a rehearsed teach that was
+        // skipped here would leave the task exactly where it started.
+        let api = crate::api::testkit::start().await;
+
+        assert!(
+            worth_writing_down(&a_run(&api, RunMode::TEACH_REHEARSAL).await),
+            "a rehearsed teach must still end with something to approve"
+        );
+        assert!(
+            worth_writing_down(&a_run(&api, RunMode::TEACH).await),
+            "an ordinary teach run is what this was written for"
+        );
+        assert!(
+            worth_writing_down(&a_run(&api, RunMode::NORMAL).await),
+            "a run that did the job for real can be written down from"
+        );
+        assert!(
+            !worth_writing_down(&a_run(&api, RunMode::REHEARSAL).await),
+            "a task that already knows the job learns nothing from a run that did none of it"
+        );
+    }
 
     #[test]
     fn a_plan_wrapped_in_prose_or_fences_is_still_read() {

@@ -8,6 +8,81 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **The app installs its own background service.** Everything Errand does happens in a daemon the
+  app has always carried inside itself and never started, so somebody who downloaded the app and
+  opened it got a window where every screen said the background service was not answering, and the
+  only instructions were to run a command that is not on anybody's PATH. None of the work in here
+  was reachable from the other side of that. It now installs the LaunchAgent on launch, from the
+  daemon beside its own executable, and refuses when macOS is running it from the temporary copy
+  it makes for an app opened straight from a download, because writing that path into a LaunchAgent
+  means the service never starts again after the next login, silently.
+- **A release.** Pushing a `v*` tag builds, signs, notarises and publishes a DMG, after the same
+  gates every other build passes. Signing needs five secrets that belong to a person; without them
+  the release still builds and publishes unsigned rather than failing, and says which step it
+  skipped. See `docs/releasing.md`.
+- **A task may spend money, once somebody says how much.** Buying was always possible in the sense
+  that a browser can click a button that pays; there was simply no ceiling on it, because every
+  limit in Errand was a ceiling on something a task does anyway. This one is a permission:
+  `limits.max_spend_usd` is zero by default and zero means a task may not buy so much as a
+  paperclip. Above zero it is the most that task may spend across one whole run, not per item, and
+  a purchase is refused unless the agent has read the total off the page and passed it as
+  `amount_usd`, so "I could not tell what it would cost" is exactly the state in which it cannot
+  press the button. What was spent is written into the side-effect record, which is where the
+  running total for the rest of the run is read back from, so the limit cannot be got round by
+  splitting a payment. Note the two dollar figures on a task are unrelated: `max_usd` is what the
+  models cost and `max_spend_usd` is money leaving an account.
+- **A run can stop and ask you one thing.** `ask_you` is for the fact a job needs and only a person
+  knows: which of two accounts, what size, which date. The question appears on the task with a box
+  under it rather than a page about what went wrong, and what you type is kept on the run that
+  asked and handed to the next one. It is deliberately not a way to be given a permission: a task
+  cannot ask for somebody to message or for a spending limit, and the refusal for a missing contact
+  now names the exact place a person goes to add one instead of asking the agent to request a phone
+  number.
+- **A task sets itself up.** Creating one used to mean filling in a name, a schedule, a list of
+  sites and a permission or two before anything could run, and the panels were the first thing a
+  person saw. Now the description is read for what it says outright, and a model is asked about
+  what it does not: "Show me the latest important Bitcoin news with links, every morning at 7am"
+  arrives named, pointed at two news sites, and on a seven o'clock schedule in the writer's own
+  timezone. What was decided is shown back in a few lines, each naming the words that decided it,
+  and only where it differs from a bare task. A name is now optional, because a person describing
+  a job has already said what it is.
+  Nothing here can grant what a sentence should not: signing in, messaging a person, spending, and
+  being told when a task fails are all left alone on purpose, and a prohibition always beats a
+  request, so "clean my mailbox but never delete anything" is allowed to read and refused the
+  moving. Sites a person named themselves are never merged with sites Errand found, because the
+  first entry decides which saved logins a run gets.
+- **A run has an answer, separate from what it did.** A task exists to produce an outcome, and
+  there was nowhere to put one: a run stored a one-line summary of the work and a step journal,
+  so a task told to "look at my inbox and tell me who each message is from" reported that it had
+  filed a note and left the actual summary inside Apple Notes. `finish` now takes an `answer`
+  beside the `summary` and refuses a pointer such as "see the note", the answer is shown first
+  and whole on the task and the run, and it survives a failure: the commonest failure of all is a
+  run that read everything, worked the answer out, and only then found macOS would not let it
+  write the note it was asked for. The answer is scrubbed like anything else that leaves the run,
+  because it is the one field built to carry the contents of a page into a database row, a
+  webhook and a phone.
+- **Copies of an answer are recorded and can be opened.** A task that asks for a note or a file
+  still gets one, and the task page names it with a button that brings it up
+  (`POST /v1/answer-copies/{id}/open`). The rows are written by the tool that actually did the
+  writing rather than read back out of the journal's sentences, so a link never points at
+  something that did not happen.
+- **A task can name the model that carries it out.** The AI screen sets the default; a task may
+  choose its own, and the run says which it used and whether the task asked for it. Only the
+  executor is per-task so far: writing the plan, diagnosing a failure and wording a notification
+  still resolve against the global choice, and the run now says so rather than promising a
+  privacy it cannot keep.
+- **A task can be taught as a rehearsal.** A task may not run until it has been taught, and
+  teaching was always for real, so the first run of "clean my mailbox of spam" really moved the
+  post and the first run of "book a tennis court" really booked it: the one run nobody had watched
+  before was the one that could not be rehearsed. `POST /v1/tasks/{id}/teach` now takes an
+  optional `{"dry_run": true}` (no body still teaches for real), and the task page offers "Teach
+  it as a rehearsal" beside "Teach it once, for real". The rehearsed run works the job out and
+  writes its plan exactly as before, while everything irreversible is recorded rather than done
+  and the fence is left unarmed, so the first real run is still allowed to do the thing. Whether a
+  run was a rehearsal is now a flag of its own beside the mode, because teaching and rehearsing
+  are two different questions and a run can be both. The plan such a run writes says on the
+  approval card that a rehearsal wrote it, since its steps otherwise read exactly like a plan from
+  a run that really did the job.
 - **Screenshots in the run timeline.** A step that took one carries a "See what it saw"
   disclosure: the shot is recorded as an artifact, addressed by id, served by the API at
   `GET /v1/artifacts/{id}`, and shown where the step is. The explanation has promised this since
@@ -19,8 +94,103 @@ All notable changes to this project are documented here. The format follows
 - **Tasks report their open holds.** The "needs you" card keys off a count of armed fences rather
   than off the wording of the pause reason, which is a sentence that can be reworded.
 
+### Changed
+
+- **The result of a scheduled run reaches you, and it is the answer.** It went to Telegram or
+  nowhere: the channel was hardcoded, so somebody who does not use Telegram installed a scheduler
+  that ran every morning and never told them anything, having filled in their own address on
+  another channel and watched a test message arrive. It now uses whichever way of reaching you is
+  set up. And it sent `summary`, which the finish tool spends eleven lines telling the agent is
+  explicitly not the answer, so a task that woke you at seven told you where it had been while
+  what it found stayed in the database.
+- **Both execution paths get the same tools.** The in-process agent loop took the whole tool list
+  on the grounds that it had no run in hand, which was not true: it is handed the run id on the
+  line above. So a task with no mail permission was still shown the mail tools, on the path used
+  by the smaller local models, which is exactly backwards from the reason that filter exists.
+- **The app stopped asserting an approval gate it no longer has.** Two runtime strings told the
+  *model* that a plan was "waiting for the person to read and approve it; nothing will follow it
+  until they do". The agent can relay that into the answer a person reads, so the app was
+  asserting a safety gate that does not exist, in its own voice.
+- **Nine messages sent people to the wrong screen.** Models live on the AI screen; every one of
+  these said Settings, and two offered to turn off a per-task setting that is a single global
+  switch.
+- **The documentation describes the app that exists.** `getting-started.md` required "the Claude
+  command line tool. This is what actually carries out a task", and `ai.md` said browsing stops
+  without it. Both are false: any model that can call tools drives the same tool surface. Both
+  documents also still walked a reader through teaching and approving, a flow that was removed.
+- **A new task does the job instead of asking to be taught.** Creating one used to leave it
+  waiting: press "Teach it once", read the plan it wrote, approve that, and only then could it
+  run. The gate read like a safety check and was not one. Teaching has never been a different kind
+  of run, and the endpoint that started one had no gate at all, so a brand new task could already
+  book, buy, file and message on its first run; all the check did was force that run to be called
+  teaching and make somebody read a document first. What protects a run is the side-effect fence,
+  the holds, the site allowlist and the budgets, and none of those reads a playbook. So the job
+  just gets done, and the plan the run writes becomes the way the job is done.
+  The gate that was worth keeping is still there, one step later and asking a better question:
+  nothing runs unattended until it has really done the job once. Not "somebody approved a plan"
+  but "it worked", and a rehearsal does not count, because a rehearsal is told to carry on as
+  though everything worked and touches nothing.
+  A plan is adopted only when the task had none. A revision to a plan already in force still waits
+  for a person, because a playbook is distilled from pages written by strangers and handed back to
+  the agent as trusted instruction: scrubbing removes secrets, not instructions.
+- **A task stops itself rather than failing for ever.** Every ceiling in Errand bounded a single
+  run: steps, minutes, money, heal cycles, turns. A task on an hourly schedule whose site has
+  changed fails inside every one of them and then does it again in an hour, for ever, each failure
+  perfectly well behaved. Three failures in a row now takes it off its own schedule, saying so;
+  pressing Run now still works, which is what somebody looking into it will be doing, and one run
+  that works puts it back. Runs the scheduler skipped do not count as the task working.
+- **The task page is the outcome and nothing else.** What you asked for, editable in place so
+  correcting it is one thought rather than a trip to a settings screen; what came back; and the
+  history. How it does the job moved behind the gear with the rest of the mechanics.
+- **A failure is one line and one thing to do.** It used to arrive as three questions glued
+  together with their headings written in as markdown that nothing rendered, so a person whose
+  task could not find a website met `**What I was doing:**` in raw asterisks and three paragraphs
+  before reaching anything they could act on. "What I was doing" is gone entirely, because the
+  timeline beside it answers that better than a sentence written from memory; what is left is what
+  stopped it and, where there is anything, the single thing to do, kept in separate fields because
+  the screen shows them differently. A failure with nothing to be done about it now says nothing
+  rather than padding. The same wording rule applies to the failures Errand writes itself.
+- **Task settings live behind a gear.** A task page opened onto eight panels of configuration
+  with the result somewhere below them. When it runs, what it may open, which AI, who it tells
+  and reading your mail are now one click away instead of in the way; the answer, what the task
+  learned, and its history are what the page shows.
+- **The agent is no longer told that answers belong in Apple Notes.** The system prompt said, in
+  those words, that a run summary is not somewhere anybody looks and a note on their phone is.
+  The agent obeyed it exactly, and wrote the answer into a note nobody had asked for. It now
+  hands the answer to `finish` and makes a note only when the task text asks for one.
+
 ### Fixed
 
+- **A locally built bundle could ship a daemon older than its own database.** The bundler copies
+  `app/binaries/errandd-<triple>` into the app and nothing rebuilt it, so it was whatever was last
+  put there. Caught by tearing the service down and opening the app: it installed a nine-hour-old
+  daemon which died with "migration 8 was previously applied but is missing in the resolved
+  migrations", a sentence that reads like a corrupt database and is nothing of the kind. CI never
+  saw it, because CI stages that file fresh in the job above. Staging is part of the build now, and
+  refuses a binary older than the code.
+- **Reading or moving a message searched the whole mailbox.** Listing was taught to walk by index
+  after an inbox of 191,000 messages failed with AppleScript error -1741, and the finder behind
+  `read` and `file` was left doing `first message of inbox whose message id is ...`, which builds
+  the collection before narrowing it and never answers. Worse, the fallback repeated that scan for
+  every mailbox of every account, and the timeout was reported to the person as a missing macOS
+  permission, sending them to System Settings to fix something that was not broken. The ids a
+  listing hands out now carry where the message was, so reading one is a lookup rather than a
+  search, with a bounded rescan when new mail has shifted it.
+- **The fence could have let one message be filed twice.** Ids that carry a position had to be
+  kept out of the side-effect fence, which identifies a message: the same message listed a minute
+  apart would otherwise have been two different scopes, and "never move it twice" would quietly
+  have stopped being true.
+- **A model repeating itself burned the whole run.** One local model asked for the same mailbox
+  twenty-five times, a second apart, until it ran out of turns, and the run ended saying the agent
+  had stopped without reporting whether it finished. It is now told plainly that it is repeating
+  itself, and the run is stopped with a reason that names the model.
+- **A plan waiting for approval could not be read.** The approval gate is the one line between
+  "somebody watched it try once" and "it does this alone at three in the morning", and the API
+  told a person to read what the task wrote while returning the text of the approved version only.
+- **`dev-install.sh` would install a stale binary.** cargo can report success and leave the last
+  executable in place when clippy or test has won the fingerprint, and an older daemon knows fewer
+  migrations, so it dies with "migration 5 was previously applied but is missing" and reads like a
+  corrupt database. The script now refuses to install anything older than the code.
 - **Checking a model said nothing.** The AI screen's Check button re-probed the model and stored
   the verdict, but when the verdict was unchanged no pixel moved, so the click looked dead. The
   button now says what it is doing, the answer lands on the row it came from ("Checked just now:

@@ -49,6 +49,12 @@ export interface Run {
   task_id: string;
   occurrence_id: string;
   mode: "normal" | "teach" | "dry_run";
+  /**
+   * Was everything irreversible recorded rather than done? Read this rather
+   * than the mode: a teach run can be a rehearsal too, and its mode still says
+   * "teach" because learning is what it is for.
+   */
+  rehearsal: boolean;
   trigger: string;
   status:
     | "armed" | "queued" | "preflight" | "holding" | "running" | "healing"

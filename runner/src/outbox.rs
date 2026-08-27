@@ -276,15 +276,56 @@ pub async fn notify_run(state: &AppState, run_id: &str) -> anyhow::Result<()> {
     }
     let ok = run.status == "succeeded";
 
+    // The answer, because that is the thing the task exists to produce. This
+    // used to send the summary, which the finish tool spends eleven lines
+    // telling the agent is explicitly NOT the answer: "One line, past tense,
+    // about the work itself. Not the answer, and not a repeat of it." So a
+    // scheduled task woke somebody's phone at seven to tell them where it had
+    // been, while what it found stayed in the database.
     let summary = run
-        .summary
+        .answer
         .clone()
+        .filter(|a| !a.trim().is_empty())
+        .or_else(|| run.summary.clone())
         .or_else(|| run.failure.as_ref().map(|f| f.plain_reason.clone()))
         .unwrap_or_else(|| "No details were recorded.".into());
 
     notify_you(state, &run, &task, ok, &summary).await?;
     notify_recipients(state, &run, &task, ok, &summary).await;
     Ok(())
+}
+
+/// Where to reach the person who set the task up.
+///
+/// Telegram first only because it was here first and somebody may already rely
+/// on it. Otherwise, whichever way of reaching them is set up. This used to be
+/// Telegram or nothing, which meant a person who does not use Telegram, or
+/// lives where it is blocked, installed a scheduler that ran every morning and
+/// never told them anything: they had filled in their own address on another
+/// channel, watched a test message arrive, and then heard nothing ever again.
+async fn your_address(state: &AppState) -> Option<(String, String)> {
+    if let Some(chat) = channels::telegram::configured_chat_id().await {
+        return Some(("telegram".into(), chat));
+    }
+    for channel in ["imessage", "apple_mail", "whatsapp"] {
+        let key = format!("messaging.self.{channel}");
+        if let Ok(Some(v)) = errand_core::db::get_setting(state.pool(), &key).await {
+            if let Some(addr) = v.as_str().map(str::trim).filter(|a| !a.is_empty()) {
+                return Some((channel.to_string(), addr.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// The same card, for a channel that carries words rather than markup.
+fn plain_card(task: &str, ok: bool, body: &str) -> String {
+    let head = if ok {
+        task.to_string()
+    } else {
+        format!("{task}: could not finish")
+    };
+    format!("{head}\n\n{body}")
 }
 
 /// The card that says how your own task went.
@@ -304,11 +345,11 @@ async fn notify_you(
         return Ok(());
     }
 
-    let Some(chat) = channels::telegram::configured_chat_id().await else {
-        // Nothing configured is not an error worth failing over, but it is
-        // worth saying once, because a user who thinks they set it up would
-        // otherwise wonder why nothing arrives.
-        tracing::info!("no Telegram chat configured, so no run notification was sent");
+    let Some((channel, address)) = your_address(state).await else {
+        tracing::info!(
+            "no way of reaching you is set up, so no run notification was sent; \
+             Settings has a place for one on each channel"
+        );
         return Ok(());
     };
 
@@ -330,15 +371,22 @@ async fn notify_you(
     // or lost over its own wording.
     let summary = narrate(state, &run.id, &task.name, ok, summary).await;
 
-    let body = channels::telegram::result_card(&task.name, ok, &summary, duration, run.cost_usd);
+    // Telegram takes an HTML card; everything else takes what a person would
+    // write. One shape per channel rather than one shape everywhere, because a
+    // card full of tags arriving as a text message is worse than plain words.
+    let body = if channel == "telegram" {
+        channels::telegram::result_card(&task.name, ok, &summary, duration, run.cost_usd)
+    } else {
+        plain_card(&task.name, ok, &summary)
+    };
     errand_core::db::enqueue_message(
         state.pool(),
         errand_core::db::NewMessage {
             run_id: Some(run.id.clone()),
             task_id: Some(run.task_id.clone()),
             class: "notify".into(),
-            channel: "telegram".into(),
-            recipient: chat,
+            channel: channel.clone(),
+            recipient: address,
             recipient_label: Some("you".into()),
             subject: None,
             body,
@@ -365,7 +413,7 @@ async fn notify_recipients(
     // A rehearsal must not reach a third party. This is the same promise
     // read_brief makes to the agent, kept here rather than there, because a
     // promise enforced only in a prompt is not a promise.
-    if run.mode == "dry_run" {
+    if run.is_rehearsal() {
         return;
     }
 
@@ -715,6 +763,7 @@ async fn narrate(state: &AppState, run_id: &str, task: &str, ok: bool, summary: 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use errand_core::models::RunMode;
 
     #[test]
     fn a_message_held_until_morning_really_goes_out_in_the_morning() {
@@ -768,6 +817,63 @@ mod tests {
     }
 
     // ----------------------------------------------- the night nobody set up --
+
+    #[tokio::test]
+    async fn what_reaches_your_phone_is_the_answer_and_not_the_story_of_the_work() {
+        // finish spends eleven lines telling the agent that summary is
+        // explicitly not the answer. This used to send the summary, so a task
+        // that woke somebody at seven told them where it had been while what
+        // it found stayed in the database.
+        let api = crate::api::testkit::start().await;
+        let task_id = crate::api::testkit::a_ready_manual_task(&api).await;
+        let run = errand_core::db::create_run(
+            &api.pool,
+            &task_id,
+            "occ-notify",
+            "schedule",
+            errand_core::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .expect("a run");
+        errand_core::db::finish_run_ok(
+            &api.pool,
+            &run.id,
+            "Went to the site and read the table.",
+            Some("Gold is 4,592.90 dollars an ounce, down 1.4 percent today."),
+        )
+        .await
+        .expect("finishing");
+        errand_core::db::set_setting(
+            &api.pool,
+            "messaging.self.imessage",
+            &serde_json::json!("+1 555 0123"),
+        )
+        .await
+        .expect("an address to reach you on");
+
+        notify_run(&api.state, &run.id).await.expect("notifying");
+
+        let queued = errand_core::db::due_outbox(&api.pool, 10)
+            .await
+            .expect("the outbox");
+        let mine: Vec<_> = queued.iter().filter(|m| m.class == "notify").collect();
+        assert_eq!(mine.len(), 1, "{queued:?}");
+        assert!(
+            mine[0].body.contains("4,592.90"),
+            "the answer never left the database: {}",
+            mine[0].body
+        );
+        assert!(
+            !mine[0].body.contains("read the table"),
+            "it sent the story of the work instead: {}",
+            mine[0].body
+        );
+        assert_eq!(
+            mine[0].channel, "imessage",
+            "it only knew how to reach you on Telegram"
+        );
+    }
 
     #[tokio::test]
     async fn a_brand_new_install_already_has_a_quiet_period_nobody_had_to_switch_on() {
@@ -863,7 +969,7 @@ mod tests {
     /// calls the settings screen makes.
     async fn a_task_that_tells_mum(
         api: &testkit::Api,
-        mode: &str,
+        mode: RunMode,
         on_success: bool,
         on_failure: bool,
     ) -> errand_core::models::Run {
@@ -916,10 +1022,15 @@ mod tests {
     #[tokio::test]
     async fn a_finished_run_writes_to_the_person_the_task_was_told_to_write_to() {
         let api = testkit::start().await;
-        let run = a_task_that_tells_mum(&api, "normal", true, true).await;
-        errand_core::db::finish_run_ok(&api.pool, &run.id, "The usual order is booked for Friday.")
-            .await
-            .expect("finishing the run");
+        let run = a_task_that_tells_mum(&api, RunMode::NORMAL, true, true).await;
+        errand_core::db::finish_run_ok(
+            &api.pool,
+            &run.id,
+            "The usual order is booked for Friday.",
+            None,
+        )
+        .await
+        .expect("finishing the run");
 
         notify_run(&api.state, &run.id)
             .await
@@ -951,7 +1062,7 @@ mod tests {
         // being told at nine that the eight o'clock booking failed is too late.
         // None of that reasoning applies to somebody else's phone at 03:00.
         let api = testkit::start().await;
-        let run = a_task_that_tells_mum(&api, "normal", true, true).await;
+        let run = a_task_that_tells_mum(&api, RunMode::NORMAL, true, true).await;
         errand_core::db::finish_run_failed(
             &api.pool,
             &run.id,
@@ -981,8 +1092,8 @@ mod tests {
     #[tokio::test]
     async fn somebody_who_only_wanted_the_bad_news_is_not_told_the_good() {
         let api = testkit::start().await;
-        let run = a_task_that_tells_mum(&api, "normal", false, true).await;
-        errand_core::db::finish_run_ok(&api.pool, &run.id, "Ordered.")
+        let run = a_task_that_tells_mum(&api, RunMode::NORMAL, false, true).await;
+        errand_core::db::finish_run_ok(&api.pool, &run.id, "Ordered.", None)
             .await
             .expect("finishing the run");
 
@@ -999,8 +1110,8 @@ mod tests {
     #[tokio::test]
     async fn a_rehearsal_reaches_nobody_at_all() {
         let api = testkit::start().await;
-        let run = a_task_that_tells_mum(&api, "dry_run", true, true).await;
-        errand_core::db::finish_run_ok(&api.pool, &run.id, "Would have ordered the usual.")
+        let run = a_task_that_tells_mum(&api, RunMode::REHEARSAL, true, true).await;
+        errand_core::db::finish_run_ok(&api.pool, &run.id, "Would have ordered the usual.", None)
             .await
             .expect("finishing the run");
 
@@ -1018,8 +1129,8 @@ mod tests {
     async fn a_second_report_of_the_same_run_does_not_tell_anybody_twice() {
         // A retried notification, or two runners racing over one finished run.
         let api = testkit::start().await;
-        let run = a_task_that_tells_mum(&api, "normal", true, true).await;
-        errand_core::db::finish_run_ok(&api.pool, &run.id, "The usual order is booked.")
+        let run = a_task_that_tells_mum(&api, RunMode::NORMAL, true, true).await;
+        errand_core::db::finish_run_ok(&api.pool, &run.id, "The usual order is booked.", None)
             .await
             .expect("finishing the run");
 
@@ -1087,7 +1198,7 @@ mod tests {
             task_id,
             &format!("manual/{}", errand_core::new_id()),
             "manual",
-            "normal",
+            errand_core::models::RunMode::NORMAL,
             None,
         )
         .await
@@ -1115,9 +1226,14 @@ mod tests {
         )
         .await;
         let run = a_press_of_run_now(&api, &task_id).await;
-        errand_core::db::finish_run_ok(&api.pool, &run.id, "The usual order is booked for Friday.")
-            .await
-            .expect("finishing the run");
+        errand_core::db::finish_run_ok(
+            &api.pool,
+            &run.id,
+            "The usual order is booked for Friday.",
+            None,
+        )
+        .await
+        .expect("finishing the run");
 
         notify_run(&api.state, &run.id)
             .await
@@ -1177,7 +1293,7 @@ mod tests {
         )
         .await
         .expect("the agent's own message");
-        errand_core::db::finish_run_ok(&api.pool, &run.id, "Ordered.")
+        errand_core::db::finish_run_ok(&api.pool, &run.id, "Ordered.", None)
             .await
             .expect("finishing the run");
 
@@ -1197,7 +1313,7 @@ mod tests {
         let task_id = a_task_that_tells(&api, 3, &[("Mum", MUMS_NUMBER)]).await;
 
         let first = a_press_of_run_now(&api, &task_id).await;
-        errand_core::db::finish_run_ok(&api.pool, &first.id, "The usual order is booked.")
+        errand_core::db::finish_run_ok(&api.pool, &first.id, "The usual order is booked.", None)
             .await
             .expect("finishing the first run");
         notify_run(&api.state, &first.id)
@@ -1247,7 +1363,7 @@ mod tests {
         let task_id =
             a_task_that_tells(&api, 3, &[("Mum", MUMS_NUMBER), ("Dad", DADS_NUMBER)]).await;
         let run = a_press_of_run_now(&api, &task_id).await;
-        errand_core::db::finish_run_ok(&api.pool, &run.id, "The usual order is booked.")
+        errand_core::db::finish_run_ok(&api.pool, &run.id, "The usual order is booked.", None)
             .await
             .expect("finishing the run");
 
@@ -1269,7 +1385,7 @@ mod tests {
         // empty string, which knows none of the secrets the run actually
         // resolved, so a summary quoting one handed it straight to the model.
         let api = testkit::start().await;
-        let run = a_task_that_tells_mum(&api, "normal", true, true).await;
+        let run = a_task_that_tells_mum(&api, RunMode::NORMAL, true, true).await;
         api.state
             .redactor(&run.id)
             .register("hunter2horse", "Shop password");

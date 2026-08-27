@@ -12,6 +12,14 @@
 //! 3. **`KeepAlive: {SuccessfulExit: false}`** means a clean `exit(0)` stays
 //!    down. That is what makes the update handover work: quiesce exits zero and
 //!    launchd leaves it alone until the installer kickstarts the new binary.
+//! 4. **`bootout` and `bootstrap` both return early.** Neither waits for what
+//!    it asked for, so a reinstall that boots out and immediately bootstraps
+//!    can land while the old job still holds the name, and end with a plist on
+//!    disk and nothing running. Installing is also done on every launch of the
+//!    window, so the ordinary case was a healthy service being taken down to
+//!    have an identical definition put back. Now an unchanged definition with
+//!    a running service is left alone, and a reinstall waits for each step and
+//!    checks at the end that something is actually running.
 
 use anyhow::{bail, Context, Result};
 use std::path::{Path, PathBuf};
@@ -27,10 +35,77 @@ pub trait ServiceManager {
 
 pub struct Launchd;
 
+/// How long to wait for launchd to catch up with itself.
+///
+/// `bootout` returns before the job is gone and `bootstrap` returns before the
+/// job is up, so both are followed by watching rather than by hoping. Tenths of
+/// a second, polled, because the whole thing normally takes one of them and
+/// nobody should wait a fixed second for it.
+const LAUNCHD_SETTLES_WITHIN: std::time::Duration = std::time::Duration::from_secs(5);
+const LOOK_AGAIN_AFTER: std::time::Duration = std::time::Duration::from_millis(100);
+
 impl Launchd {
     fn uid() -> u32 {
         // Safe: getuid cannot fail and has no side effects.
         unsafe { libc_getuid() }
+    }
+
+    /// Wait for the job to be loaded, or to be gone, whichever was asked for.
+    fn settles(&self, loaded: bool) -> bool {
+        wait_for(LAUNCHD_SETTLES_WITHIN, LOOK_AGAIN_AFTER, || {
+            self.is_loaded() == loaded
+        })
+    }
+
+    /// Take the service down and bring it back on the definition just written.
+    ///
+    /// Every step is waited for. `launchctl bootout` returns as soon as it has
+    /// asked, not when the job has gone, so a bootstrap issued straight
+    /// afterwards can land while the old job still holds the name and fail:
+    /// the plist is on disk, nothing is running, and nothing says so until
+    /// somebody opens the window and finds the service not answering.
+    fn reload(&self, plist_path: &Path) -> Result<()> {
+        let domain = format!("gui/{}", Self::uid());
+        let _ = std::process::Command::new("launchctl")
+            .args(["bootout", &format!("{domain}/{}", crate::LAUNCHD_LABEL)])
+            .output();
+        // Not an error on its own: a job that will not go may still be
+        // replaced, and the bootstrap below is where that shows up.
+        let _ = self.settles(false);
+
+        let mut said = String::new();
+        for attempt in 0..2 {
+            let out = std::process::Command::new("launchctl")
+                .arg("bootstrap")
+                .arg(&domain)
+                .arg(plist_path)
+                .output()
+                .context("running launchctl bootstrap")?;
+            if out.status.success() || self.is_loaded() {
+                break;
+            }
+            said = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            // One retry, because the common failure is transient: launchd was
+            // still letting go of the old job.
+            if attempt == 0 {
+                std::thread::sleep(LOOK_AGAIN_AFTER * 5);
+            }
+        }
+
+        // The thing that actually matters, asked rather than assumed. A
+        // bootstrap can report success and leave nothing running.
+        if !self.settles(true) {
+            bail!(
+                "the background service was reinstalled but did not start.{}{}",
+                if said.is_empty() {
+                    ""
+                } else {
+                    " launchctl said: "
+                },
+                said
+            );
+        }
+        Ok(())
     }
 }
 
@@ -146,6 +221,28 @@ fn render_plist_with(exe: &Path, logs_dir: &Path, extra_env: &[(String, String)]
     )
 }
 
+/// Ask until it is true or the time is up.
+///
+/// Its own function so the waiting can be held to in a test: nothing in the
+/// suite can drive launchctl, but this is the part that decides whether a
+/// service that comes up a moment late is seen at all.
+fn wait_for(
+    within: std::time::Duration,
+    gap: std::time::Duration,
+    mut ready: impl FnMut() -> bool,
+) -> bool {
+    let deadline = std::time::Instant::now() + within;
+    loop {
+        if ready() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(gap);
+    }
+}
+
 impl ServiceManager for Launchd {
     fn install(&self, exe: &Path) -> Result<PathBuf> {
         if crate::paths::is_translocated(exe) {
@@ -167,27 +264,30 @@ impl ServiceManager for Launchd {
         let logs = crate::paths::logs_dir()?;
         std::fs::create_dir_all(&logs)?;
 
-        std::fs::write(&plist_path, render_plist(exe, &logs))
-            .with_context(|| format!("writing {}", plist_path.display()))?;
+        let wanted = render_plist(exe, &logs);
 
-        let domain = format!("gui/{}", Self::uid());
-        // bootout first so re-installing over an older definition is clean.
-        let _ = std::process::Command::new("launchctl")
-            .args(["bootout", &format!("{domain}/{}", crate::LAUNCHD_LABEL)])
-            .output();
-
-        let out = std::process::Command::new("launchctl")
-            .arg("bootstrap")
-            .arg(&domain)
-            .arg(&plist_path)
-            .output()
-            .context("running launchctl bootstrap")?;
-        if !out.status.success() {
-            bail!(
-                "launchctl bootstrap failed: {}",
-                String::from_utf8_lossy(&out.stderr).trim()
-            );
+        // A service that is already right is left alone.
+        //
+        // This runs on every launch of the window, and it used to take a
+        // healthy service down and put an identical definition back in its
+        // place. Every one of those was a chance to end up with nothing
+        // running, which is what happened: install, then the window opens a
+        // second later and installs again, and the second bootout landed on a
+        // service the first bootstrap had only just started. The window said
+        // the background service was not answering, and it was right.
+        //
+        // Nothing to change and something already running is the ordinary case
+        // and now costs one file read.
+        let unchanged = std::fs::read_to_string(&plist_path)
+            .map(|on_disk| on_disk == wanted)
+            .unwrap_or(false);
+        if unchanged && self.is_loaded() {
+            return Ok(plist_path);
         }
+
+        std::fs::write(&plist_path, &wanted)
+            .with_context(|| format!("writing {}", plist_path.display()))?;
+        self.reload(&plist_path)?;
         Ok(plist_path)
     }
 
@@ -233,6 +333,44 @@ impl ServiceManager for Launchd {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_same_inputs_render_the_same_plist_every_time() {
+        // What the "leave it alone" check rests on. If rendering varied at all
+        // -- a timestamp, a set iterated in whatever order -- the comparison
+        // would never match, every launch of the window would reinstall, and
+        // the race this file now avoids would be back with nothing to show for
+        // it.
+        let exe = Path::new("/Applications/Errand-AI.app/Contents/MacOS/errandd");
+        let logs = Path::new("/Users/USER/Library/Application Support/com.errandai.app/logs");
+        assert_eq!(render_plist(exe, logs), render_plist(exe, logs));
+    }
+
+    #[test]
+    fn waiting_gives_up_at_the_deadline_and_stops_the_moment_it_is_true() {
+        use std::time::Duration;
+        // Ready on the third ask, which is the shape of a service coming up a
+        // moment after launchctl said it had.
+        let mut asked = 0;
+        let got = wait_for(Duration::from_secs(5), Duration::from_millis(1), || {
+            asked += 1;
+            asked == 3
+        });
+        assert!(got);
+        assert_eq!(asked, 3, "it went on asking after the answer was yes");
+
+        // Never ready: it gives up rather than hanging the window that called
+        // it, and says so rather than pretending.
+        let began = std::time::Instant::now();
+        let got = wait_for(Duration::from_millis(40), Duration::from_millis(1), || {
+            false
+        });
+        assert!(!got);
+        assert!(
+            began.elapsed() < Duration::from_secs(2),
+            "waited far too long"
+        );
+    }
 
     #[test]
     fn plist_has_no_tilde_and_the_right_keepalive() {

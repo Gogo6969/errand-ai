@@ -135,6 +135,20 @@ fn task_from_row(r: &sqlx::sqlite::SqliteRow) -> Result<crate::models::Task> {
     })
 }
 
+/// A password belongs in the keychain, and a description is the one field that
+/// is sent whole to a model on every run.
+///
+/// Checked here as well as at the API edge, for the reason the sites are: this
+/// is the only place every write passes through, so it is the only place the
+/// rule cannot be walked around by a caller that forgot it. See
+/// `crate::passwords` for what counts and why the shape is drawn where it is.
+fn refuse_a_typed_secret(description: &str) -> Result<()> {
+    if let Some(label) = crate::passwords::typed_secret(description) {
+        anyhow::bail!(crate::passwords::refusal(&label));
+    }
+    Ok(())
+}
+
 pub struct NewTask {
     pub name: String,
     pub description: String,
@@ -143,6 +157,7 @@ pub struct NewTask {
 }
 
 pub async fn create_task(pool: &Pool, t: NewTask) -> Result<crate::models::Task> {
+    refuse_a_typed_secret(&t.description)?;
     let id = crate::new_id();
     let now = crate::now_iso();
     // The floor starts at creation. A task set up today with a cron that has
@@ -229,6 +244,10 @@ fn merge_settings(stored: &str, patch: Option<&serde_json::Value>) -> Result<Opt
 /// person editing the schedule has not necessarily looked at the site.
 pub async fn update_task(pool: &Pool, id: &str, patch: TaskPatch) -> Result<crate::models::Task> {
     let now = crate::now_iso();
+
+    if let Some(d) = &patch.description {
+        refuse_a_typed_secret(d)?;
+    }
 
     // Done before the transaction opens, so a rejected site entry costs nothing
     // and leaves nothing half-written.

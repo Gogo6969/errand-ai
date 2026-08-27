@@ -283,6 +283,11 @@ async fn create_task(
              so write it the way you would explain the job to a person.",
         ));
     }
+    if let Some(label) = errand_core::passwords::typed_secret(&body.description) {
+        return Err(ApiError::bad_request(errand_core::passwords::refusal(
+            &label,
+        )));
+    }
     let schedule = body.schedule.unwrap_or_else(|| json!({ "kind": "manual" }));
     errand_core::schedule::ScheduleSpec::from_json(&schedule)
         .and_then(|s| s.validate())
@@ -438,6 +443,15 @@ async fn patch_task(
             "A task needs a description: it is what the agent actually reads, so nothing was \
              changed. Leave the description out of the change to keep the one it has.",
         ));
+    }
+    if let Some(label) = body
+        .description
+        .as_deref()
+        .and_then(errand_core::passwords::typed_secret)
+    {
+        return Err(ApiError::bad_request(errand_core::passwords::refusal(
+            &label,
+        )));
     }
 
     let mut warnings: Vec<String> = vec![];
@@ -4307,20 +4321,11 @@ mod tests {
         assert_eq!(super::self_address_channel("messaging.quiet"), None);
     }
 
-    /// Nothing in this test may ask the real Mac for anything. Asking is what
-    /// makes macOS prompt, and a suite that prompts is a suite that puts a
-    /// permission dialogue in front of whoever ran it.
-    fn nothing_touches_the_real_mac() {
-        static ONCE: std::sync::Once = std::sync::Once::new();
-        ONCE.call_once(|| std::env::set_var("ERRAND_APPLE_DRY", "1"));
-    }
-
     #[tokio::test]
     async fn the_screen_can_offer_an_enable_for_every_app_a_task_drives() {
         // The gap this closes: the consent button existed for the two channels
         // and for nothing else, so a task told to write a note met a prompt
         // nobody could see and simply stopped.
-        nothing_touches_the_real_mac();
         let api = testkit::start().await;
 
         let listed = api.get("/v1/automation").await;
@@ -4361,6 +4366,53 @@ mod tests {
             .post("/v1/automation/the-garage-door/enable", json!({}))
             .await;
         assert_eq!(code, 400, "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_password_typed_into_a_description_is_refused_with_somewhere_to_put_it() {
+        // Found in a real task: an account and its password sat in the
+        // description, which is the prompt, so both went to the model on every
+        // run and sat in the clear in the database between them. The box next
+        // door was right there and nothing pointed at it.
+        let api = testkit::start().await;
+        let secret_in_the_wrong_box =
+            "Show me the trending subjects on X\n\nX PW: Hunter2-not-a-real-one";
+
+        let (code, body) = api
+            .post(
+                "/v1/tasks",
+                json!({ "name": "X research", "description": secret_in_the_wrong_box }),
+            )
+            .await;
+        assert_eq!(code, 400, "the password was accepted: {body}");
+        let detail = body["detail"].as_str().unwrap_or_default();
+        assert!(detail.contains("Logins"), "say where it goes: {detail}");
+        assert!(detail.contains("keychain"), "and why there: {detail}");
+
+        // And the same on the way in through an edit, which is how it would
+        // arrive otherwise.
+        let id = a_task(
+            &api,
+            json!({ "name": "X research", "description": "Trending on X" }),
+        )
+        .await;
+        let (code, body) = api
+            .patch(
+                &format!("/v1/tasks/{id}"),
+                json!({ "description": secret_in_the_wrong_box }),
+            )
+            .await;
+        assert_eq!(code, 400, "the password was accepted on an edit: {body}");
+
+        // Saying where the password lives is the thing being asked for, so it
+        // has to go through.
+        let (code, body) = api
+            .patch(
+                &format!("/v1/tasks/{id}"),
+                json!({ "description": "Trending on X. Sign in with the saved X login." }),
+            )
+            .await;
+        assert_eq!(code, 200, "refused an ordinary description: {body}");
     }
 
     #[tokio::test]

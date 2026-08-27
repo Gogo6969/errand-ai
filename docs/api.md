@@ -102,6 +102,15 @@ saying but not worth refusing over, such as `www.x.com` without `x.com`.
 Order matters: the first entry decides which browser profile the task uses, and
 that profile holds its saved logins.
 
+A teach run adds to this list on its own. Most sites serve their code from a
+second address nobody thinks to type (x.com's is abs.twimg.com), and a task
+allowed only the address a person names gets a page that cannot start. So a
+teach run, where somebody is present, writes the addresses a page could not
+load without into the task, and says which in the run's timeline. Only ones a
+page was refused several scripts from: a single script is a sign-in button or
+an analytics tag, not the site. An ordinary run never widens the list. It says
+which address was refused and leaves the decision to a person.
+
 ### Schedules
 
 ```json

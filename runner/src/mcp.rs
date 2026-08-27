@@ -833,7 +833,7 @@ pub(crate) async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &
                              it themselves."
                         ));
                     }
-                    text_result(render_snapshot(&snap))
+                    text_result(page_for_model(state, run_id, &b, &snap).await)
                 }
                 Err(e) => {
                     // A refused navigation is a decision worth recording: it is
@@ -854,7 +854,7 @@ pub(crate) async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &
                 return text_error("No browser is open. Call open_browser first.");
             };
             match b.snapshot().await {
-                Ok(s) => text_result(render_snapshot(&s)),
+                Ok(s) => text_result(page_for_model(state, run_id, &b, &s).await),
                 Err(e) => text_error(format!("Could not read the page: {e}")),
             }
         }
@@ -1153,6 +1153,166 @@ fn render_snapshot(s: &crate::browser::Snapshot) -> String {
             ""
         }
     )
+}
+
+/// The page as the agent reads it, and then whatever has to be said about the
+/// files it did not get.
+///
+/// One funnel, because the two things that can be said are contradictory and
+/// only ever one of them is true: either the missing sites have just been added
+/// to the task and the page is worth loading again, or they have not been and no
+/// amount of reloading will help.
+///
+/// After the page rather than before it: it explains what is missing from what
+/// was just read, and a warning above the content reads as being about the tool
+/// call rather than about the page.
+async fn page_for_model(
+    state: &AppState,
+    run_id: &str,
+    b: &crate::browser::Browser,
+    s: &crate::browser::Snapshot,
+) -> String {
+    let page = render_snapshot(s);
+    match learn_the_sites_a_page_needs(state, run_id, b, s)
+        .await
+        .or_else(|| s.blocked_note())
+    {
+        Some(said) => format!("{page}\n\n{said}"),
+        None => page,
+    }
+}
+
+/// Teach the task which other sites the one it names is actually served from.
+///
+/// Somebody types the site they mean, x.com, and every script on it comes from
+/// abs.twimg.com. Nobody knows that until a page is open and broken, so nobody
+/// can be expected to have typed it in advance, and the fence that refused it
+/// was working exactly as designed. So it is learned at the one moment somebody
+/// is present and setting the task up: a teach run writes what the site needed
+/// into the task, and every run after it opens a page that works.
+///
+/// Deliberately not done on an ordinary run. Widening a fence is a decision,
+/// and 03:00 with nobody watching is the wrong time to take one. A run that
+/// meets a new asset host says so instead, and says which line to add.
+///
+/// Returns what to tell the agent, when there is anything to tell it.
+async fn learn_the_sites_a_page_needs(
+    state: &AppState,
+    run_id: &str,
+    b: &crate::browser::Browser,
+    s: &crate::browser::Snapshot,
+) -> Option<String> {
+    let fresh = b.newly_blocked(s).await;
+    if fresh.is_empty() {
+        return None;
+    }
+    for host in &fresh {
+        let line = format!(
+            "Refused {} this page wanted from {}: not on this task's sites",
+            if host.count == 1 {
+                "1 file".to_string()
+            } else {
+                format!("{} files", host.count)
+            },
+            host.host
+        );
+        let _ = journal(state, run_id, "decide", &line, false).await;
+    }
+
+    let run = errand_core::db::get_run(state.pool(), run_id)
+        .await
+        .ok()??;
+    if run.mode != "teach" {
+        return None;
+    }
+    let worth = crate::browser::worth_allowing(&fresh);
+    if worth.is_empty() {
+        return None;
+    }
+
+    let added = match add_sites_to_task(state, &run.task_id, &worth).await {
+        Ok(added) if !added.is_empty() => added,
+        Ok(_) => return None,
+        Err(e) => {
+            tracing::warn!(target: "task", "could not record the sites a page needs: {e}");
+            return None;
+        }
+    };
+
+    // The task first, this session second: the task is the record, and the open
+    // session is only catching up with what it now says.
+    if let Err(e) = b.also_allow(&added).await {
+        tracing::warn!(target: "browser", "could not widen the open session: {e}");
+    }
+    let list = added.join(", ");
+    let _ = journal(
+        state,
+        run_id,
+        "decide",
+        &format!("Added {list} to this task's sites: this page is served from there"),
+        true,
+    )
+    .await;
+    Some(format!(
+        "This page is served from {list}, which this task did not allow, so it was refused its \
+         own scripts and drew an error instead of its content. That has been put right: {list} \
+         now belongs to this task, here and in every run after this one. Load the page again and \
+         carry on."
+    ))
+}
+
+/// Add sites to a task, keeping the ones it has and the order they are in.
+///
+/// Order is load-bearing: the browser profile a task uses is claimed from the
+/// first entry, so anything learned goes on the end. A task signed in to a site
+/// yesterday must not find itself in a different profile today because Errand
+/// learned about a CDN.
+async fn add_sites_to_task(
+    state: &AppState,
+    task_id: &str,
+    hosts: &[String],
+) -> anyhow::Result<Vec<String>> {
+    let task = errand_core::db::get_task(state.pool(), task_id)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("task not found"))?;
+    let mut sites: Vec<String> = task
+        .allowed_domains
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let mut added = vec![];
+    for host in hosts {
+        // Stored the way the run-time check will compare it, or not at all: an
+        // entry that can never match is worse than none, because it reads on
+        // the screen as a site that is allowed.
+        let Ok(tidy) = errand_core::domains::normalize_domain(host) else {
+            continue;
+        };
+        if sites.iter().any(|d| d == &tidy) {
+            continue;
+        }
+        sites.push(tidy.clone());
+        added.push(tidy);
+    }
+    if added.is_empty() {
+        return Ok(added);
+    }
+
+    errand_core::db::update_task(
+        state.pool(),
+        task_id,
+        errand_core::db::TaskPatch {
+            allowed_domains: Some(sites),
+            ..Default::default()
+        },
+    )
+    .await?;
+    Ok(added)
 }
 
 /// A crude shape check, used only to stop the model routing a secret through

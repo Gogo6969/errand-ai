@@ -23,6 +23,7 @@ pub struct Api {
 /// Start a daemon on a free port, with one admin token.
 pub async fn start() -> Api {
     data_dir_once();
+    nothing_touches_the_real_mac();
     let pool = errand_core::db::open_memory()
         .await
         .expect("an in-memory database");
@@ -53,6 +54,18 @@ pub async fn mint(pool: &Pool, name: &str, scopes: &str) -> String {
         .await
         .expect("storing the token");
     token
+}
+
+/// Nothing an API test does may ask the real Mac for anything.
+///
+/// Asking is what makes macOS prompt, and a suite that prompts is a suite that
+/// puts a permission dialogue in front of whoever ran it. The switch is thrown
+/// here rather than in each test because the channel checks are reached from
+/// routes that are not about them: the channel list runs them, and so does
+/// saving a setting, so a test that never mentions Mail can still open it.
+fn nothing_touches_the_real_mac() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| std::env::set_var("ERRAND_APPLE_DRY", "1"));
 }
 
 /// Playbooks are files on disk, so the tests need a directory of their own

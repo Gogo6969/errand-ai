@@ -10,6 +10,7 @@ pub mod keychain;
 pub mod launchd;
 pub mod limits;
 pub mod models;
+pub mod passwords;
 pub mod paths;
 pub mod playbook;
 pub mod providers;

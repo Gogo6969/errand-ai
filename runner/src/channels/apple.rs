@@ -131,6 +131,39 @@ fn escape(s: &str) -> String {
     s.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+/// What a channel check answers when nothing may touch the real machine.
+///
+/// The same answer `app_consent` gives, for the same reason: asking macOS is
+/// itself what makes it prompt, so a rehearsal must not ask. A check looks
+/// harmless next to a send, which is how these two probes kept their osascript
+/// call long after the sends beside them stopped making one, and how a single
+/// test asking for the channel list could open Mail and Messages on the machine
+/// of whoever ran the suite.
+fn rehearsal(c: ChannelId) -> Health {
+    match crate::desktop::rehearsed_refusal() {
+        Some(stderr) => from_channel_error(c, translate(c.display_name(), &stderr)),
+        None => Health {
+            status: "not_configured".into(),
+            detail: format!(
+                "This is a rehearsal, so macOS was not asked about {}.",
+                c.display_name()
+            ),
+            ..Health::off(c)
+        },
+    }
+}
+
+/// A refusal or a failure, said the way a channel says it.
+///
+/// Shared so that a rehearsed refusal and a real one reach the screen in one
+/// set of words rather than two that can drift apart.
+fn from_channel_error(c: ChannelId, e: ChannelError) -> Health {
+    match e {
+        ChannelError::NeedsUser { why, fix } => Health::needs_user(c, why, fix),
+        other => Health::down(c, other.to_string(), None),
+    }
+}
+
 // ------------------------------------------------------------------- mail --
 
 pub async fn send_mail(to: &str, subject: &str, body: &str) -> SendResult {
@@ -159,6 +192,9 @@ pub async fn mail_health() -> Health {
     if !cfg!(target_os = "macos") {
         return Health::off(ChannelId::AppleMail);
     }
+    if crate::desktop::dry() {
+        return rehearsal(ChannelId::AppleMail);
+    }
     match osascript(
         ChannelId::AppleMail.display_name(),
         r#"tell application "Mail" to return (count of accounts)"#,
@@ -175,10 +211,7 @@ pub async fn mail_health() -> Health {
             "Mail is running but has no accounts.",
             "Add an account in Mail, then try again.",
         ),
-        Err(ChannelError::NeedsUser { why, fix }) => {
-            Health::needs_user(ChannelId::AppleMail, why, fix)
-        }
-        Err(e) => Health::down(ChannelId::AppleMail, e.to_string(), None),
+        Err(e) => from_channel_error(ChannelId::AppleMail, e),
     }
 }
 
@@ -206,6 +239,9 @@ pub async fn imessage_health() -> Health {
     if !cfg!(target_os = "macos") {
         return Health::off(ChannelId::Imessage);
     }
+    if crate::desktop::dry() {
+        return rehearsal(ChannelId::Imessage);
+    }
     match osascript(
         ChannelId::Imessage.display_name(),
         r#"tell application "Messages" to return (count of (accounts whose service type = iMessage))"#,
@@ -219,10 +255,7 @@ pub async fn imessage_health() -> Health {
             "Messages is running but not signed in to iMessage.",
             "Open Messages and sign in with your Apple ID.",
         ),
-        Err(ChannelError::NeedsUser { why, fix }) => {
-            Health::needs_user(ChannelId::Imessage, why, fix)
-        }
-        Err(e) => Health::down(ChannelId::Imessage, e.to_string(), None),
+        Err(e) => from_channel_error(ChannelId::Imessage, e),
     }
 }
 
@@ -544,6 +577,49 @@ mod tests {
             assert!(fix.contains("Enable"), "{fix}");
             assert!(fix.contains(app.app_name()), "{fix}");
             assert!(fix.contains("System Settings"), "{fix}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rehearsal_never_asks_the_real_mac_whether_mail_and_messages_are_well() {
+        // The defect: these two ran osascript whatever the switch said, so a
+        // test that only wanted the channel list drove Mail and Messages on the
+        // machine of whoever ran it, and could stop on a permission prompt that
+        // nobody expected to be asked for.
+        std::env::set_var("ERRAND_APPLE_DRY", "1");
+        for h in [mail_health().await, imessage_health().await] {
+            assert_eq!(h.status, "not_configured", "{h:?}");
+            assert!(h.detail.contains("rehearsal"), "{}", h.detail);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rehearsed_refusal_on_a_channel_names_the_app_and_the_button() {
+        // A rehearsal that answered "all well" would hide the one failure these
+        // channels actually have, so a Mac that says no has to be rehearsable
+        // too, in the words the real one would produce.
+        std::env::set_var("ERRAND_APPLE_DRY", "1");
+        for (channel, app) in [
+            (ChannelId::AppleMail, "Apple Mail"),
+            (ChannelId::Imessage, "Apple Messages"),
+        ] {
+            let check = async move {
+                match channel {
+                    ChannelId::AppleMail => mail_health().await,
+                    _ => imessage_health().await,
+                }
+            };
+            let h = crate::desktop::PRETEND_MACOS_SAID
+                .scope(
+                    "execution error: Not authorized to send Apple events. (-1743)".to_string(),
+                    check,
+                )
+                .await;
+            assert_eq!(h.status, "needs_user", "{h:?}");
+            assert!(h.detail.contains(app), "{h:?}");
+            let fix = h.fix.clone().unwrap_or_default();
+            assert!(fix.contains("Enable"), "{fix}");
+            assert!(fix.contains(app), "{fix}");
         }
     }
 

@@ -6,11 +6,20 @@
 //! is the authoritative layer: the model is told the rules so it plans within
 //! them, and the sidecar blocks requests as a backstop, but this is the check
 //! that counts.
+//!
+//! The allowlist holds the sites a person named, and a modern page is served
+//! from more addresses than anybody names. x.com's every script comes from
+//! abs.twimg.com, so a task allowed x.com alone opens a shell that cannot start
+//! and shows the site's own "something went wrong". So a refused file is
+//! counted and reported rather than dropped silently, and a teach run, where
+//! somebody is present and setting the task up, writes the addresses a page
+//! could not live without into the task. See `worth_allowing` for where that
+//! line is drawn and why it is drawn conservatively.
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
@@ -30,6 +39,133 @@ pub struct Snapshot {
     pub truncated: bool,
     #[serde(default)]
     pub ref_count: i64,
+    /// Hosts this page wanted files from and was refused, because they are not
+    /// on the task's list of sites.
+    #[serde(default)]
+    pub blocked: Vec<BlockedHost>,
+}
+
+/// One host a page asked for files from and did not get them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BlockedHost {
+    pub host: String,
+    pub count: i64,
+    /// Whether any of what it was refused was a script or a stylesheet, rather
+    /// than an image or a font. A page missing a picture is a page with a gap
+    /// in it; a page missing its scripts never starts, and only that is worth
+    /// widening a task's list of sites for.
+    #[serde(default)]
+    pub scripts: bool,
+}
+
+impl Snapshot {
+    /// What to tell the agent about the files this page did not get.
+    ///
+    /// Said on every read of the page rather than once at the moment of the
+    /// refusal, because the agent meets the consequence later and somewhere
+    /// else: a half-drawn page, or the site's own error message, several turns
+    /// after the request was refused. Without this it reads that as a site
+    /// having a bad day and reloads, which is what a run against x.com did
+    /// until it ran out of patience. Every script x.com has comes from
+    /// abs.twimg.com, so a task allowed x.com alone can never load it, and
+    /// nothing anywhere said so.
+    pub fn blocked_note(&self) -> Option<String> {
+        if self.blocked.is_empty() {
+            return None;
+        }
+        let mut worst = self.blocked.clone();
+        worst.sort_by(|a, b| b.count.cmp(&a.count).then(a.host.cmp(&b.host)));
+        let opening = if worst.len() == 1 {
+            format!(
+                "This page asked for {} from {}, which is not on this task's list of sites, so \
+                 it got none of them.",
+                files(worst[0].count),
+                worst[0].host
+            )
+        } else {
+            let named: Vec<String> = worst
+                .iter()
+                .take(5)
+                .map(|b| format!("{} ({})", b.host, files(b.count)))
+                .collect();
+            let rest = worst.len().saturating_sub(5);
+            format!(
+                "This page asked for files from {} sites that are not on this task's list: \
+                 {}{}. It got none of them.",
+                worst.len(),
+                named.join(", "),
+                if rest > 0 {
+                    format!(", and {rest} more")
+                } else {
+                    String::new()
+                }
+            )
+        };
+        Some(format!(
+            "{opening} A page that was refused its scripts usually shows its own error \
+             message instead of its content, and reloading will not change that. If this page \
+             looks broken or empty, that is why: say so and name those sites, so the person who \
+             set this task up can add the ones it genuinely needs. Do not keep trying."
+        ))
+    }
+}
+
+/// The blocked hosts in this snapshot that `seen` has not heard of, worst
+/// first, added to `seen`. Split from the lock so the rule can be tested
+/// without a browser to hold it.
+fn unreported(seen: &mut HashSet<String>, s: &Snapshot) -> Vec<BlockedHost> {
+    let mut fresh: Vec<BlockedHost> = s
+        .blocked
+        .iter()
+        .filter(|b| !seen.contains(&b.host))
+        .cloned()
+        .collect();
+    for b in &fresh {
+        seen.insert(b.host.clone());
+    }
+    fresh.sort_by(|a, b| b.count.cmp(&a.count).then(a.host.cmp(&b.host)));
+    fresh
+}
+
+/// A site's own bundle never arrives as one file.
+///
+/// This is the line between the two kinds of stranger a page asks for scripts.
+/// A site's own code is split by its build into chunks, a vendor bundle and its
+/// stylesheets, so its asset domain is asked for many files and the page is
+/// dead without them. A third party bolted onto the page is one script: a
+/// sign-in widget, an analytics tag, a chat bubble. Measured rather than
+/// guessed at, on x.com's own login page, which wants eleven files from
+/// abs.twimg.com and exactly one each from accounts.google.com and
+/// appleid.cdn-apple.com. The first is the site. The other two are the "sign in
+/// with" buttons, and a task that was allowed x.com should not come away
+/// holding a key to somebody's Google account.
+const A_SITES_OWN_BUNDLE: i64 = 3;
+
+/// The hosts on this page worth adding to the task, most-refused first.
+///
+/// Two tests, and a host must pass both. It was refused a script or a
+/// stylesheet, because a page missing a picture still works and a fence does
+/// not move for a picture. And it was refused several, which is what separates
+/// a site's own code from a passenger riding on it.
+///
+/// Both are deliberately conservative. Adding too little costs a line in the
+/// timeline saying which site was refused, which somebody can act on; adding
+/// too much silently hands a task somewhere it was never meant to go.
+pub fn worth_allowing(blocked: &[BlockedHost]) -> Vec<String> {
+    let mut worth: Vec<&BlockedHost> = blocked
+        .iter()
+        .filter(|b| b.scripts && b.count >= A_SITES_OWN_BUNDLE)
+        .collect();
+    worth.sort_by(|a, b| b.count.cmp(&a.count).then(a.host.cmp(&b.host)));
+    worth.iter().map(|b| b.host.clone()).collect()
+}
+
+fn files(n: i64) -> String {
+    if n == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{n} files")
+    }
 }
 
 /// What the run is allowed to reach on the web.
@@ -342,12 +478,18 @@ pub struct Browser {
     /// can be classified by what it actually says before it is performed.
     /// The model's own account of what it is clicking is not trusted alone.
     last_refs: Mutex<HashMap<String, (String, String)>>,
+    /// Hosts whose refusal is already in the run's timeline. A page read five
+    /// times refused the same CDN five times, and five identical lines in a
+    /// timeline a person reads afterwards is noise, not information.
+    noted_blocks: Mutex<HashSet<String>>,
     stdin: Mutex<ChildStdin>,
     pending: Arc<Mutex<Pending>>,
     /// Shared with the reader task, which needs the exit status to explain a
     /// death and must not hold the lock while `close` is trying to kill.
     child: Arc<Mutex<Child>>,
-    policy: DomainPolicy,
+    /// Behind a lock because a run can learn, mid-page, that the site it was
+    /// told to visit serves its scripts from somewhere else. See `also_allow`.
+    policy: Mutex<DomainPolicy>,
     redactor: Redactor,
 }
 
@@ -488,10 +630,11 @@ impl Browser {
 
         let b = Self {
             last_refs: Mutex::new(HashMap::new()),
+            noted_blocks: Mutex::new(HashSet::new()),
             stdin: Mutex::new(stdin),
             pending,
             child,
-            policy: policy.clone(),
+            policy: Mutex::new(policy.clone()),
             redactor,
         };
 
@@ -563,8 +706,9 @@ impl Browser {
 
     /// Navigate, with the authoritative allowlist check in front of it.
     pub async fn goto(&self, url: &str) -> std::result::Result<Snapshot, NavError> {
-        if !self.policy.permits(url) {
-            if let Some(similar) = self.policy.looks_like_typosquat(url) {
+        let policy = self.policy.lock().await.clone();
+        if !policy.permits(url) {
+            if let Some(similar) = policy.looks_like_typosquat(url) {
                 return Err(NavError::Lookalike {
                     url: url.to_string(),
                     similar,
@@ -572,13 +716,49 @@ impl Browser {
             }
             return Err(NavError::NotAllowed {
                 url: url.to_string(),
-                allowed: self.policy.allowed.clone(),
+                allowed: policy.allowed.clone(),
             });
         }
         self.call("page.goto", json!({ "url": url }))
             .await
             .map_err(NavError::Failed)?;
         self.snapshot().await.map_err(NavError::Failed)
+    }
+
+    /// Let this session reach these sites too, from now on.
+    ///
+    /// Both layers move together or neither does: this one, which is what the
+    /// agent's next navigation is checked against, and the sidecar's, which is
+    /// what the page's own requests are checked against. Widening one alone
+    /// would be a fence that disagrees with itself, and the disagreement would
+    /// show up as a page that half works.
+    ///
+    /// The caller writes it to the task first. A session that allowed more than
+    /// the task says would quietly hand the next run a rule nobody stored.
+    pub async fn also_allow(&self, hosts: &[String]) -> Result<()> {
+        let allowed = {
+            let mut p = self.policy.lock().await;
+            for h in hosts {
+                if !p.allowed.iter().any(|d| d == h) {
+                    p.allowed.push(h.clone());
+                }
+            }
+            p.allowed.clone()
+        };
+        self.call("session.allow", json!({ "domains": allowed }))
+            .await
+            .map(|_| ())
+    }
+
+    /// The hosts in this snapshot whose refusal has not been recorded yet,
+    /// most-refused first, marked as recorded on the way out.
+    ///
+    /// The caller writes the timeline line rather than this, because what a
+    /// person reads afterwards belongs with the rest of the run's story, not in
+    /// the layer that talks to node.
+    pub async fn newly_blocked(&self, s: &Snapshot) -> Vec<BlockedHost> {
+        let mut seen = self.noted_blocks.lock().await;
+        unreported(&mut seen, s)
     }
 
     /// What a ref says, from the last snapshot: (role, label).
@@ -1007,6 +1187,143 @@ mod tests {
         assert!(!p.permits("not a url"));
         assert!(!p.permits("javascript:alert(1)"));
         assert!(!p.permits("file:///etc/passwd"));
+    }
+
+    /// A page that was refused files: (host, how many, was any of it a script).
+    fn page_refused(hosts: &[(&str, i64, bool)]) -> Snapshot {
+        Snapshot {
+            url: "https://x.com/explore".into(),
+            title: String::new(),
+            tree: "- text \"Something went wrong\"".into(),
+            truncated: false,
+            ref_count: 1,
+            blocked: hosts
+                .iter()
+                .map(|(h, c, scripts)| BlockedHost {
+                    host: (*h).to_string(),
+                    count: *c,
+                    scripts: *scripts,
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn a_page_that_was_refused_its_scripts_says_so_and_names_the_site() {
+        // The real run this comes from: a task allowed x.com, every script on
+        // x.com comes from abs.twimg.com, and the agent read the site's own
+        // "something went wrong" as a site having a bad day. It retried until
+        // it gave up, and no line anywhere named the fence that broke it.
+        let note = page_refused(&[("abs.twimg.com", 103, true)])
+            .blocked_note()
+            .expect("a page that was refused files says so");
+        assert!(note.contains("abs.twimg.com"), "{note}");
+        assert!(note.contains("103 files"), "{note}");
+        assert!(note.contains("list of sites"), "{note}");
+        // The retry is the expensive part, so it is refused in words.
+        assert!(note.contains("Do not keep trying"), "{note}");
+    }
+
+    #[test]
+    fn every_refused_site_is_named_worst_first() {
+        let note = page_refused(&[("pbs.twimg.com", 4, false), ("abs.twimg.com", 103, true)])
+            .blocked_note()
+            .expect("two refused sites still say so");
+        let abs = note.find("abs.twimg.com").expect("the worst offender");
+        let pbs = note.find("pbs.twimg.com").expect("the other one");
+        assert!(abs < pbs, "the site to add first comes first: {note}");
+        assert!(note.contains("2 sites"), "{note}");
+    }
+
+    #[test]
+    fn one_refused_file_is_not_called_one_files() {
+        let note = page_refused(&[("fonts.example", 1, false)])
+            .blocked_note()
+            .unwrap();
+        assert!(note.contains("1 file from"), "{note}");
+    }
+
+    #[test]
+    fn the_sentence_a_refused_page_produces_reads_as_one_sentence() {
+        // These lines are wrapped by hand in the source, and a dropped
+        // continuation turns one of them into a paragraph with a hole in the
+        // middle. The agent reads this and so does the person it quotes it to.
+        for hosts in [
+            &[("abs.twimg.com", 103, true)][..],
+            &[("a.example", 2, true), ("b.example", 1, false)][..],
+        ] {
+            let note = page_refused(hosts).blocked_note().expect("a note");
+            assert!(!note.contains("  "), "double space in: {note}");
+            assert!(!note.contains('\n'), "an unwrapped line in: {note}");
+        }
+    }
+
+    #[test]
+    fn a_page_that_got_everything_it_asked_for_says_nothing_about_blocking() {
+        // The note is on every read of every page. One that appears when
+        // nothing was refused is a warning about nothing, on every page.
+        assert!(page_refused(&[]).blocked_note().is_none());
+    }
+
+    #[test]
+    fn only_the_sites_a_page_cannot_run_without_are_worth_adding() {
+        // The rule that decides what a teach run writes into somebody's task,
+        // so it is the one that decides how far their fence moves. A page asks
+        // a dozen strangers for a tracking pixel and works perfectly without
+        // any of them; a fence that widened itself for those would dissolve on
+        // contact with the ordinary web.
+        let page = page_refused(&[
+            ("tracker.example", 9, false),
+            ("abs.twimg.com", 103, true),
+            ("assets.example", 4, true),
+        ]);
+        assert_eq!(
+            worth_allowing(&page.blocked),
+            vec!["abs.twimg.com".to_string(), "assets.example".to_string()],
+            "scripts only, and the one the page leans on hardest first"
+        );
+    }
+
+    #[test]
+    fn a_sign_in_button_from_another_company_does_not_widen_the_fence() {
+        // Measured on x.com's login page: its own bundle came from one host in
+        // eleven files, and the "continue with Google" and "continue with
+        // Apple" buttons wanted one script each. A task allowed x.com must not
+        // come away allowed to reach somebody's Google account.
+        let page = page_refused(&[
+            ("abs.twimg.com", 11, true),
+            ("accounts.google.com", 1, true),
+            ("appleid.cdn-apple.com", 1, true),
+        ]);
+        assert_eq!(
+            worth_allowing(&page.blocked),
+            vec!["abs.twimg.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn a_page_that_only_lost_its_pictures_teaches_the_task_nothing() {
+        let page = page_refused(&[("images.example", 40, false)]);
+        assert!(worth_allowing(&page.blocked).is_empty());
+        // It is still worth saying out loud, because it is still why the page
+        // looks wrong.
+        assert!(page.blocked_note().is_some());
+    }
+
+    #[test]
+    fn the_same_refused_site_goes_in_the_timeline_once_and_not_again() {
+        // Every snapshot carries the whole tally, and a page is often read
+        // several times. The person wants the fact, not one line per read.
+        let mut seen = HashSet::new();
+        let page = page_refused(&[("abs.twimg.com", 103, true)]);
+        assert_eq!(unreported(&mut seen, &page).len(), 1);
+        assert!(unreported(&mut seen, &page).is_empty());
+
+        // A second site on the same page is still news.
+        let more = page_refused(&[("abs.twimg.com", 140, true), ("pbs.twimg.com", 4, false)]);
+        let fresh = unreported(&mut seen, &more);
+        assert_eq!(fresh.len(), 1);
+        assert_eq!(fresh[0].host, "pbs.twimg.com");
     }
 
     #[test]

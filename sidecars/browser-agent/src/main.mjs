@@ -123,6 +123,42 @@ function normaliseDomains(list) {
   return (list || []).map((d) => String(d).trim().toLowerCase()).filter(Boolean);
 }
 
+// Which hosts this page asked for files from and did not get them.
+//
+// A blocked subresource is silent by design: the request never happens, and a
+// site whose scripts live on a second domain draws its own "something went
+// wrong" instead of its content. So the page looks broken, the fence looks
+// innocent, and the agent retries something that can never load. Learned from
+// x.com, whose every script comes from abs.twimg.com: a task allowed x.com and
+// nothing else gets a shell that cannot start, and no line anywhere said why.
+const blockedHosts = new Map();
+
+// The two kinds of file whose absence stops a page working rather than merely
+// making it plainer. A missing image is a gap on the screen; a missing script
+// is a page that never starts. Only these are worth widening a task's list of
+// sites for, which is why the kind is remembered and not just the count.
+const RUNS_THE_PAGE = new Set(['script', 'stylesheet']);
+
+function noteBlocked(request) {
+  let host;
+  try {
+    host = new URL(request.url()).hostname.toLowerCase();
+  } catch {
+    return;
+  }
+  const before = blockedHosts.get(host);
+  const scripts = RUNS_THE_PAGE.has(request.resourceType());
+  blockedHosts.set(host, {
+    count: (before?.count || 0) + 1,
+    scripts: !!before?.scripts || scripts,
+  });
+  // One event per host per page. A page shell can ask a single CDN for a
+  // hundred files, and a hundred identical lines bury the one that matters.
+  if (!before) {
+    emit('blocked', { url: request.url(), host, reason: 'off_allowlist_resource' });
+  }
+}
+
 function domainAllowed(url) {
   // An empty list permits nothing, which is what the Rust layer does too. A
   // task that has not said where it may go has not been taught yet, and
@@ -243,6 +279,7 @@ function findBrowser() {
 const methods = {
   async 'session.open'({ profile_dir, headless = true, allowed_domains = [], strict_network = false }) {
     if (context) await methods['session.close']({ save_state: true });
+    blockedHosts.clear();
     allowedDomains = normaliseDomains(allowed_domains);
     strictNetwork = !!strict_network;
 
@@ -266,13 +303,18 @@ const methods = {
         return route.abort('blockedbyclient');
       }
       if (strictNetwork && !isMain && !domainAllowed(request.url())) {
+        noteBlocked(request);
         return route.abort('blockedbyclient');
       }
       return route.continue();
     });
 
     page.on('framenavigated', (f) => {
-      if (f === page.mainFrame()) emit('nav', { url: f.url() });
+      if (f !== page.mainFrame()) return;
+      // Each page is refused its own files. Carrying the last one's tally over
+      // would have a snapshot blame a host this page never asked for.
+      blockedHosts.clear();
+      emit('nav', { url: f.url() });
     });
     page.on('dialog', async (d) => {
       emit('dialog', { type: d.type(), message: d.message().slice(0, 300) });
@@ -287,6 +329,20 @@ const methods = {
     // the run log says what was actually driven rather than leaving it a
     // mystery.
     return { ok: true, url: page.url(), browser: browser.name };
+  },
+
+  // Widen the list this session enforces, without closing the page that is
+  // open on it.
+  //
+  // Only ever called after the same widening has been written to the task, so
+  // this is the fence being told what it already agreed to rather than a way
+  // round it. The tally is cleared with it: the hosts in it have just stopped
+  // being refused, and a snapshot still reporting them would have the agent
+  // announce a problem that was fixed a moment ago.
+  async 'session.allow'({ domains = [] }) {
+    allowedDomains = normaliseDomains(domains);
+    blockedHosts.clear();
+    return { ok: true, allowed: allowedDomains };
   },
 
   // The same ladder, without launching anything, so a health check can say
@@ -323,6 +379,10 @@ const methods = {
     const p = requirePage();
     secureRefs.clear();
     const snap = await p.evaluate(SNAPSHOT_FN);
+    // Travelling with the page rather than sitting in a log nobody reads is
+    // what turns "this site is broken" into "this site wanted a domain the
+    // task does not allow".
+    snap.blocked = [...blockedHosts].map(([host, seen]) => ({ host, ...seen }));
     return snap;
   },
 

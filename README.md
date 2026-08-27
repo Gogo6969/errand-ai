@@ -108,14 +108,20 @@ Requires a stable Rust toolchain and macOS.
 ```bash
 cargo test --workspace       # 307 tests, including a real keychain round-trip
 ./scripts/smoke.sh           # drives the real daemon through the real API
-cargo tauri build            # produces Errand-AI.app and a DMG
 ```
 
-The bundle carries the browser helper, so building it also needs Node 20 and the helper's own
-dependencies:
+Building the app bundle needs three more things first, in this order. It is the order that
+matters: the bundler copies the daemon in by target triple, so a bundle built before that file
+exists is a bundle with nothing inside it.
 
 ```bash
+npm --prefix frontend install
 npm --prefix sidecars/browser-agent install
+cargo install tauri-cli --version "^2" --locked
+cargo build --release -p errand-runner --bin errandd
+mkdir -p app/binaries
+cp target/release/errandd "app/binaries/errandd-$(rustc -vV | sed -n 's/host: //p')"
+cd app && cargo tauri build   # produces Errand-AI.app and a DMG
 ```
 
 Errand drives a Chrome-family browser you already have rather than downloading its own. It uses a
@@ -130,18 +136,27 @@ cargo run -p errand-runner -- --foreground
 Install it as a background agent that starts at login:
 
 ```bash
-./target/debug/errandd install "$(pwd)/target/debug/errandd"
+./scripts/dev-install.sh
 ```
+
+Never point the agent at `target/debug` yourself. cargo rewrites that file on
+every build, and macOS deadlocks a launchd-spawned process in dyld while it
+tries to validate a signature that changed underneath it: the process sits on
+its own binary for ever, alive but never reaching main, with no log and nothing
+listening. The script builds, copies to a stable path, signs it there, and
+points the agent at the copy.
 
 Diagnose anything that is not working:
 
 ```bash
-./target/debug/errandd doctor
+"$HOME/Library/Application Support/com.errandai.app/bin/errandd" doctor
 ```
 
 ## The API
 
-Loopback only, on `http://127.0.0.1:4477`. Bearer token, minted on first boot into your keychain.
+Loopback only, on `http://127.0.0.1:4477`. Bearer token, minted on first boot. A signed build keeps it in the keychain; a
+build from source keeps it in a file next to the database, so a rebuild does not
+ask for permission again.
 
 ```bash
 TOKEN=$(errandd token)

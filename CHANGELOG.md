@@ -8,6 +8,18 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **The app installs its own background service.** Everything Errand does happens in a daemon the
+  app has always carried inside itself and never started, so somebody who downloaded the app and
+  opened it got a window where every screen said the background service was not answering, and the
+  only instructions were to run a command that is not on anybody's PATH. None of the work in here
+  was reachable from the other side of that. It now installs the LaunchAgent on launch, from the
+  daemon beside its own executable, and refuses when macOS is running it from the temporary copy
+  it makes for an app opened straight from a download, because writing that path into a LaunchAgent
+  means the service never starts again after the next login, silently.
+- **A release.** Pushing a `v*` tag builds, signs, notarises and publishes a DMG, after the same
+  gates every other build passes. Signing needs five secrets that belong to a person; without them
+  the release still builds and publishes unsigned rather than failing, and says which step it
+  skipped. See `docs/releasing.md`.
 - **A task may spend money, once somebody says how much.** Buying was always possible in the sense
   that a browser can click a button that pays; there was simply no ceiling on it, because every
   limit in Errand was a ceiling on something a task does anyway. This one is a permission:
@@ -149,6 +161,13 @@ All notable changes to this project are documented here. The format follows
 
 ### Fixed
 
+- **A locally built bundle could ship a daemon older than its own database.** The bundler copies
+  `app/binaries/errandd-<triple>` into the app and nothing rebuilt it, so it was whatever was last
+  put there. Caught by tearing the service down and opening the app: it installed a nine-hour-old
+  daemon which died with "migration 8 was previously applied but is missing in the resolved
+  migrations", a sentence that reads like a corrupt database and is nothing of the kind. CI never
+  saw it, because CI stages that file fresh in the job above. Staging is part of the build now, and
+  refuses a binary older than the code.
 - **Reading or moving a message searched the whole mailbox.** Listing was taught to walk by index
   after an inbox of 191,000 messages failed with AppleScript error -1741, and the finder behind
   `read` and `file` was left doing `first message of inbox whose message id is ...`, which builds

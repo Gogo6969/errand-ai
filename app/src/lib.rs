@@ -267,6 +267,38 @@ async fn daemon_up(state: tauri::State<'_, Daemon>) -> Result<bool, String> {
         .unwrap_or(false))
 }
 
+/// Open a link from a run's answer in whatever app owns it.
+///
+/// A run that has read the post writes links to the messages it found, and
+/// `message:` is the scheme macOS gives to Mail. The webview cannot follow one
+/// itself: it is a page, and a page that navigated away from the app would take
+/// the app with it. So the page names a link and Rust hands it to macOS.
+///
+/// The scheme is checked here rather than trusted, because the text these come
+/// out of is written by a model that has been reading somebody's mail, and mail
+/// is written by strangers. Four schemes are enough for anything a run has to
+/// offer, and `file:` is deliberately not among them: a link that opens
+/// anything on this disk is a different proposition from one that opens a
+/// message or a web page.
+#[tauri::command]
+async fn open_link(app: tauri::AppHandle, url: String) -> Result<(), String> {
+    const ALLOWED: [&str; 4] = ["message:", "https:", "http:", "mailto:"];
+    let lower = url.trim().to_ascii_lowercase();
+    if !ALLOWED.iter().any(|s| lower.starts_with(s)) {
+        return Err(json_err(
+            "link_not_allowed",
+            "Errand only opens web pages, mail messages and message links from an answer.",
+        ));
+    }
+    use tauri_plugin_shell::ShellExt;
+    app.shell().open(url.trim(), None).map_err(|e| {
+        json_err(
+            "link_failed",
+            &format!("That link could not be opened: {e}"),
+        )
+    })
+}
+
 /// One run artifact, such as a screenshot, handed to the page as a data URL.
 ///
 /// Artifacts are bytes, so they cannot ride the ordinary proxy, which speaks
@@ -372,7 +404,7 @@ pub fn run() {
         .plugin(tauri_plugin_shell::init())
         .manage(Daemon::new())
         .invoke_handler(tauri::generate_handler![
-            api, daemon_up, follow_run, artifact
+            api, daemon_up, follow_run, artifact, open_link
         ])
         .setup(|app| {
             // Shown only once the page is ready, so nobody sees a white square.

@@ -5,6 +5,7 @@
   import { page } from "$app/state";
   import { api, channelName, followRun, statusLabel, when, ApiError, type AiSetup, type ListedProvider, type Task, type Run, type TaskRecipient, type Recipient, type MailGrant } from "$lib/api";
   import Hint from "$lib/components/Hint.svelte";
+  import Answered from "$lib/components/Answered.svelte";
   import { headlineFor, hintFor, ranHeadline } from "$lib/taskState";
   import ScheduleEditor from "$lib/components/ScheduleEditor.svelte";
   import SitesEditor from "$lib/components/SitesEditor.svelte";
@@ -528,7 +529,7 @@
          found behind the failure makes somebody do that work again. -->
     <div class="card ended" class:bad={finishedRun.status === "failed"}>
       {#if finishedRun.answer}
-        <div class="answer">{finishedRun.answer}</div>
+        <Answered text={finishedRun.answer} />
       {/if}
       <div class="row spread" style="margin-top:{finishedRun.answer ? '12px' : '0'}">
         <div>
@@ -1082,14 +1083,6 @@
      and often quotes a web page, and putting that through {@html} inside the
      app's own webview buys formatting with a class of bug nobody wants. The
      playbook is shown the same way. */
-  .answer {
-    white-space: pre-wrap;
-    color: var(--ink);
-    font-size: 14px;
-    line-height: 1.55;
-    max-width: 72ch;
-  }
-
   /* This page had no styles of its own; app.css covers the rest. */
   .warnbox {
     background: var(--warn-bg); color: var(--warn);

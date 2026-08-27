@@ -144,6 +144,21 @@ export function channelName(c: { channel: string; display_name?: string }): stri
   return c.display_name || c.channel.replace(/_/g, " ");
 }
 
+/**
+ * Open a link out of a run's answer in whatever app owns it.
+ *
+ * Rust does the opening and checks the scheme first. The webview cannot follow
+ * a `message:` link itself, and a page that navigated away from the app would
+ * take the app with it.
+ */
+export async function openLink(url: string): Promise<void> {
+  try {
+    await invoke("open_link", { url });
+  } catch (e) {
+    throw asApiError(e);
+  }
+}
+
 /** An error the daemon reported, with its plain-language detail. */
 export class ApiError extends Error {
   constructor(readonly code: string, message: string) {

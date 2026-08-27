@@ -295,6 +295,13 @@ export const hints = {
   "cred.delete": {
     short: "Forget this login. Tasks that use it will stop being able to sign in.",
   },
+  "answer.link": {
+    short: "Open this where it belongs: a message in Mail, a page in your browser.",
+    long:
+      "The link came out of what the run found, so it goes to whatever the run was reading. " +
+      "Errand opens web pages, mail messages and addresses, and nothing else: a link to a file " +
+      "on this Mac is not opened from here.",
+  },
   "cred.reveal": {
     short: "Show what you are typing.",
     long:

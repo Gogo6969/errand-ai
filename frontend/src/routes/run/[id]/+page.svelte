@@ -5,6 +5,7 @@
   import { goto } from "$app/navigation";
   import { page } from "$app/state";
   import { api, artifactUrl, followRun, statusLabel, ApiError } from "$lib/api";
+  import Answered from "$lib/components/Answered.svelte";
   import Hint from "$lib/components/Hint.svelte";
 
   const id = page.params.id!;
@@ -112,7 +113,7 @@
   {#if run.answer}
     <div class="card">
       <Hint id="run.answer"><strong>The answer</strong></Hint>
-      <div class="answer">{run.answer}</div>
+      <Answered text={run.answer} />
       {#if run.answer_copies?.length}
         <div class="row" style="margin-top:12px; flex-wrap:wrap; gap:8px">
           <span class="muted">Also put here, because the task asked for it:</span>
@@ -198,18 +199,6 @@
   /* The thing to do, set apart from the thing that went wrong: a person
      scanning a failure is looking for this line. */
   .fix { margin-top: 8px; font-weight: 500; }
-
-  /* Set to be read. pre-wrap rather than rendered Markdown: this text is
-     written by a model and often quotes a page, and {@html} over that inside
-     the app's own webview is a bad trade for a few bold words. */
-  .answer {
-    white-space: pre-wrap;
-    color: var(--ink);
-    font-size: 14px;
-    line-height: 1.55;
-    max-width: 72ch;
-    margin-top: 6px;
-  }
 
   .shot {
     display: block; max-width: 100%; margin-top: 8px;

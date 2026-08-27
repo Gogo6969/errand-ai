@@ -1849,15 +1849,31 @@ async fn list_mail(state: &AppState, run_id: &str, args: &Value) -> Value {
 
     let red = state.redactor(run_id);
     let kind = if unread_only { "unread " } else { "" };
+    // How far the walk got, when it did not get all the way.
+    //
+    // A search for unread mail gives up on its own clock where Mail is slow,
+    // and the difference between "there are two unread" and "there are two in
+    // the thirty I could look at" is the difference between an answer and a
+    // guess. Said to the agent because it is the one that writes the summary.
+    let short = crate::mail::stopped_short(&found, limit, unread_only);
+    let far_as_it_got = match &short {
+        Some(said) => format!(" {said}"),
+        None => String::new(),
+    };
+
     let _ = journal(
         state,
         run_id,
         "read",
         &format!(
-            "Looked through {} {kind}message{} in {}",
+            "Looked through {} {kind}message{} in {}{}",
             found.messages.len(),
             if found.messages.len() == 1 { "" } else { "s" },
-            where_from(mailbox)
+            where_from(mailbox),
+            match &short {
+                Some(_) => format!(", stopping at the {} most recent", found.checked),
+                None => String::new(),
+            }
         ),
         true,
     )
@@ -1866,7 +1882,7 @@ async fn list_mail(state: &AppState, run_id: &str, args: &Value) -> Value {
     if found.messages.is_empty() {
         return text_result(
             format!(
-                "There are no {kind}messages in {}. {}",
+                "There are no {kind}messages in {}.{far_as_it_got} {}",
                 where_from(mailbox),
                 unaddressable_note(found.unaddressable)
             )
@@ -1877,7 +1893,7 @@ async fn list_mail(state: &AppState, run_id: &str, args: &Value) -> Value {
 
     let mut out = format!(
         "{} {kind}message{} in {}, in the order Mail lists them, which is normally newest \
-         first:\n\n",
+         first:{far_as_it_got}\n\n",
         found.messages.len(),
         if found.messages.len() == 1 { "" } else { "s" },
         where_from(mailbox)

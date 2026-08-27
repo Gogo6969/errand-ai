@@ -37,6 +37,29 @@ const TIMEOUT_S: u64 = 45;
 /// unread post from last year is not what somebody means by "my inbox".
 const SCAN_FOR_UNREAD: usize = 200;
 
+/// How many messages one question to Mail covers.
+///
+/// The walk stops as soon as it has enough, so the size of this decides how
+/// much work is done past the point where the answer was already known. Small
+/// enough that a mailbox where every message costs Mail real time still gets
+/// through the first chunk quickly; large enough that a quiet inbox is one
+/// question rather than eight.
+const UNREAD_CHUNK: usize = 25;
+
+/// How long the walk may take before it settles for what it has.
+///
+/// Comfortably inside `TIMEOUT_S`, and that is the point: a walk that stops
+/// itself returns what it found and says how far it got, where one that runs
+/// into the outer timeout returns nothing at all and used to blame the
+/// permission for it. Measured against a real inbox of six figures, where two
+/// hundred messages could not be looked at in forty-five seconds however they
+/// were asked for.
+const WALK_DEADLINE_S: u64 = 25;
+
+/// The walk must give up before Errand does, or it never gets to say how far
+/// it reached and the whole exercise is back to a timeout with nothing in it.
+const _: () = assert!(WALK_DEADLINE_S < TIMEOUT_S);
+
 /// The most messages one listing may hand back.
 ///
 /// A ceiling rather than a preference: every row crosses to whichever model is
@@ -138,6 +161,15 @@ pub struct Message {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Listing {
     pub messages: Vec<Summary>,
+    /// How many of the most recent messages the walk actually got to look at.
+    ///
+    /// Counted for the same reason as `unaddressable` below. A walk for unread
+    /// mail gives up on its own clock when Mail is slow, and a listing that
+    /// came back having examined thirty of the two hundred it meant to is not
+    /// the same answer as one that examined all two hundred. Saying "here is
+    /// your unread post" off the back of the first would be a lie that reads
+    /// exactly like the truth.
+    pub checked: usize,
     /// Messages Mail handed over with no message id.
     ///
     /// Counted rather than dropped in silence: an id is the only way a later
@@ -268,20 +300,53 @@ async fn osascript(script: &str) -> Result<String, MailError> {
     let out = match tokio::time::timeout(std::time::Duration::from_secs(TIMEOUT_S), call).await {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => return Err(MailError::Machine(format!("macOS could not be asked: {e}"))),
-        // Not a hang to wait out: this is the prompt nobody can see, and it is
-        // the same problem as an outright refusal, so it is said in the same
-        // words and recognised by the same check.
-        Err(_) => {
-            return Err(MailError::Machine(
-                crate::channels::apple::no_answer(MAIL).to_string(),
-            ))
-        }
+        Err(_) => return Err(why_it_never_answered().await),
     };
 
     if out.status.success() {
         return Ok(String::from_utf8_lossy(&out.stdout).to_string());
     }
     Err(from_stderr(&String::from_utf8_lossy(&out.stderr)))
+}
+
+/// A question that never came back, and which of the two reasons it was.
+///
+/// A timeout used to be reported as the permission prompt nobody can see. That
+/// is one of the two things it means, and assuming it is always that one has a
+/// cost this module already knew about and paid again: a listing that was
+/// simply too big for the mailbox came back as a permission wall, so somebody
+/// was sent to press Enable and then to System Settings, for a permission that
+/// had been working all afternoon. The wrong half of that answer is worse than
+/// no answer, because it is specific and it is actionable and it is a dead end.
+///
+/// So the cheap question is asked before blaming anybody: may Errand drive Mail
+/// at all? It counts mailboxes rather than messages, which is why it answers in
+/// a moment on a mailbox where a listing cannot finish. A Mail that answers
+/// that has plainly given permission, and the timeout was about size.
+async fn why_it_never_answered() -> MailError {
+    use crate::channels::apple::{app_consent, Automation};
+    if app_consent(Automation::MailReading).await.is_ok() {
+        return MailError::Machine(too_big_to_finish());
+    }
+    // Nothing came back from either question, which is the prompt waiting where
+    // nobody can see it. Said in the words every other path uses, so the checks
+    // that recognise a permission wall recognise this one too.
+    MailError::Machine(crate::channels::apple::no_answer(MAIL).to_string())
+}
+
+/// What a timeout means when Mail is plainly willing to be driven.
+///
+/// Kept apart from the question that decides which of the two it was, so the
+/// words can be held to in a test: this sentence must never be mistaken for a
+/// permission wall by the checks that look for one.
+fn too_big_to_finish() -> String {
+    format!(
+        "Mail did not finish answering within {TIMEOUT_S} seconds. This is not a permission \
+         problem: Errand asked Mail a smaller question straight afterwards and it answered at \
+         once. The mailbox is large enough that what was asked for cannot be done in the time. \
+         Ask for the most recent messages rather than searching the whole mailbox, or name one \
+         smaller mailbox to look in."
+    )
 }
 
 /// Turn what osascript printed into something a person can act on.
@@ -401,6 +466,121 @@ end clip
 /// The order is whatever Mail hands back for that mailbox, which is its own
 /// sort order and normally newest first. Errand does not re-sort it, and does
 /// not claim to.
+/// What to say when the walk stopped before it had looked everywhere.
+///
+/// None when there is nothing to explain: it found everything it was asked for,
+/// or it got through the whole window. Otherwise a sentence naming how far it
+/// reached, because "your unread post" and "the unread post in the thirty I
+/// could look at" are different claims and only one of them is true.
+pub fn stopped_short(found: &Listing, limit: usize, unread_only: bool) -> Option<String> {
+    if !unread_only || found.messages.len() >= limit || found.checked >= SCAN_FOR_UNREAD {
+        return None;
+    }
+    Some(format!(
+        "Mail was slow enough that only the {} most recent messages could be looked at, out of \
+         the {SCAN_FOR_UNREAD} this search covers, so there may be older unread post it did not \
+         reach. Say so rather than calling this the whole of it.",
+        found.checked
+    ))
+}
+
+/// The script one listing runs, built where a test can read it.
+///
+/// Split out for the reason `no_script_ever_asks_mail_to_search` gives: nothing
+/// in the suite can reach a real mailbox, so what this module can be held to is
+/// the shape of what it asks Mail, and that is only checkable if it is a string
+/// somebody can get hold of.
+fn listing_script(box_line: &str, scan: usize, limit: usize, unread_only: bool) -> String {
+    format!(
+        r#"{handlers}
+{box_line}
+if theBox is missing value then return "!no-mailbox"
+tell application "Mail"
+	set total to (count of messages of theBox)
+	set howMany to {scan}
+	if howMany > total then set howMany to total
+	set out to ""
+	set picks to {{}}
+	set checked to 0
+	if howMany > 0 then
+{picks}
+	end if
+	repeat with i in picks
+		set i to i as integer
+		set m to missing value
+		try
+			set m to message i of theBox
+		end try
+		if m is missing value then
+			set out to out & "!no-id" & linefeed
+		else
+			set theId to ""
+			try
+				set theId to my flat(message id of m)
+			end try
+			if theId is "" then
+				set out to out & "!no-id" & linefeed
+			else
+			set snd to ""
+			set subj to ""
+			set dt to ""
+			set pv to ""
+			try
+				set snd to my flat(sender of m)
+			end try
+			try
+				set subj to my flat(subject of m)
+			end try
+			try
+				set dt to my flat((date received of m) as string)
+			end try
+			try
+				set pv to my flat(my clip(content of m, {PREVIEW_CHARS}))
+			end try
+			set out to out & i & tab & theId & tab & snd & tab & subj & tab & dt & tab & pv & linefeed
+			end if
+		end if
+	end repeat
+	return out & "!checked" & tab & checked & linefeed
+end tell
+"#,
+        handlers = HANDLERS,
+        scan = scan,
+        picks = if unread_only {
+            // A chunk at a time, and it gives up on its own clock rather than
+            // on Errand's. One question covers a chunk's read status; only the
+            // few that come back unread are then asked about themselves.
+            format!(
+                "\t\tset t0 to current date\n\
+                 \t\trepeat with startAt from 1 to howMany by {UNREAD_CHUNK}\n\
+                 \t\t\tset endAt to startAt + {UNREAD_CHUNK} - 1\n\
+                 \t\t\tif endAt > howMany then set endAt to howMany\n\
+                 \t\t\tset flags to read status of messages startAt thru endAt of theBox\n\
+                 \t\t\trepeat with j from 1 to (count of flags)\n\
+                 \t\t\t\tif item j of flags is false then\n\
+                 \t\t\t\t\tset end of picks to (startAt + j - 1)\n\
+                 \t\t\t\t\tif (count of picks) is {limit} then exit repeat\n\
+                 \t\t\t\tend if\n\
+                 \t\t\tend repeat\n\
+                 \t\t\tset checked to endAt\n\
+                 \t\t\tif (count of picks) is {limit} then exit repeat\n\
+                 \t\t\tif ((current date) - t0) > {WALK_DEADLINE_S} then exit repeat\n\
+                 \t\tend repeat"
+            )
+        } else {
+            // Nothing to select on, so nothing is asked about read status at
+            // all: the cheap path stays the cheap path.
+            format!(
+                "\t\trepeat with i from 1 to howMany\n\
+                 \t\t\tset end of picks to i\n\
+                 \t\t\tset checked to i\n\
+                 \t\t\tif (count of picks) is {limit} then exit repeat\n\
+                 \t\tend repeat"
+            )
+        },
+    )
+}
+
 pub async fn list(
     mailbox: Option<&str>,
     limit: usize,
@@ -433,69 +613,19 @@ pub async fn list(
     // walking recent messages and stopping early. That means unread mail older
     // than the window is not found, which is the right trade for a summary of
     // what has just arrived: it is bounded and it always answers.
+    //
+    // Bounded was not enough on its own. Walking asked Mail for one message's
+    // read status at a time, and two hundred of those is two hundred Apple
+    // Events: on the mailbox above it did not finish inside the timeout, so the
+    // first task ever to ask for unread mail failed on the first attempt and
+    // every attempt after it. The whole range is asked for in one event now.
+    // A range is not a `whose` clause and does not make Mail build the
+    // collection; it is the same indexing, asked once instead of two hundred
+    // times, and only the few messages that turn out to be unread are then
+    // asked about themselves.
     let scan = if unread_only { SCAN_FOR_UNREAD } else { limit };
 
-    let script = format!(
-        r#"{handlers}
-{box_line}
-if theBox is missing value then return "!no-mailbox"
-tell application "Mail"
-	set total to (count of messages of theBox)
-	set howMany to {scan}
-	if howMany > total then set howMany to total
-	set out to ""
-	set found to 0
-	repeat with i from 1 to howMany
-		if found is {limit} then exit repeat
-		set m to missing value
-		try
-			set m to message i of theBox
-		end try
-		if m is missing value then
-			set out to out & "!no-id" & linefeed
-		else
-			if {unread_test} then
-			set found to found + 1
-		set theId to ""
-		try
-			set theId to my flat(message id of m)
-		end try
-		if theId is "" then
-			set out to out & "!no-id" & linefeed
-		else
-			set snd to ""
-			set subj to ""
-			set dt to ""
-			set pv to ""
-			try
-				set snd to my flat(sender of m)
-			end try
-			try
-				set subj to my flat(subject of m)
-			end try
-			try
-				set dt to my flat((date received of m) as string)
-			end try
-			try
-				set pv to my flat(my clip(content of m, {PREVIEW_CHARS}))
-			end try
-			set out to out & i & tab & theId & tab & snd & tab & subj & tab & dt & tab & pv & linefeed
-		end if
-			end if
-		end if
-	end repeat
-	return out
-end tell
-"#,
-        handlers = HANDLERS,
-        scan = scan,
-        limit = limit,
-        unread_test = if unread_only {
-            "(read status of m) is false"
-        } else {
-            "true"
-        },
-    );
+    let script = listing_script(&box_line, scan, limit, unread_only);
 
     let reply = osascript(&script).await?;
     if reply.trim() == "!no-mailbox" {
@@ -506,12 +636,17 @@ end tell
 
     let mut messages = vec![];
     let mut unaddressable = 0;
+    let mut checked = 0usize;
     for line in reply.lines() {
         if line.trim().is_empty() {
             continue;
         }
         if line.trim() == "!no-id" {
             unaddressable += 1;
+            continue;
+        }
+        if let Some(n) = line.trim().strip_prefix("!checked\t") {
+            checked = n.trim().parse().unwrap_or(0);
             continue;
         }
         let mut f = line.split('\t');
@@ -535,6 +670,7 @@ end tell
     }
     Ok(Listing {
         messages,
+        checked,
         unaddressable,
     })
 }
@@ -751,6 +887,7 @@ fn rehearsal_listing(mailbox: Option<&str>, limit: usize, unread_only: bool) -> 
     if !known {
         return Listing {
             messages: vec![],
+            checked: 0,
             unaddressable: 0,
         };
     }
@@ -760,6 +897,8 @@ fn rehearsal_listing(mailbox: Option<&str>, limit: usize, unread_only: bool) -> 
     }
     messages.truncate(limit);
     Listing {
+        // A rehearsal invents what it hands back, so it looked at all of it.
+        checked: messages.len(),
         messages,
         unaddressable: 0,
     }
@@ -821,6 +960,98 @@ mod tests {
             assert!(!line.contains("whose"), "bind_line searches: {line}");
             assert!(line.contains(&RESCAN.to_string()), "unbounded: {line}");
         }
+    }
+
+    #[test]
+    fn the_unread_walk_asks_about_a_chunk_at_a_time_and_never_one_message() {
+        // What broke the first task that ever asked for unread mail: one Apple
+        // Event per message, two hundred of them, into a mailbox with six
+        // figures in it. It did not finish in forty-five seconds. Asking for
+        // the whole window in one event did not finish either, which is why
+        // this is a chunk at a time with a clock on it.
+        let script = listing_script("set theBox to my findBox(\"\")", 200, 5, true);
+        assert!(
+            script.contains("read status of messages startAt thru endAt of theBox"),
+            "the walk is back to one message at a time: {script}"
+        );
+        assert!(
+            !script.contains("read status of m)"),
+            "a per-message read status is back in the walk: {script}"
+        );
+        // The same rule as everywhere else in this module.
+        assert!(!script.contains("whose"), "the listing searches: {script}");
+    }
+
+    #[test]
+    fn a_listing_that_does_not_want_unread_asks_mail_nothing_about_read_status() {
+        // Five most recent is the cheap path and must stay cheap: no bulk
+        // fetch, no read status, just the five.
+        let script = listing_script("set theBox to my findBox(\"\")", 5, 5, false);
+        assert!(!script.contains("read status"), "{script}");
+    }
+
+    #[test]
+    fn the_unread_walk_gives_up_on_its_own_clock_rather_than_on_errands() {
+        // The whole point of the rewrite. A walk that runs into the outer
+        // timeout returns nothing and used to blame the permission for it; one
+        // that stops itself returns what it found and says how far it reached.
+        let script = listing_script("set theBox to my findBox(\"\")", 200, 5, true);
+        assert!(script.contains("set t0 to current date"), "{script}");
+        assert!(
+            script.contains(&format!("> {WALK_DEADLINE_S} then exit repeat")),
+            "the walk has no deadline of its own: {script}"
+        );
+        assert!(
+            script.contains(&format!("by {UNREAD_CHUNK}")),
+            "the walk asks for the whole window in one go again: {script}"
+        );
+        assert!(script.contains("!checked"), "it never says how far it got");
+    }
+
+    #[test]
+    fn a_walk_that_was_cut_short_says_so_and_one_that_was_not_says_nothing() {
+        let two = |checked: usize| Listing {
+            messages: vec![rehearsal_messages()[0].clone()],
+            checked,
+            unaddressable: 0,
+        };
+        // Stopped at thirty of two hundred, with fewer than asked for: worth
+        // saying, because the answer is about thirty messages and not two
+        // hundred.
+        let said = stopped_short(&two(30), 5, true).expect("a short walk says so");
+        assert!(said.contains("30"), "{said}");
+        assert!(
+            said.contains("Say so"),
+            "the agent is told to pass it on: {said}"
+        );
+
+        // Got through the whole window: nothing to explain.
+        assert_eq!(stopped_short(&two(SCAN_FOR_UNREAD), 5, true), None);
+        // Found everything it was asked for: the window is beside the point.
+        assert_eq!(stopped_short(&two(30), 1, true), None);
+        // And a listing that never wanted unread has no window at all.
+        assert_eq!(stopped_short(&two(5), 5, false), None);
+    }
+
+    #[test]
+    fn a_mailbox_too_big_to_finish_is_not_reported_as_a_permission_problem() {
+        // The half of this that cost a real afternoon. A timeout was said in
+        // the words of a refused permission, so the person was sent to press
+        // Enable and then into System Settings, for a permission that had been
+        // working all day.
+        let said = too_big_to_finish();
+        assert!(
+            !crate::channels::apple::is_permission_block(&said),
+            "a slow mailbox still reads as a permission wall: {said}"
+        );
+        assert!(said.contains("not a permission problem"), "{said}");
+        assert!(said.contains("most recent"), "it says what to do: {said}");
+
+        // And the other half still is one, so everything that reacts to a wall
+        // goes on reacting to it.
+        assert!(crate::channels::apple::is_permission_block(
+            &crate::channels::apple::no_answer(MAIL).to_string()
+        ));
     }
 
     #[test]

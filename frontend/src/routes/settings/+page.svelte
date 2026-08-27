@@ -23,6 +23,10 @@
 
   // Adding a login.
   let label = $state(""), domain = $state(""), username = $state(""), secret = $state("");
+  // Off by default. A password field that starts visible is one somebody types
+  // into with a colleague behind them; the toggle is there for the other case,
+  // where a login is refused twice and nobody can see why.
+  let showSecret = $state(false);
 
   // Telling Telegram who to talk to. Write-only: these go to the keychain and
   // Errand can never show them back.
@@ -225,6 +229,47 @@
   async function addCred() {
     await act(() => api.addCredential(label.trim(), domain.trim(), username.trim(), secret));
     label = ""; domain = ""; username = ""; secret = "";
+    showSecret = false;
+  }
+
+  /**
+   * Changing a saved login.
+   *
+   * The password box starts empty and stays empty unless something is typed in
+   * it, because there is nothing to prefill it with: the stored password cannot
+   * be read back, by this window or by anything else. Left empty it is left
+   * alone, so somebody correcting a typo in a username does not have to know
+   * the password to do it.
+   */
+  let editing = $state<string | null>(null);
+  let eLabel = $state("");
+  let eUsername = $state("");
+  let eSecret = $state("");
+  let showESecret = $state(false);
+
+  function startEdit(c: { id: string; label: string; username?: string | null }) {
+    editing = c.id;
+    eLabel = c.label;
+    eUsername = c.username ?? "";
+    eSecret = "";
+    showESecret = false;
+  }
+
+  function stopEdit() {
+    editing = null;
+    eSecret = "";
+    showESecret = false;
+  }
+
+  async function saveCred(id: string) {
+    await act(() =>
+      api.updateCredential(id, {
+        label: eLabel.trim(),
+        username: eUsername.trim(),
+        ...(eSecret ? { secret: eSecret } : {}),
+      }),
+    );
+    stopEdit();
   }
 
   const cls = (s: string) => (s === "ok" ? "ok" : s === "not_configured" ? "" : s === "needs_user" ? "warn" : "bad");
@@ -473,18 +518,81 @@
 
 <h2>Logins</h2>
 <Hint id="cred.what"><span class="muted">Stored in your macOS keychain, never in Errand's own files.</span></Hint>
+<!-- One eye, drawn twice: on the field a new password is typed into and on the
+     field one is replaced in. It shows what is being typed now, and never what
+     was typed before, which is the whole distinction this screen rests on. -->
+{#snippet eye(shown: boolean)}
+  <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true"
+    fill="none" stroke="currentColor" stroke-width="1.7"
+    stroke-linecap="round" stroke-linejoin="round">
+    <path d="M2 12s3.6-6.5 10-6.5S22 12 22 12s-3.6 6.5-10 6.5S2 12 2 12z" />
+    <circle cx="12" cy="12" r="2.8" />
+    {#if shown}<path d="M4 20 20 4" />{/if}
+  </svg>
+{/snippet}
+
 {#each creds as c}
   <div class="card">
-    <div class="row spread">
-      <div>
-        <strong>{c.label}</strong>
-        <Hint id="cred.domain"><span class="muted"> · only on {c.domain}</span></Hint>
-        <div class="muted" style="margin-top:4px">used {c.use_count} time(s)</div>
+    {#if editing === c.id}
+      <strong>Change this login</strong>
+      <label for={`el-${c.id}`}>What is it for?</label>
+      <input id={`el-${c.id}`} bind:value={eLabel} />
+      <label for={`eu-${c.id}`}>Username</label>
+      <input id={`eu-${c.id}`} bind:value={eUsername} />
+      <label for={`es-${c.id}`}>New password</label>
+      <div class="secretrow">
+        <input
+          id={`es-${c.id}`}
+          type={showESecret ? "text" : "password"}
+          bind:value={eSecret}
+          placeholder="Leave empty to keep the saved one"
+        />
+        <Hint id="cred.reveal">
+          <button
+            type="button"
+            class="reveal"
+            aria-pressed={showESecret}
+            aria-label={showESecret ? "Hide the password" : "Show the password"}
+            onclick={() => (showESecret = !showESecret)}
+          >
+            {@render eye(showESecret)}
+          </button>
+        </Hint>
       </div>
-      <Hint id="cred.delete">
-        <button disabled={busy} onclick={() => act(() => api.deleteCredential(c.id))}>Forget</button>
-      </Hint>
-    </div>
+      <p class="muted" style="margin-top:8px">
+        The saved password cannot be shown here, or anywhere else: it is in your keychain and
+        Errand can only type it into {c.domain}. Typing a new one replaces it. If you have
+        forgotten it, change it at the site and then put the new one here.
+      </p>
+      <div class="row" style="margin-top:10px; gap:6px">
+        <Hint id="cred.save_change">
+          <button class="primary" disabled={busy || !eLabel.trim()} onclick={() => saveCred(c.id)}>
+            Save
+          </button>
+        </Hint>
+        <Hint id="cred.cancel_change">
+          <button disabled={busy} onclick={stopEdit}>Never mind</button>
+        </Hint>
+      </div>
+    {:else}
+      <div class="row spread">
+        <div>
+          <strong>{c.label}</strong>
+          <Hint id="cred.domain"><span class="muted"> · only on {c.domain}</span></Hint>
+          <div class="muted" style="margin-top:4px">
+            {c.username ? `${c.username} · ` : ""}used {c.use_count} time(s)
+          </div>
+        </div>
+        <div class="row" style="gap:6px">
+          <Hint id="cred.change">
+            <button disabled={busy} onclick={() => startEdit(c)}>Change</button>
+          </Hint>
+          <Hint id="cred.delete">
+            <button disabled={busy} onclick={() => act(() => api.deleteCredential(c.id))}>Forget</button>
+          </Hint>
+        </div>
+      </div>
+    {/if}
   </div>
 {/each}
 
@@ -497,7 +605,20 @@
   <label for="u">Username</label>
   <input id="u" bind:value={username} />
   <label for="s">Password</label>
-  <input id="s" type="password" bind:value={secret} />
+  <div class="secretrow">
+    <input id="s" type={showSecret ? "text" : "password"} bind:value={secret} />
+    <Hint id="cred.reveal">
+      <button
+        type="button"
+        class="reveal"
+        aria-pressed={showSecret}
+        aria-label={showSecret ? "Hide the password" : "Show the password"}
+        onclick={() => (showSecret = !showSecret)}
+      >
+        {@render eye(showSecret)}
+      </button>
+    </Hint>
+  </div>
   <p class="muted" style="margin-top:8px">
     This goes straight to your keychain. Errand can use it; it cannot show it back to you, and it
     will never be typed into any site but the one above.
@@ -515,6 +636,23 @@
   /* The page had no styles of its own until now; the shared sheet in app.css
      covers everything else. These are only for the blocks added here. */
   .form { display: grid; gap: 4px; margin-top: 12px; max-width: 420px; }
+
+  /* The password field and its eye, on one line, with the eye outside the box
+     rather than floating inside it: inside, it sits on top of the text it is
+     there to reveal. */
+  .secretrow { display: flex; align-items: center; gap: 6px; }
+  .secretrow input { flex: 1; min-width: 0; }
+  .reveal {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    width: 32px;
+    height: 32px;
+    padding: 0;
+    flex: none;
+    color: var(--ink-soft);
+  }
+  .reveal:hover, .reveal[aria-pressed="true"] { color: var(--ink); }
   /* The answer to the button directly above it, tinted so it cannot be mistaken
      for the description of the channel. */
   .result {

@@ -1062,6 +1062,45 @@ pub async fn create_credential_meta(
     Ok(id)
 }
 
+/// Change what is written on a saved login, never the secret behind it.
+///
+/// The secret lives in the keychain under a name derived from the id, so it is
+/// replaced by writing over that item rather than through here. Keeping the two
+/// apart is deliberate: this function cannot read a secret, cannot leak one, and
+/// cannot be talked into either by a caller that passes the wrong argument.
+///
+/// Returns the row as it now stands, or None when there is no such login.
+pub async fn update_credential_meta(
+    pool: &Pool,
+    id: &str,
+    label: Option<&str>,
+    username: Option<&str>,
+) -> Result<Option<crate::models::CredentialMeta>> {
+    let known = list_credentials(pool).await?;
+    if !known.iter().any(|c| c.id == id) {
+        return Ok(None);
+    }
+    // COALESCE, so a caller changing the username alone does not blank a label
+    // it never mentioned. The domain is not here on purpose: a credential is
+    // bound to one site, and moving that binding is how a login registered for
+    // one site ends up typed into another. Delete it and save it again.
+    sqlx::query(
+        "UPDATE credentials
+            SET label    = COALESCE(?, label),
+                username = COALESCE(?, username)
+          WHERE id = ?",
+    )
+    .bind(label)
+    .bind(username)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    Ok(list_credentials(pool)
+        .await?
+        .into_iter()
+        .find(|c| c.id == id))
+}
+
 pub async fn delete_credential_meta(pool: &Pool, id: &str) -> Result<Option<(String, String)>> {
     let row =
         sqlx::query("SELECT keychain_service, keychain_account FROM credentials WHERE id = ?")

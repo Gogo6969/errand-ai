@@ -295,6 +295,25 @@ export const hints = {
   "cred.delete": {
     short: "Forget this login. Tasks that use it will stop being able to sign in.",
   },
+  "cred.reveal": {
+    short: "Show what you are typing.",
+    long:
+      "Only what is in the box right now, so you can check a password before saving it. A " +
+      "password already saved is never shown here: it is in your keychain, and nothing in " +
+      "Errand can read it back out.",
+  },
+  "cred.change": {
+    short: "Rename this login, correct the username, or replace the password.",
+    long:
+      "The site it is tied to cannot be changed, because that binding is what stops it being " +
+      "typed into a convincing fake. A login for a different site is a new one.",
+  },
+  "cred.save_change": {
+    short: "Save the change. An empty password box leaves the saved password alone.",
+  },
+  "cred.cancel_change": {
+    short: "Leave this login as it was. Nothing typed here is saved.",
+  },
 
   // ------------------------------------------------------------- channels --
   "channel.telegram": {

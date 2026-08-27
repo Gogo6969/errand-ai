@@ -177,7 +177,7 @@ work.
 
 | | |
 |---|---|
-| `GET`/`POST /v1/credentials`, `DELETE /v1/credentials/{id}` | Logins. Write-only: the secret never comes back. |
+| `GET`/`POST /v1/credentials`, `PATCH`/`DELETE /v1/credentials/{id}` | Logins. Write-only: the secret never comes back. `PATCH` takes `label`, `username` and `secret`, each optional; a `secret` replaces the stored one and anything left out is left alone. The `domain` is not editable, because that binding is what keeps a login off a lookalike site. |
 | `GET /v1/channels` | How each way of reaching you is doing. |
 | `POST /v1/channels/{channel}/config` | `{secrets, settings}`. Secrets go to the keychain. |
 | `POST /v1/channels/{channel}/test` · `/enable` | Send yourself one; ask macOS for permission. |

@@ -55,7 +55,10 @@ pub fn router(state: AppState) -> Router {
             "/v1/credentials",
             get(list_credentials).post(create_credential),
         )
-        .route("/v1/credentials/{id}", delete(delete_credential))
+        .route(
+            "/v1/credentials/{id}",
+            delete(delete_credential).patch(update_credential),
+        )
         .route(
             "/v1/tasks/{id}/credentials",
             get(list_task_credentials).post(grant_credential),
@@ -2951,6 +2954,85 @@ async fn create_credential(
     })))
 }
 
+#[derive(Deserialize)]
+struct UpdateCredential {
+    label: Option<String>,
+    username: Option<String>,
+    /// Write-only, like the one on the way in. Absent means leave the stored
+    /// secret alone; present replaces it. There is no way to ask for it back.
+    secret: Option<String>,
+}
+
+/// Change a saved login: what it is called, who it signs in as, and the secret.
+///
+/// Replacing rather than editing, because there is nothing here to edit from: a
+/// stored secret cannot be read back out of this API by anybody, which is the
+/// promise the settings screen makes and the reason a task can hold a password
+/// that its own model never sees. So a password that has changed is typed
+/// afresh, and a password that has been forgotten is changed at the site and
+/// then typed afresh. The alternative, an endpoint that hands a password to
+/// whoever holds the API token, would turn one stolen token into every login on
+/// the machine.
+///
+/// The site a login is bound to is deliberately not changeable. That binding is
+/// what stops a credential registered for one site being typed into a lookalike,
+/// so moving it is a new credential, made on purpose.
+async fn update_credential(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateCredential>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    if body.secret.as_ref().is_some_and(|s| s.is_empty()) {
+        return Err(ApiError::bad_request(
+            "The new password is empty, so nothing was changed. Type the password, or leave it \
+             out of the change to keep the one already saved.",
+        ));
+    }
+    if body.label.as_ref().is_some_and(|l| l.trim().is_empty()) {
+        return Err(ApiError::bad_request(
+            "A saved login needs a name, so nothing was changed.",
+        ));
+    }
+
+    // The keychain first, because it is the half that can fail: a keychain that
+    // says no leaves a login whose name matches the password behind it, rather
+    // than one renamed for a password that was never written.
+    if let Some(secret) = body.secret {
+        let Some((service, account, _)) =
+            errand_core::db::credential_keychain_ref(state.pool(), &id)
+                .await
+                .map_err(ApiError::from)?
+        else {
+            return Err(ApiError::not_found(format!("No credential with id {id}.")));
+        };
+        crate::secrets::put(service, account, errand_core::keychain::Secret::new(secret))
+            .await
+            .map_err(|e| {
+                ApiError::internal(format!(
+                    "Could not save that password to your keychain: {e}"
+                ))
+            })?;
+    }
+
+    let updated = errand_core::db::update_credential_meta(
+        state.pool(),
+        &id,
+        body.label.as_deref(),
+        body.username.as_deref().map(str::trim),
+    )
+    .await
+    .map_err(ApiError::from)?
+    .ok_or_else(|| ApiError::not_found(format!("No credential with id {id}.")))?;
+
+    Ok(Json(json!({
+        "credential": updated,
+        "note": "Saved. The password is in your macOS keychain, where Errand can use it and \
+                 nothing can read it back, this window included."
+    })))
+}
+
 async fn delete_credential(
     State(state): State<AppState>,
     Extension(caller): Extension<Caller>,
@@ -5037,6 +5119,95 @@ mod tests {
             .post("/v1/automation/the-garage-door/enable", json!({}))
             .await;
         assert_eq!(code, 400, "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_saved_login_can_be_renamed_and_its_password_replaced_but_never_read_back() {
+        // Asked for after somebody saved one and found no way back to it: a
+        // typo in the username meant deleting the login and typing the password
+        // in again. Changing it is ordinary. Reading it back is not, and the
+        // difference is what this test is here to hold.
+        let api = testkit::start().await;
+        let (code, made) = api
+            .post(
+                "/v1/credentials",
+                json!({
+                    "label": "X",
+                    "domain": "x.com",
+                    "username": "someone@example.com",
+                    "secret": "the-first-one",
+                }),
+            )
+            .await;
+        assert_eq!(code, 200, "{made}");
+        let id = made["id"].as_str().expect("an id").to_string();
+
+        let (code, body) = api
+            .patch(
+                &format!("/v1/credentials/{id}"),
+                json!({ "label": "X (research)", "username": "someone-else@example.com" }),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body["credential"]["label"], "X (research)");
+        assert_eq!(body["credential"]["username"], "someone-else@example.com");
+        assert_eq!(
+            body["credential"]["domain"], "x.com",
+            "the site it may be typed into is not something an edit moves"
+        );
+
+        // A new password reaches the store, and the old one stops working.
+        let (code, body) = api
+            .patch(
+                &format!("/v1/credentials/{id}"),
+                json!({ "secret": "the-second-one" }),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+        let (service, account, _) = errand_core::db::credential_keychain_ref(&api.pool, &id)
+            .await
+            .expect("reading where the secret lives")
+            .expect("a credential that exists");
+        let held = crate::secrets::get(service, account)
+            .await
+            .expect("the stored secret");
+        assert_eq!(held.expose(), "the-second-one");
+
+        // Nothing hands it back. Not the reply that saved it, not the list.
+        assert!(
+            !body.to_string().contains("the-second-one"),
+            "the reply quoted the password: {body}"
+        );
+        let listed = api.get("/v1/credentials").await.to_string();
+        for typed in ["the-first-one", "the-second-one"] {
+            assert!(!listed.contains(typed), "the list gave a password away");
+        }
+
+        // An empty box means "leave it alone", so it must not arrive here as an
+        // instruction to store nothing and lock the task out.
+        let (code, body) = api
+            .patch(&format!("/v1/credentials/{id}"), json!({ "secret": "" }))
+            .await;
+        assert_eq!(code, 400, "{body}");
+        let still = crate::secrets::get(
+            errand_core::db::credential_keychain_ref(&api.pool, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .0,
+            format!("cred/{id}/v1"),
+        )
+        .await
+        .expect("the secret is still there");
+        assert_eq!(still.expose(), "the-second-one");
+
+        let (code, _) = api
+            .patch(
+                "/v1/credentials/nothing-by-that-name",
+                json!({ "label": "x" }),
+            )
+            .await;
+        assert_eq!(code, 404);
     }
 
     #[tokio::test]

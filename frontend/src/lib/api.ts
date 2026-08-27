@@ -300,6 +300,16 @@ export const api = {
   credentials: () => call<{ items: any[] }>("GET", "/v1/credentials").then((r) => r.items),
   addCredential: (label: string, domain: string, username: string, secret: string) =>
     call("POST", "/v1/credentials", { label, domain, username, secret }),
+  /**
+   * Change a saved login. Anything left out stays as it was.
+   *
+   * There is no matching read. A stored password cannot be fetched back by this
+   * window or by anything else holding the API token, so a password that has
+   * changed is typed again rather than edited: the field it goes into starts
+   * empty every time, and an empty field means "leave the saved one alone".
+   */
+  updateCredential: (id: string, change: { label?: string; username?: string; secret?: string }) =>
+    call("PATCH", `/v1/credentials/${id}`, change),
   deleteCredential: (id: string) => call("DELETE", `/v1/credentials/${id}`),
 
   channels: () => call<{ channels: ChannelHealth[]; notes: Record<string, string> }>("GET", "/v1/channels"),

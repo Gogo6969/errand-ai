@@ -17,6 +17,31 @@
   // Closed by default, which is the whole point: a task is opened to see what
   // it produced, not to be asked eight questions about how it should work.
   let showSettings = $state(false);
+  let settingsTop: HTMLElement | undefined = $state();
+
+  /**
+   * Open the settings, and go to them.
+   *
+   * The going is the part that was missing. Settings sit below the answer, and
+   * an answer can be a screen and a half of trending topics, so the panel
+   * opened underneath everything the reader could see and the gear looked
+   * broken. It was doing exactly what it was told; there was simply nothing to
+   * notice. Reported as "clicking the gear does nothing", which is what it is
+   * from the chair.
+   */
+  function toggleSettings() {
+    showSettings = !showSettings;
+    if (!showSettings) return;
+    // One frame, so the panel exists to be scrolled to.
+    requestAnimationFrame(() =>
+      settingsTop?.scrollIntoView({
+        behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)").matches
+          ? "auto"
+          : "smooth",
+        block: "start",
+      })
+    );
+  }
   let draftAnswer = $state("");
   let editingDirective = $state(false);
   let draftDirective = $state("");
@@ -436,7 +461,7 @@
           class="gear"
           aria-expanded={showSettings}
           aria-label={showSettings ? "Hide task settings" : "Task settings"}
-          onclick={() => (showSettings = !showSettings)}
+          onclick={toggleSettings}
         >
           <svg viewBox="0 0 24 24" width="17" height="17" aria-hidden="true"
             fill="none" stroke="currentColor" stroke-width="1.7"
@@ -633,7 +658,7 @@
        here, unchanged, one click away, for the times somebody really does want
        to change the schedule or take a permission back. -->
   {#if showSettings}
-  <h2>When it runs</h2>
+  <h2 bind:this={settingsTop} class="settings-top">When it runs</h2>
   <div class="card">
     {#if editingSchedule}
       <ScheduleEditor bind:value={draftSchedule} />
@@ -1046,6 +1071,11 @@
     background: var(--surface-2);
     border-color: var(--rule);
   }
+
+  /* Room above the heading the gear jumps to, so it lands as the top of a
+     section rather than flush against the window edge, where it reads as the
+     page having been cut off. */
+  .settings-top { scroll-margin-top: 16px; }
 
   /* The answer, set as something to read rather than a status line.
      pre-wrap rather than a Markdown renderer: this text is written by a model

@@ -11,9 +11,54 @@ export const SNAPSHOT_FN = `(() => {
   const refs = [];
   window.__errandRefs = refs;
 
-  const isVisible = (el) => {
+  // Would a click here actually reach this element?
+  //
+  // Drawn and reachable are different questions, and only the first one used to
+  // be asked. A page that opens a modal leaves the form behind it fully
+  // rendered, the right size, and completely unreachable, so a snapshot listing
+  // both hands the agent two of every field and no way to tell which one is
+  // live. It picks wrong about half the time and then cannot say why.
+  //
+  // Watched happen on x.com: the run filled the username box behind the login
+  // dialog, pressed a Continue the overlay was swallowing, and reported that
+  // the button would not respond to a click. It was right. Nothing it could
+  // read said the thing was buried.
+  //
+  // The same test the browser itself would apply on the way to a click, so an
+  // element that survives this is one an action can actually use.
+  const reachable = (el) => {
+    const r = el.getBoundingClientRect();
+    const x = r.left + r.width / 2;
+    const y = r.top + r.height / 2;
+    // Off-screen is not covered. A control below the fold is reached by
+    // scrolling to it, and a hit test cannot see outside the window, so
+    // everything there would fail this and the page would come back empty.
+    if (x < 0 || y < 0 || x > window.innerWidth || y > window.innerHeight) return true;
+    const hit = document.elementFromPoint(x, y);
+    if (!hit) return false;
+    // Its own child is still it: a button's centre belongs to the span inside
+    // it, and a click on that span is a click on the button.
+    return hit === el || el.contains(hit) || hit.contains(el);
+  };
+
+  // Does this element hide everything inside it?
+  //
+  // Only these three do, and they are the only grounds for skipping a whole
+  // subtree. A box of zero size is not one of them, however much it looks like
+  // one: flex and grid layouts are full of zero-height wrappers whose children
+  // are positioned out of them and painted perfectly. Treating those as hidden
+  // is how Errand came to be blind to x.com's sign-in dialog, which lives
+  // inside a 1280x0 div. Every control the agent was offered on that page was
+  // the copy on the page underneath, buried by the dialog's own backdrop, and
+  // "the Continue button will not respond" was the honest report of a run
+  // clicking the only Continue it could see.
+  const hidesSubtree = (el) => {
     const s = window.getComputedStyle(el);
-    if (s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0') return false;
+    return s.display === 'none' || s.visibility === 'hidden' || s.opacity === '0';
+  };
+
+  /** Is the element itself drawn? Asked about the line, never about descending. */
+  const isDrawn = (el) => {
     const r = el.getBoundingClientRect();
     return r.width > 0 && r.height > 0;
   };
@@ -80,10 +125,11 @@ export const SNAPSHOT_FN = `(() => {
       if (!(el instanceof HTMLElement)) continue;
       const tag = el.tagName.toLowerCase();
       if (['script', 'style', 'noscript', 'svg', 'head'].includes(tag)) continue;
-      if (!isVisible(el)) continue;
+      if (hidesSubtree(el)) continue;
 
       const pad = '  '.repeat(Math.min(depth, 8));
-      if (interactive(el)) {
+      const drawn = isDrawn(el);
+      if (drawn && interactive(el) && reachable(el)) {
         const ref = 'e' + (refs.length + 1);
         refs.push(el);
         const role = roleOf(el);
@@ -105,10 +151,15 @@ export const SNAPSHOT_FN = `(() => {
         if (el.checked) parts.push('[checked]');
         if (tag === 'a' && el.href) parts.push('-> ' + el.getAttribute('href'));
         lines.push(pad + '- ' + parts.join(' '));
-      } else if (/^h[1-6]$/.test(tag)) {
+      } else if (interactive(el)) {
+        // Either not drawn, or drawn under something else. No ref either way:
+        // a ref is an offer to act on a thing, and neither of these can be
+        // acted on. Its children are still walked, because the element
+        // covering something is often a child of the thing it covers.
+      } else if (drawn && /^h[1-6]$/.test(tag)) {
         const t = (el.innerText || '').trim().slice(0, 160);
         if (t) lines.push(pad + '- heading ' + JSON.stringify(t));
-      } else {
+      } else if (drawn) {
         const own = Array.from(el.childNodes)
           .filter((n) => n.nodeType === 3)
           .map((n) => n.textContent.trim())

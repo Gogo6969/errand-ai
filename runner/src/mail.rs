@@ -23,10 +23,20 @@
 
 use std::fmt;
 
-/// Long enough for Mail to answer about a full inbox from cold, short enough
+/// Long enough for Mail to answer about one message from cold, short enough
 /// that a wedged run is still a run that ends. Longer than the note timeout
-/// next door because a `whose` search asks Mail to walk every mailbox.
+/// next door because Mail is slower to answer than Notes about anything.
 const TIMEOUT_S: u64 = 45;
+
+/// What a listing gets instead, which is more.
+///
+/// Not the same question. Reading one message is one lookup; listing walks
+/// hundreds, and on a mailbox with six figures in it Mail charges about a
+/// second a message however it is asked. Forty-five seconds bought about forty
+/// messages there, which is not enough of somebody's post to call it their
+/// unread mail. A morning summary can afford two minutes; a run waiting on a
+/// single message cannot, which is why these are two numbers and not one.
+const LISTING_TIMEOUT_S: u64 = 120;
 
 /// How far back to walk when looking for unread mail.
 ///
@@ -54,11 +64,18 @@ const UNREAD_CHUNK: usize = 25;
 /// permission for it. Measured against a real inbox of six figures, where two
 /// hundred messages could not be looked at in forty-five seconds however they
 /// were asked for.
-const WALK_DEADLINE_S: u64 = 25;
+const WALK_DEADLINE_S: u64 = 100;
 
-/// The walk must give up before Errand does, or it never gets to say how far
-/// it reached and the whole exercise is back to a timeout with nothing in it.
-const _: () = assert!(WALK_DEADLINE_S < TIMEOUT_S);
+/// Three things that must hold, held where they cannot come loose.
+///
+/// A listing gets longer than a lookup, because they answer different
+/// questions. The walk gives up before Errand does, or it never gets to say how
+/// far it reached and the whole exercise is back to a timeout with nothing in
+/// it. And there is room between the two for the one Apple Event already in
+/// flight when the walk's clock runs out.
+const _: () = assert!(LISTING_TIMEOUT_S > TIMEOUT_S);
+const _: () = assert!(WALK_DEADLINE_S < LISTING_TIMEOUT_S);
+const _: () = assert!(LISTING_TIMEOUT_S - WALK_DEADLINE_S >= 15);
 
 /// The most messages one listing may hand back.
 ///
@@ -298,15 +315,21 @@ fn escape(s: &str) -> String {
 
 /// Run one AppleScript, with a deadline.
 async fn osascript(script: &str) -> Result<String, MailError> {
+    osascript_within(script, TIMEOUT_S).await
+}
+
+/// The same, with its own deadline, because a listing is allowed longer than a
+/// lookup.
+async fn osascript_within(script: &str, seconds: u64) -> Result<String, MailError> {
     let call = tokio::process::Command::new("/usr/bin/osascript")
         .arg("-e")
         .arg(script)
         .output();
 
-    let out = match tokio::time::timeout(std::time::Duration::from_secs(TIMEOUT_S), call).await {
+    let out = match tokio::time::timeout(std::time::Duration::from_secs(seconds), call).await {
         Ok(Ok(o)) => o,
         Ok(Err(e)) => return Err(MailError::Machine(format!("macOS could not be asked: {e}"))),
-        Err(_) => return Err(why_it_never_answered().await),
+        Err(_) => return Err(why_it_never_answered(seconds).await),
     };
 
     if out.status.success() {
@@ -329,10 +352,10 @@ async fn osascript(script: &str) -> Result<String, MailError> {
 /// at all? It counts mailboxes rather than messages, which is why it answers in
 /// a moment on a mailbox where a listing cannot finish. A Mail that answers
 /// that has plainly given permission, and the timeout was about size.
-async fn why_it_never_answered() -> MailError {
+async fn why_it_never_answered(seconds: u64) -> MailError {
     use crate::channels::apple::{app_consent, Automation};
     if app_consent(Automation::MailReading).await.is_ok() {
-        return MailError::Machine(too_big_to_finish());
+        return MailError::Machine(too_big_to_finish(seconds));
     }
     // Nothing came back from either question, which is the prompt waiting where
     // nobody can see it. Said in the words every other path uses, so the checks
@@ -345,9 +368,9 @@ async fn why_it_never_answered() -> MailError {
 /// Kept apart from the question that decides which of the two it was, so the
 /// words can be held to in a test: this sentence must never be mistaken for a
 /// permission wall by the checks that look for one.
-fn too_big_to_finish() -> String {
+fn too_big_to_finish(seconds: u64) -> String {
     format!(
-        "Mail did not finish answering within {TIMEOUT_S} seconds. This is not a permission \
+        "Mail did not finish answering within {seconds} seconds. This is not a permission \
          problem: Errand asked Mail a smaller question straight afterwards and it answered at \
          once. The mailbox is large enough that what was asked for cannot be done in the time. \
          Ask for the most recent messages rather than searching the whole mailbox, or name one \
@@ -782,7 +805,7 @@ pub async fn list(
 
     let script = listing_script(box_name, scan, limit, unread_only);
 
-    let reply = osascript(&script).await?;
+    let reply = osascript_within(&script, LISTING_TIMEOUT_S).await?;
     if reply.trim() == "!no-mailbox" {
         return Err(MailError::NoSuchMailbox(
             mailbox.unwrap_or("inbox").to_string(),
@@ -1237,7 +1260,7 @@ mod tests {
         // the words of a refused permission, so the person was sent to press
         // Enable and then into System Settings, for a permission that had been
         // working all day.
-        let said = too_big_to_finish();
+        let said = too_big_to_finish(LISTING_TIMEOUT_S);
         assert!(
             !crate::channels::apple::is_permission_block(&said),
             "a slow mailbox still reads as a permission wall: {said}"

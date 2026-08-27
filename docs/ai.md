@@ -102,8 +102,9 @@ A machine name usually beats a number, because numbers change:
 
 *Keep everything on this machine* is a real restriction, not a preference: with
 it on, Errand refuses to send anything to a model it does not reach on your own
-machine or network. Tasks that need a browser stop working, because that needs
-Claude. Errand will not let you turn it on until there is a local model to use.
+machine or network. Browsing still works: a model on your own network drives the
+browser through the same tools the Claude command line tool uses. Errand will not
+let you turn it on until there is a local model to use.
 
 ## What leaves your machine
 

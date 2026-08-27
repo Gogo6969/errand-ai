@@ -96,7 +96,13 @@ pub async fn run_with_tools(
         .and_then(|t| t.playbook_version)
         .is_some();
 
-    let tools = tools_for_chat();
+    // The same list the other path gets, filtered to what this task was
+    // actually granted. A tool a task cannot use is better absent than
+    // present-and-refused: a model shown list_mail will try it, read the
+    // refusal, and spend the rest of the run looking for a way round something
+    // that is not a fault.
+    let offered_tools = crate::mcp::tools_for_run(state, run_id).await;
+    let tools = tools_for_chat(&offered_tools);
     let offered = tool_names();
 
     // The same prompt the Claude path uses, so a task behaves the same however
@@ -283,7 +289,7 @@ fn cannot_use_tools(model: &str, e: &crate::models::ChatError) -> String {
     format!(
         "{model} cannot carry out tasks: it does not support tool calling, which is the only way \
          Errand hands a model the browser and everything else. Pick a different model for \
-         \"Doing the task\" in Settings. What the server said: {e}"
+         \"Doing the task\" on the AI screen. What the server said: {e}"
     )
 }
 
@@ -292,8 +298,8 @@ fn cannot_use_tools(model: &str, e: &crate::models::ChatError) -> String {
 /// Converted from `mcp::tool_definitions()`, never written out again: one list,
 /// so a tool added there appears here and a tool removed there disappears from
 /// both paths at once.
-fn tools_for_chat() -> Vec<Value> {
-    crate::mcp::tool_definitions()
+fn tools_for_chat(offered: &Value) -> Vec<Value> {
+    offered
         .as_array()
         .map(Vec::as_slice)
         .unwrap_or_default()
@@ -715,7 +721,7 @@ mod tests {
             .to_string();
 
         assert!(
-            e.contains("cannot carry out tasks") && e.contains("Settings"),
+            e.contains("cannot carry out tasks") && e.contains("AI screen"),
             "it must say plainly that this model cannot do it, and what to do: {e}"
         );
     }
@@ -923,7 +929,7 @@ mod tests {
         .expect_err("there is nothing to run it with")
         .to_string();
         assert!(
-            e.contains("Settings") && e.contains("claude /login"),
+            e.contains("AI screen") && e.contains("claude /login"),
             "the failure has to name what to configure: {e}"
         );
     }
@@ -1141,7 +1147,7 @@ mod tests {
             crate::mcp::qualified_tool_names().len(),
             "the two paths must offer the same tools"
         );
-        for t in tools_for_chat() {
+        for t in tools_for_chat(&crate::mcp::tool_definitions()) {
             assert_eq!(t["type"], "function");
             let name = t["function"]["name"].as_str().expect("a name");
             assert!(offered.contains(&name.to_string()));

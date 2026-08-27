@@ -465,8 +465,9 @@ pub(crate) fn tool_definitions() -> Value {
                  Call this once, near the end of a supervised first run, after you know what \
                  actually worked. Describe each step by its INTENT (what you were trying to \
                  achieve, which survives a site redesign) and give the hint (the URL or the \
-                 button you used) separately, because hints go stale and intents do not. What \
-                 you write is shown to the person for approval before any future run follows it.",
+                 button you used) separately, because hints go stale and intents do not. If the \
+                 task had no plan, what you write becomes how the job is done from now on. If it \
+                 already had one, yours waits for a person to read before it replaces theirs.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -521,10 +522,12 @@ const MAIL_TOOLS: &[&str] = &["list_mail", "read_mail", "file_mail"];
 /// the run looking for a way round something that is not a fault: the person
 /// simply did not switch it on.
 ///
-/// The in-process agent loop takes the whole list instead, because it builds
-/// its tool list with no run in hand. `dispatch` refuses there in the same
-/// words, so the rule holds either way and only the tidiness differs.
-async fn tools_for_run(state: &AppState, run_id: &str) -> Value {
+/// Both execution paths come through here. The in-process agent loop used to
+/// take the unfiltered list on the grounds that it had no run in hand, which
+/// was not true: it is handed the run id on the line above. That left the
+/// weaker model with the more confusing surface, which is exactly backwards
+/// from the reason this filter exists.
+pub async fn tools_for_run(state: &AppState, run_id: &str) -> Value {
     let may_read_mail = mail_grant(state, run_id).await.is_some();
     let all = tool_definitions();
     let Some(list) = all.as_array() else {
@@ -3337,9 +3340,13 @@ async fn save_playbook(state: &AppState, run_id: &str, args: &Value) -> anyhow::
     )
     .await;
 
+    // Said accurately, because the agent can and does repeat this back to the
+    // person in the answer they read. Asserting a safety gate that does not
+    // exist, in the app's own voice, is worse than having no gate.
     Ok(format!(
-        "Saved as version {version}, with {} steps. It is waiting for the person to read and \
-         approve it; nothing will follow it until they do.{}",
+        "Saved as version {version}, with {} steps. If this task had no plan, this is now how \
+         the job gets done. If it already had one, that one stays in force and a person reads \
+         this before it replaces it.{}",
         pb.steps.len(),
         if run.is_rehearsal() {
             " It is marked as written by a rehearsal, so they will know nothing in it was \

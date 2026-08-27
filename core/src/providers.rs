@@ -960,19 +960,21 @@ pub fn resolve_chain_knowing<'a>(
 pub fn explain_empty_chain(role: Role, local_only: bool, providers: &[Provider]) -> String {
     if providers.is_empty() {
         return "Errand has no AI to work with. It uses the Claude command line tool by default; \
-                install it and run 'claude /login' once, or add a model of your own in Settings."
+                install it and run 'claude /login' once, or add a model of your own on the AI \
+                 screen."
             .into();
     }
     if local_only {
         return format!(
             "This task is set to stay on your own machine, and nothing on it can do the job of \
-             {}. Add a model of your own in Settings, or turn that setting off for this task.",
+             {}. Add a model of your own on the AI screen, or turn off 'Keep everything on \
+             this machine', which is one switch for all tasks rather than one per task.",
             role.plain()
         );
     }
     if role.needs_agentic() {
         return "Nothing Errand can reach is able to carry out a task. Any model that can use \
-                tools can do this: add one in Settings under Models and choose it for \"Doing \
+                tools can do this: add one on the AI screen and choose it for \"Doing \
                 the task\", or install the Claude command line tool and run 'claude /login' once."
             .into();
     }
@@ -1204,7 +1206,7 @@ mod tests {
         );
         let why = explain_empty_chain(Role::Executor, true, &providers);
         assert!(why.contains("your own machine"));
-        assert!(why.contains("Settings"));
+        assert!(why.contains("AI screen"));
     }
 
     #[test]

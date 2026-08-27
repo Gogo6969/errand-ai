@@ -255,13 +255,14 @@ pub async fn executor_chain(state: &AppState, task_id: Option<&str>) -> anyhow::
         if local_only {
             anyhow::bail!(
                 "This task is set to stay on your own machine, and no model on this machine is \
-                 switched on. Add one in Settings under Models, or turn that setting off for this \
-                 task."
+                 switched on. Add one on the AI screen, or turn off 'Keep everything on this \
+                 machine' there. That switch covers every task, not just this one."
             );
         }
         anyhow::bail!(
-            "Errand has no model switched on to carry out this task. Open Settings and either \
-             install the Claude command line tool and run 'claude /login' once, or add a model of \
+            "Errand has no model switched on to carry out this task. Open the AI screen and \
+             either install the Claude command line tool and run 'claude /login' once, or add a \
+             model of \
              your own by address and choose it for \"Doing the task\"."
         );
     }
@@ -575,7 +576,7 @@ fn read_turn(msg: &Value) -> Turn {
 async fn ask_anthropic(model: &str, prompt: &str) -> Result<String, String> {
     let key = crate::secrets::get_internal("anthropic.api_key")
         .await
-        .map_err(|_| "no Anthropic key is saved. Add one in Settings.".to_string())?;
+        .map_err(|_| "no Anthropic key is saved. Add one on the AI screen.".to_string())?;
 
     let res = reqwest::Client::new()
         .post("https://api.anthropic.com/v1/messages")

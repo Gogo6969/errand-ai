@@ -84,6 +84,28 @@ All notable changes to this project are documented here. The format follows
 
 ### Changed
 
+- **The result of a scheduled run reaches you, and it is the answer.** It went to Telegram or
+  nowhere: the channel was hardcoded, so somebody who does not use Telegram installed a scheduler
+  that ran every morning and never told them anything, having filled in their own address on
+  another channel and watched a test message arrive. It now uses whichever way of reaching you is
+  set up. And it sent `summary`, which the finish tool spends eleven lines telling the agent is
+  explicitly not the answer, so a task that woke you at seven told you where it had been while
+  what it found stayed in the database.
+- **Both execution paths get the same tools.** The in-process agent loop took the whole tool list
+  on the grounds that it had no run in hand, which was not true: it is handed the run id on the
+  line above. So a task with no mail permission was still shown the mail tools, on the path used
+  by the smaller local models, which is exactly backwards from the reason that filter exists.
+- **The app stopped asserting an approval gate it no longer has.** Two runtime strings told the
+  *model* that a plan was "waiting for the person to read and approve it; nothing will follow it
+  until they do". The agent can relay that into the answer a person reads, so the app was
+  asserting a safety gate that does not exist, in its own voice.
+- **Nine messages sent people to the wrong screen.** Models live on the AI screen; every one of
+  these said Settings, and two offered to turn off a per-task setting that is a single global
+  switch.
+- **The documentation describes the app that exists.** `getting-started.md` required "the Claude
+  command line tool. This is what actually carries out a task", and `ai.md` said browsing stops
+  without it. Both are false: any model that can call tools drives the same tool surface. Both
+  documents also still walked a reader through teaching and approving, a flow that was removed.
 - **A new task does the job instead of asking to be taught.** Creating one used to leave it
   waiting: press "Teach it once", read the plan it wrote, approve that, and only then could it
   run. The gate read like a safety check and was not one. Teaching has never been a different kind

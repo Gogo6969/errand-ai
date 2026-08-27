@@ -394,7 +394,7 @@ pub async fn carry_out(
     }
 
     Err(ExecError::NoModel(format!(
-        "Nothing Errand can use is able to carry out this task. {}. Open Settings, under Models, \
+        "Nothing Errand can use is able to carry out this task. {}. Open the AI screen \
          and choose something for \"Doing the task\".",
         passed_over.join(". ")
     )))

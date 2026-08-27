@@ -28,16 +28,17 @@ sites, deciding as it goes, repairing itself when a page changes, and reporting 
 Not a cron scheduler. Every run is executed by an AI that reads your task description and
 decides what to do, which is what lets it cope with a site that moved a button since last week.
 
-The loop is: **describe, teach, approve, repeat.**
+The loop is: **describe, watch it once, put it on a schedule.**
 
-1. **Describe.** You write the task the way you would explain it to a person.
-2. **Teach.** A visible browser opens and the agent attempts the job while narrating. You can
-   pause, take over, or correct it mid-run.
-3. **Approve.** The agent distils what it learned into a playbook, in markdown, that you read and
-   approve. Nothing is ever scheduled before you approve it.
-4. **Repeat.** It runs on your schedule. When a page changes it tries to repair its own approach.
-   When it genuinely cannot finish, it stops and tells you what it was doing, why it could not,
-   and what you can do about it.
+1. **Describe.** You write the task the way you would explain it to a person. Errand reads it,
+   works out what it needs (which sites, when to run, what it may touch) and tells you in a line
+   or two what it set up.
+2. **It does the job.** No approval step and nothing to read first: it works the job out and does
+   it while you watch, and shows you the answer. If it goes wrong it tries another way, and it
+   stops itself rather than going round for ever. What it learned becomes how the job is done.
+3. **Put it on a schedule.** Only offered once it has really done the job with you there: proven,
+   rather than approved. From then on it runs on its own, repairs its own approach when a page
+   changes, and stops itself if it fails three times in a row.
 
 ## Design commitments
 

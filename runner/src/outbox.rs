@@ -276,15 +276,52 @@ pub async fn notify_run(state: &AppState, run_id: &str) -> anyhow::Result<()> {
     }
     let ok = run.status == "succeeded";
 
+    // The answer, because that is the thing the task exists to produce. This
+    // used to send the summary, which the finish tool spends eleven lines
+    // telling the agent is explicitly NOT the answer: "One line, past tense,
+    // about the work itself. Not the answer, and not a repeat of it." So a
+    // scheduled task woke somebody's phone at seven to tell them where it had
+    // been, while what it found stayed in the database.
     let summary = run
-        .summary
+        .answer
         .clone()
+        .filter(|a| !a.trim().is_empty())
+        .or_else(|| run.summary.clone())
         .or_else(|| run.failure.as_ref().map(|f| f.plain_reason.clone()))
         .unwrap_or_else(|| "No details were recorded.".into());
 
     notify_you(state, &run, &task, ok, &summary).await?;
     notify_recipients(state, &run, &task, ok, &summary).await;
     Ok(())
+}
+
+/// Where to reach the person who set the task up.
+///
+/// Telegram first only because it was here first and somebody may already rely
+/// on it. Otherwise, whichever way of reaching them is set up. This used to be
+/// Telegram or nothing, which meant a person who does not use Telegram, or
+/// lives where it is blocked, installed a scheduler that ran every morning and
+/// never told them anything: they had filled in their own address on another
+/// channel, watched a test message arrive, and then heard nothing ever again.
+async fn your_address(state: &AppState) -> Option<(String, String)> {
+    if let Some(chat) = channels::telegram::configured_chat_id().await {
+        return Some(("telegram".into(), chat));
+    }
+    for channel in ["imessage", "apple_mail", "whatsapp"] {
+        let key = format!("messaging.self.{channel}");
+        if let Ok(Some(v)) = errand_core::db::get_setting(state.pool(), &key).await {
+            if let Some(addr) = v.as_str().map(str::trim).filter(|a| !a.is_empty()) {
+                return Some((channel.to_string(), addr.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// The same card, for a channel that carries words rather than markup.
+fn plain_card(task: &str, ok: bool, body: &str) -> String {
+    let head = if ok { task.to_string() } else { format!("{task}: could not finish") };
+    format!("{head}\n\n{body}")
 }
 
 /// The card that says how your own task went.
@@ -304,11 +341,11 @@ async fn notify_you(
         return Ok(());
     }
 
-    let Some(chat) = channels::telegram::configured_chat_id().await else {
-        // Nothing configured is not an error worth failing over, but it is
-        // worth saying once, because a user who thinks they set it up would
-        // otherwise wonder why nothing arrives.
-        tracing::info!("no Telegram chat configured, so no run notification was sent");
+    let Some((channel, address)) = your_address(state).await else {
+        tracing::info!(
+            "no way of reaching you is set up, so no run notification was sent; \
+             Settings has a place for one on each channel"
+        );
         return Ok(());
     };
 
@@ -330,15 +367,22 @@ async fn notify_you(
     // or lost over its own wording.
     let summary = narrate(state, &run.id, &task.name, ok, summary).await;
 
-    let body = channels::telegram::result_card(&task.name, ok, &summary, duration, run.cost_usd);
+    // Telegram takes an HTML card; everything else takes what a person would
+    // write. One shape per channel rather than one shape everywhere, because a
+    // card full of tags arriving as a text message is worse than plain words.
+    let body = if channel == "telegram" {
+        channels::telegram::result_card(&task.name, ok, &summary, duration, run.cost_usd)
+    } else {
+        plain_card(&task.name, ok, &summary)
+    };
     errand_core::db::enqueue_message(
         state.pool(),
         errand_core::db::NewMessage {
             run_id: Some(run.id.clone()),
             task_id: Some(run.task_id.clone()),
             class: "notify".into(),
-            channel: "telegram".into(),
-            recipient: chat,
+            channel: channel.clone(),
+            recipient: address,
             recipient_label: Some("you".into()),
             subject: None,
             body,
@@ -769,6 +813,63 @@ mod tests {
     }
 
     // ----------------------------------------------- the night nobody set up --
+
+    #[tokio::test]
+    async fn what_reaches_your_phone_is_the_answer_and_not_the_story_of_the_work() {
+        // finish spends eleven lines telling the agent that summary is
+        // explicitly not the answer. This used to send the summary, so a task
+        // that woke somebody at seven told them where it had been while what
+        // it found stayed in the database.
+        let api = crate::api::testkit::start().await;
+        let task_id = crate::api::testkit::a_ready_manual_task(&api).await;
+        let run = errand_core::db::create_run(
+            &api.pool,
+            &task_id,
+            "occ-notify",
+            "schedule",
+            errand_core::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .expect("a run");
+        errand_core::db::finish_run_ok(
+            &api.pool,
+            &run.id,
+            "Went to the site and read the table.",
+            Some("Gold is 4,592.90 dollars an ounce, down 1.4 percent today."),
+        )
+        .await
+        .expect("finishing");
+        errand_core::db::set_setting(
+            &api.pool,
+            "messaging.self.imessage",
+            &serde_json::json!("+1 555 0123"),
+        )
+        .await
+        .expect("an address to reach you on");
+
+        notify_run(&api.state, &run.id).await.expect("notifying");
+
+        let queued = errand_core::db::due_outbox(&api.pool, 10)
+            .await
+            .expect("the outbox");
+        let mine: Vec<_> = queued.iter().filter(|m| m.class == "notify").collect();
+        assert_eq!(mine.len(), 1, "{queued:?}");
+        assert!(
+            mine[0].body.contains("4,592.90"),
+            "the answer never left the database: {}",
+            mine[0].body
+        );
+        assert!(
+            !mine[0].body.contains("read the table"),
+            "it sent the story of the work instead: {}",
+            mine[0].body
+        );
+        assert_eq!(
+            mine[0].channel, "imessage",
+            "it only knew how to reach you on Telegram"
+        );
+    }
 
     #[tokio::test]
     async fn a_brand_new_install_already_has_a_quiet_period_nobody_had_to_switch_on() {

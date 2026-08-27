@@ -3008,6 +3008,7 @@ mod tests {
         // Nobody is asked to read and approve a document before the task may
         // be used. It has just been watched doing the job, which is better
         // evidence than a reading of a plan.
+        nothing_writes_to_the_real_data_dir();
         let pool = open_memory().await.unwrap();
         let task = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
         let run = create_run(
@@ -3070,6 +3071,7 @@ mod tests {
         // back to the agent as trusted instruction. Scrubbing removes secrets,
         // not instructions. One run against a changed page must not become
         // standing orders for every unattended run after it.
+        nothing_writes_to_the_real_data_dir();
         let pool = open_memory().await.unwrap();
         let task = a_task(&pool, serde_json::json!({"kind": "manual"})).await;
 
@@ -3990,6 +3992,27 @@ mod tests {
         ));
     }
 
+    /// Nothing in these tests may write into the real data directory.
+    ///
+    /// A playbook is a file, and where it goes is read out of ERRAND_DATA_DIR
+    /// at the moment of writing. One test used to point that at a temporary
+    /// directory and then remove both the directory and the variable at the
+    /// end, while other tests were running beside it in the same process. A
+    /// write that had already worked out its directory found it gone, which is
+    /// a failure that turns up about one run in eight; and every write that
+    /// landed after the variable was cleared went into the real directory
+    /// instead. A real installation was found with sixty-seven playbook folders
+    /// belonging to tasks that had never existed.
+    ///
+    /// So it is set once, for the whole process, and never unset.
+    fn nothing_writes_to_the_real_data_dir() {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            let dir = std::env::temp_dir().join(format!("errand-core-tests-{}", crate::new_id()));
+            std::env::set_var("ERRAND_DATA_DIR", &dir);
+        });
+    }
+
     fn a_playbook() -> crate::playbook::Playbook {
         crate::playbook::Playbook {
             version: 1,
@@ -4009,8 +4032,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_new_playbook_does_not_take_effect_until_it_is_approved() {
-        let dir = std::env::temp_dir().join(format!("errand-pb-{}", crate::new_id()));
-        std::env::set_var("ERRAND_DATA_DIR", &dir);
+        nothing_writes_to_the_real_data_dir();
         let pool = open_memory().await.unwrap();
         let t = create_task(
             &pool,
@@ -4050,8 +4072,6 @@ mod tests {
         set_active_playbook(&pool, &t.id, v).await.unwrap();
         let active = active_playbook(&pool, &t.id).await.unwrap().unwrap();
         assert_eq!(active.goal, "Book a court.");
-        std::fs::remove_dir_all(&dir).ok();
-        std::env::remove_var("ERRAND_DATA_DIR");
     }
 
     #[tokio::test]

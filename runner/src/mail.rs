@@ -151,6 +151,15 @@ impl fmt::Display for MailError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Summary {
     pub id: String,
+    /// A link that opens this message in Mail.
+    ///
+    /// Not the same thing as `id` and not interchangeable with it. `id` is
+    /// Errand's own handle, which read_mail and file_mail take and which means
+    /// nothing to anybody else; this is a URL macOS hands to Mail. Asked for a
+    /// link to each message, a run had only the handle to give and put that in
+    /// the answer, so somebody got a page of `E1.616363743a...` where they had
+    /// asked for something to click.
+    pub link: String,
     pub sender: String,
     pub subject: String,
     pub date: String,
@@ -519,6 +528,29 @@ pub fn stopped_short(found: &Listing, limit: usize, _unread_only: bool) -> Optio
     ))
 }
 
+/// A URL that opens one message in Mail.
+///
+/// `message:` is Mail's own scheme and macOS hands it over: LaunchServices on
+/// this Mac lists it against Mail beside `mailto:`. What it takes is the
+/// message's real id in angle brackets, which have to be percent-encoded to
+/// survive being a URL, along with anything else in the id that a URL does not
+/// allow. The at sign is left alone because every message id has one and Mail
+/// is given them that way.
+fn message_link(message_id: &str) -> String {
+    let id = message_id.trim().trim_matches(|c| c == '<' || c == '>');
+    let mut out = String::from("message://%3C");
+    for b in id.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'@' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out.push_str("%3E");
+    out
+}
+
 /// Turn what the script printed into a listing.
 ///
 /// Split from the call for the same reason the script is: nothing in the suite
@@ -563,6 +595,7 @@ fn parse_listing(reply: &str) -> Listing {
         let stamp: i64 = f.next().and_then(|v| v.trim().parse().ok()).unwrap_or(0);
         stamps.push(stamp);
         messages.push(Summary {
+            link: message_link(id.trim()),
             id: locator_id(from_box.trim(), at, id.trim()),
             sender: sender.trim().to_string(),
             subject: subject.trim().to_string(),
@@ -1049,6 +1082,7 @@ fn rehearsal_messages() -> Vec<Summary> {
     vec![
         Summary {
             id: locator_id("", 1, "errand-rehearsal-1@example.invalid"),
+            link: message_link("errand-rehearsal-1@example.invalid"),
             sender: "A Made-Up Sender <nobody@example.invalid>".into(),
             subject: "An invented message, for testing".into(),
             date: "Tuesday 26 August 2026 at 09:00".into(),
@@ -1056,6 +1090,7 @@ fn rehearsal_messages() -> Vec<Summary> {
         },
         Summary {
             id: locator_id("", 2, "errand-rehearsal-2@example.invalid"),
+            link: message_link("errand-rehearsal-2@example.invalid"),
             sender: "Another Made-Up Sender <nobody-else@example.invalid>".into(),
             subject: "A second invented message".into(),
             date: "Tuesday 26 August 2026 at 08:15".into(),
@@ -1201,6 +1236,37 @@ mod tests {
         // Minutes, because AppleScript hands back seconds this large as a real
         // and a real arrives as "1.767E+9", which parses as nothing.
         assert!(script.contains("div 60"), "{script}");
+    }
+
+    #[test]
+    fn every_listed_message_carries_something_a_person_can_click() {
+        // What went wrong: asked to put a link to each message in its answer, a
+        // run had only Errand's own handle to give and printed a page of
+        // "E1.616363743a69436c6f7564...". That is not a link, it is not a
+        // message id either, and it means nothing outside this program.
+        let got = parse_listing(
+            "acct:One\t1\t<abc.def@mail.example>\tsomebody\tA subject\twhenever\t29000000\ta preview\n",
+        );
+        let m = &got.messages[0];
+        assert_eq!(m.link, "message://%3Cabc.def@mail.example%3E");
+        // And the handle is still the handle, unchanged and separate.
+        assert_eq!(
+            parse_locator(&m.id).unwrap().message_id,
+            "<abc.def@mail.example>"
+        );
+    }
+
+    #[test]
+    fn a_link_survives_a_message_id_with_awkward_characters_in_it() {
+        // Angle brackets have to go, a space or a quote cannot travel as
+        // itself, and the at sign is left alone because Mail is given ids that
+        // way and every id has one.
+        assert_eq!(
+            message_link("<a b\"c@example.com>"),
+            "message://%3Ca%20b%22c@example.com%3E"
+        );
+        // Already bare, and it comes back the same either way.
+        assert_eq!(message_link("x@y.z"), message_link("<x@y.z>"));
     }
 
     #[test]

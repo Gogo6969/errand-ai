@@ -468,6 +468,16 @@ export interface Provider {
  * not have yet must not be able to arrive here looking like an answer.
  */
 export interface ListedProvider extends Provider {
+  /**
+   * The name to show, which is the model's name and then where it runs.
+   *
+   * `label` says where: "llama.cpp on 192.168.1.25" names a program and a
+   * machine. Somebody choosing which AI does a task is choosing between models,
+   * and usually has several on the one server, so the model goes first and the
+   * place stays behind it. Composed by the daemon rather than by each screen,
+   * so two screens cannot disagree about what an endpoint is called.
+   */
+  display_name: string;
   /** Whether it will call a tool, which is all that carrying out a task needs. */
   tools: "yes" | "no" | "unknown";
   /** That, as a standing label in plain words. */
@@ -527,6 +537,8 @@ export interface RoleSetup {
   /** Why the model picked for this job cannot do it, when that turns out to be so. */
   chosen_problem: string | null;
   using: {
+    /** Which model, then where it runs. What every screen puts on the page. */
+    display_name: string;
     id: string;
     label: string;
     /** Exactly what Errand asks that endpoint for. */

@@ -236,11 +236,11 @@
                their choice stuck. -->
           <div class="warnbox">
             {r.chosen_problem}
-            {#if r.using}Errand is using {r.using.label} instead.{/if}
+            {#if r.using}Errand is using {r.using.display_name} instead.{/if}
           </div>
         {:else if r.using}
           <div class="using">
-            <span class="pill ok">{r.using.label}</span>
+            <span class="pill ok">{r.using.display_name}</span>
             <!-- The Claude command line tool answers to three models, so naming
                  the provider does not answer "which one is it". Where there is
                  a choice it is made here; where there is not, the model is
@@ -287,7 +287,7 @@
               <option value="">No preference: use whatever works</option>
               {#each setup.providers as p}
                 <option value={p.id} disabled={r.needs_agentic && !!p.cannot_carry_out_because}>
-                  {p.label}{r.needs_agentic ? taskNote(p) : ""}
+                  {p.display_name}{r.needs_agentic ? taskNote(p) : ""}
                 </option>
               {/each}
             </select>
@@ -303,7 +303,7 @@
 
             {#if unchecked.length}
               <div class="muted">
-                Not checked yet: {unchecked.map((p) => p.label).join(", ")}. Errand has not asked
+                Not checked yet: {unchecked.map((p) => p.display_name).join(", ")}. Errand has not asked
                 {unchecked.length === 1 ? "it" : "them"} to use a tool, so it does not know. You can
                 pick {unchecked.length === 1 ? "it" : "one"} anyway.
               </div>
@@ -339,7 +339,7 @@
     <div class="card row">
       <div class="grow">
         <div class="rname">
-          {p.label}
+          {p.display_name}
           <span class="pill {dot(p.health)}">{health(p.health)}</span>
           <Hint id="ai.tools">
             <span class="pill {toolsDot(p)}">{p.tools_says}</span>

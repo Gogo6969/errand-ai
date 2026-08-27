@@ -2757,6 +2757,26 @@ struct AnswerToAQuestion {
 /// This only records the answer. Starting the run is the caller's next call,
 /// because there is exactly one place that knows how to start one properly and
 /// a second copy of it here would be a second thing to get wrong.
+/// The last question this run stopped to ask, if it asked one.
+///
+/// Read from the timeline, which is append-only, so it survives whatever the
+/// run's failure ends up saying. The last one rather than the first: a run that
+/// asked twice is waiting on its most recent question.
+async fn question_it_asked(
+    pool: &errand_core::db::Pool,
+    run_id: &str,
+) -> anyhow::Result<Option<String>> {
+    Ok(errand_core::db::list_steps(pool, run_id)
+        .await?
+        .into_iter()
+        .rev()
+        .find_map(|s| {
+            s.title
+                .strip_prefix(crate::mcp::ASKED_PREFIX)
+                .map(str::to_string)
+        }))
+}
+
 async fn answer_a_question(
     State(state): State<AppState>,
     Extension(caller): Extension<Caller>,
@@ -2773,16 +2793,24 @@ async fn answer_a_question(
         .await
         .map_err(ApiError::from)?
         .ok_or_else(|| ApiError::not_found(format!("No run with id {id}.")))?;
-    let question = run
-        .failure
-        .as_ref()
-        .map(|f| f.plain_reason.clone())
-        .unwrap_or_default();
-    if run.failure.as_ref().map(|f| f.code.as_str()) != Some("needs_answer") {
+
+    // The question comes from the timeline rather than from the failure.
+    //
+    // The failure is not a safe place to keep it. A run that asks something and
+    // trips a ceiling on the same turn ends up carrying the ceiling's failure,
+    // and the question that was there a moment ago is gone, along with any way
+    // to answer it. That happened: a run asked for an account handle, reached
+    // its spending limit, and the question could not be answered afterwards by
+    // any route. The timeline is written once and never rewritten, so a
+    // question asked is a question that stays askable.
+    let question = question_it_asked(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?;
+    let Some(question) = question else {
         return Err(ApiError::bad_request(
             "That run did not stop to ask anything, so there is nothing to answer.",
         ));
-    }
+    };
 
     errand_core::db::set_run_notes(
         state.pool(),
@@ -3112,6 +3140,11 @@ async fn get_ai(
                 "id": p.id,
                 "kind": p.kind,
                 "label": p.label,
+                // The same endpoint said the way somebody picking one reads it:
+                // the model's name, then where it runs. The screens use this;
+                // `label` stays as it was, because it is what a person typed
+                // and what the settings form edits.
+                "display_name": p.display_name(),
                 "base_url": p.base_url,
                 "model": p.model,
                 // The command line tool has no model in its row: it answers to
@@ -3178,6 +3211,15 @@ async fn get_ai(
                     json!({
                         "id": p.id,
                         "label": p.label,
+                        // Which model, then where it runs, the same way the
+                        // list above says it. "Currently llama.cpp on
+                        // 192.168.1.25" answers a question nobody asked: the
+                        // one being answered is which model does the work.
+                        "display_name": if cli {
+                            format!("{} · {}", known.map(|m| m.name).unwrap_or(&model), p.label)
+                        } else {
+                            p.display_name()
+                        },
                         "model": model,
                         "model_name": known.map(|m| m.name),
                         "model_says": known.map(|m| m.what_it_is_for),
@@ -5119,6 +5161,84 @@ mod tests {
             .post("/v1/automation/the-garage-door/enable", json!({}))
             .await;
         assert_eq!(code, 400, "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_question_can_still_be_answered_after_the_run_hit_its_spending_limit() {
+        // Watched happen on a real task. The run asked for an X account handle,
+        // reached its 50 cent ceiling on the same turn, and the ceiling's
+        // failure replaced the question's. What reached the screen was "it
+        // reached a limit", the answer box was gone, and the question could not
+        // be answered by any route afterwards. The question is read from the
+        // timeline now, which nothing rewrites.
+        let api = testkit::start().await;
+        let task = a_task(
+            &api,
+            json!({ "name": "X research", "description": "Show me the trending subjects." }),
+        )
+        .await;
+        let run = errand_core::db::try_create_run(
+            &api.pool,
+            &task,
+            "teach/one",
+            "teach",
+            errand_core::models::RunMode::TEACH,
+            None,
+        )
+        .await
+        .expect("a run");
+
+        errand_core::db::append_step(
+            &api.pool,
+            &run.id,
+            "decide",
+            &format!("{}What is the account handle?", crate::mcp::ASKED_PREFIX),
+            true,
+            None,
+        )
+        .await
+        .expect("the question in the timeline");
+
+        // The ceiling lands afterwards and takes the failure with it.
+        errand_core::db::finish_run_failed_fully(
+            &api.pool,
+            &run.id,
+            "budget_exceeded",
+            "It reached a limit set for this task and was stopped.",
+            Some("Raise the limit if the task genuinely needs more."),
+            None,
+            None,
+        )
+        .await
+        .expect("the run stops on its ceiling");
+
+        let (code, body) = api
+            .post(
+                &format!("/v1/runs/{}/answer", run.id),
+                json!({ "answer": "@someone" }),
+            )
+            .await;
+        assert_eq!(code, 200, "the question was lost with the failure: {body}");
+        assert_eq!(body["answered"], "What is the account handle?");
+
+        // And a run that never asked anything still has nothing to answer.
+        let quiet = errand_core::db::try_create_run(
+            &api.pool,
+            &task,
+            "teach/two",
+            "teach",
+            errand_core::models::RunMode::TEACH,
+            None,
+        )
+        .await
+        .expect("a second run");
+        let (code, _) = api
+            .post(
+                &format!("/v1/runs/{}/answer", quiet.id),
+                json!({ "answer": "unasked for" }),
+            )
+            .await;
+        assert_eq!(code, 400);
     }
 
     #[tokio::test]

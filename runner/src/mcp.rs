@@ -515,6 +515,16 @@ pub(crate) fn tool_definitions() -> Value {
 /// The tools that only exist for a task that was granted the mail.
 const MAIL_TOOLS: &[&str] = &["list_mail", "read_mail", "file_mail"];
 
+/// How a question the run stopped to ask is written into the timeline.
+///
+/// Shared with the route that takes the answer, because that is where the
+/// question is looked up. It used to be read off the run's failure, which the
+/// run then lost: a question asked on the same turn that tripped a ceiling was
+/// overwritten by the ceiling, and an unanswerable question is worse than none.
+/// The timeline is the one place it cannot be overwritten, so that is where the
+/// answer route now reads it from.
+pub const ASKED_PREFIX: &str = "Stopped to ask: ";
+
 /// The tools this one run may actually call.
 ///
 /// A tool a task cannot use is better absent than present-and-refused. A model
@@ -927,7 +937,7 @@ pub(crate) async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &
                 state,
                 run_id,
                 "decide",
-                &format!("Stopped to ask: {question}"),
+                &format!("{ASKED_PREFIX}{question}"),
                 true,
             )
             .await;

@@ -312,6 +312,34 @@ pub struct Provider {
 }
 
 impl Provider {
+    /// The name to put on screen, which is the model's name first.
+    ///
+    /// The label alone says where a model runs and not which model it is:
+    /// "llama.cpp on 192.168.1.25" names a program and a machine, and somebody
+    /// choosing which AI does a task is choosing between Qwen and Llama, not
+    /// between two IP addresses. They usually have one server and several
+    /// models on it, so the label is the half that does not vary.
+    ///
+    /// Where it runs still matters, and is kept: on a screen that also offers a
+    /// hosted service, "on this machine" is the difference between the mail
+    /// being read here and being read somewhere else. So it is both, in the
+    /// order somebody reads them.
+    ///
+    /// Falls back to the label for an endpoint with no model of its own, which
+    /// is the command line tool: it answers to three models, one per job, and
+    /// `claude_models_summary` is what says which.
+    pub fn display_name(&self) -> String {
+        match self
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            Some(model) if model != self.label => format!("{model} · {}", self.label),
+            _ => self.label.clone(),
+        }
+    }
+
     pub fn kind_enum(&self) -> Option<Kind> {
         Kind::parse(&self.kind)
     }
@@ -1014,6 +1042,58 @@ pub fn parse_base_url(s: &str) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_model_is_named_by_its_model_and_then_by_where_it_runs() {
+        // What the screen said was "llama.cpp on 192.168.1.25", which names a
+        // program and a machine and not the thing being chosen. Somebody picking
+        // which AI does a task is picking between models, and usually keeps
+        // several on the one server.
+        let mut server = p(
+            "x",
+            Kind::OpenAiCompat,
+            Some("http://192.168.1.25:8081/v1"),
+            true,
+        );
+        server.label = "llama.cpp on 192.168.1.25".into();
+        server.model = Some("Qwen3.8-27B-Q4_K_M".into());
+        assert_eq!(
+            server.display_name(),
+            "Qwen3.8-27B-Q4_K_M · llama.cpp on 192.168.1.25",
+            "the model comes first and the machine stays behind it"
+        );
+    }
+
+    #[test]
+    fn an_endpoint_with_no_model_of_its_own_keeps_the_name_it_had() {
+        // The command line tool answers to three models, one per job, so its
+        // row has no model and there is nothing to put in front.
+        let mut cli = p("c", Kind::ClaudeCli, None, true);
+        cli.label = "Claude (command line tool)".into();
+        assert_eq!(cli.display_name(), "Claude (command line tool)");
+
+        // And a label somebody typed as the model's name is not said twice.
+        let mut same = p(
+            "s",
+            Kind::OpenAiCompat,
+            Some("http://127.0.0.1:1234/v1"),
+            true,
+        );
+        same.label = "Qwen3-8B".into();
+        same.model = Some("Qwen3-8B".into());
+        assert_eq!(same.display_name(), "Qwen3-8B");
+
+        // Nor is an empty model allowed to leave a dangling separator.
+        let mut blank = p(
+            "b",
+            Kind::OpenAiCompat,
+            Some("http://127.0.0.1:1234/v1"),
+            true,
+        );
+        blank.label = "Ollama on this machine".into();
+        blank.model = Some("   ".into());
+        assert_eq!(blank.display_name(), "Ollama on this machine");
+    }
 
     fn p(id: &str, kind: Kind, url: Option<&str>, enabled: bool) -> Provider {
         Provider {

@@ -81,7 +81,7 @@
   // list of models nobody could fill in would be worse than not offering one.
   let ai = $state<AiSetup | null>(null);
   const executorRole = $derived(ai?.roles.find((r) => r.role === "executor") ?? null);
-  const defaultModel = $derived(executorRole?.using?.label ?? null);
+  const defaultModel = $derived(executorRole?.using?.display_name ?? null);
   // The model this task names, when it names one that is still in the list.
   const taskModel = $derived(
     ai?.providers.find((p) => p.id === task?.model_id) ?? null,
@@ -790,7 +790,7 @@
                  switched off can still be picked, the same as on the AI screen:
                  it is a model you have, not one that cannot do the job. -->
             <option value={p.id} disabled={!!p.cannot_carry_out_because}>
-              {p.label}{modelNote(p)}
+              {p.display_name}{modelNote(p)}
             </option>
           {/each}
         </select>
@@ -804,7 +804,7 @@
           This task asks for a model that is no longer in Errand's list, so it runs on the
           default until you pick another one.
         {:else if taskModel}
-          This task uses {taskModel.label}, whatever the AI screen is set to.
+          This task uses {taskModel.display_name}, whatever the AI screen is set to.
         {:else if defaultModel}
           This task follows the AI screen, which is set to {defaultModel}. Choosing one here
           changes it for this task only.

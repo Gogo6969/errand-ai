@@ -812,18 +812,57 @@ pub async fn run_to_completion(state: AppState, run_id: String) {
 
         // A run that spent more than it was allowed stops here, whatever it was
         // in the middle of, and says which ceiling it hit.
+        //
+        // Except when the thing it was in the middle of was asking a question.
+        // A question is the one failure with something for the person to do,
+        // and it was being thrown away: the run asked, tripped the ceiling on
+        // the same turn, and what reached the screen was "it reached a limit",
+        // with the question nowhere and the answer box gone with it. So the
+        // question is kept and the ceiling is said underneath it, since both
+        // are true and only one of them can be acted on.
         if let Some(breach) = over_budget(&state, &run_id, &limits).await {
-            finish_failed_fully(
-                &state,
-                &run_id,
-                &task_id,
-                "budget_exceeded",
-                "It reached a limit set for this task and was stopped.",
-                Some(&breach.explain(&limits)),
-                None,
-                None,
-            )
-            .await;
+            let asked = match &outcome {
+                Ok(crate::mcp::Outcome::Failed {
+                    code, problem, fix, ..
+                }) if code == "needs_answer" => Some((problem.clone(), fix.clone())),
+                _ => None,
+            };
+            match asked {
+                Some((question, fix)) => {
+                    let ceiling = breach.explain(&limits);
+                    let fix = match fix {
+                        Some(f) => format!("{f} It also {}", lower_first(&ceiling)),
+                        None => format!(
+                            "Answer the question on this task and run it again. It also {}",
+                            lower_first(&ceiling)
+                        ),
+                    };
+                    finish_failed_fully(
+                        &state,
+                        &run_id,
+                        &task_id,
+                        "needs_answer",
+                        &question,
+                        Some(&fix),
+                        None,
+                        None,
+                    )
+                    .await;
+                }
+                None => {
+                    finish_failed_fully(
+                        &state,
+                        &run_id,
+                        &task_id,
+                        "budget_exceeded",
+                        "It reached a limit set for this task and was stopped.",
+                        Some(&breach.explain(&limits)),
+                        None,
+                        None,
+                    )
+                    .await;
+                }
+            }
             break;
         }
 
@@ -1047,6 +1086,18 @@ pub async fn run_to_completion(state: AppState, run_id: String) {
 /// One line for what stopped it, one for what to do, and the rest of the
 /// arguments for the two cases that have more. Grouped rather than passed
 /// separately at seven call sites, most of which have nothing to add.
+/// Join a sentence onto the end of another one.
+///
+/// The ceiling's own explanation starts with a capital because it is normally
+/// the whole message. Behind a question it is the second half of one.
+fn lower_first(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(f) => f.to_lowercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn finish_failed_fully(
     state: &AppState,

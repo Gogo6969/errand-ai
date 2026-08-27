@@ -535,18 +535,14 @@
   <div class="card">
     {#if editing === c.id}
       <strong>Change this login</strong>
-      <label for={`el-${c.id}`}>What is it for?</label>
-      <input id={`el-${c.id}`} bind:value={eLabel} />
-      <label for={`eu-${c.id}`}>Username</label>
-      <input id={`eu-${c.id}`} bind:value={eUsername} />
-      <label for={`es-${c.id}`}>New password</label>
+      <label for="el">What is it for?</label>
+      <input id="el" bind:value={eLabel} />
+      <label for="eu">Username</label>
+      <input id="eu" bind:value={eUsername} />
+      <label for="es">New password</label>
       <div class="secretrow">
-        <input
-          id={`es-${c.id}`}
-          type={showESecret ? "text" : "password"}
-          bind:value={eSecret}
-          placeholder="Leave empty to keep the saved one"
-        />
+        <input id="es" type={showESecret ? "text" : "password"} bind:value={eSecret}
+          placeholder="Leave empty to keep the saved one" />
         <Hint id="cred.reveal">
           <button
             type="button"

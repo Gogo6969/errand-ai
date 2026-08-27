@@ -120,6 +120,13 @@ export const hints = {
       "The answer is kept on the run that asked, so the question and what you said sit together, " +
       "and the next run is given it. Never type a password or a card number here.",
   },
+  "task.remove": {
+    short: "Stops this task for good and takes it off the list.",
+    long:
+      "What it did is kept, including the record that stops a later run repeating anything it " +
+      "booked or bought. A task that never ran has nothing worth keeping, and can be removed " +
+      "completely instead.",
+  },
   "task.settings": {
     short: "How this task works: when it runs, what it may open, which AI, who it tells.",
     long:

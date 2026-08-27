@@ -2025,6 +2025,106 @@ pub async fn recent_commit_of_any_scope(
     }
 }
 
+/// Put a task away: gone from the list, never runs again, history kept.
+///
+/// The default way to get rid of one, and not the same as deleting it. A task
+/// that has booked, bought or filed something leaves rows in the side-effect
+/// record, and those rows are what stop a future run doing the same thing
+/// twice. Throwing them away to tidy a list is throwing away the evidence.
+///
+/// Reversible by hand, because "I did not mean that one" is a thing people say.
+pub async fn archive_task(pool: &Pool, task_id: &str) -> Result<bool> {
+    let res = sqlx::query(
+        "UPDATE tasks SET status = 'archived', updated_at = ? WHERE id = ? AND status <> 'archived'",
+    )
+    .bind(crate::now_iso())
+    .bind(task_id)
+    .execute(pool)
+    .await?;
+    Ok(res.rows_affected() > 0)
+}
+
+/// Really remove a task and everything it left behind.
+///
+/// For a task that never should have existed: a test, a mistake, a duplicate.
+/// Says how many runs went with it, because that is the number somebody wants
+/// to have been told before it is gone rather than after.
+///
+/// Refuses while a run is in flight. Deleting the row under a running agent
+/// leaves it writing steps to a task that is not there.
+pub async fn forget_task(pool: &Pool, task_id: &str) -> Result<i64> {
+    if busy_run_for_task(pool, task_id).await?.is_some() {
+        anyhow::bail!(
+            "That task is running right now. Wait for it to finish, or stop it, then remove it."
+        );
+    }
+    let runs: i64 = sqlx::query("SELECT COUNT(*) AS n FROM runs WHERE task_id = ?")
+        .bind(task_id)
+        .fetch_one(pool)
+        .await?
+        .try_get("n")?;
+
+    // In one transaction, so a half-removed task cannot be left behind: rows
+    // pointing at a task that no longer exists are worse than the task was.
+    let mut tx = pool.begin().await?;
+    // Written out rather than looped: sqlx refuses a SQL string built at
+    // runtime, which is the right refusal, and naming each table here means a
+    // table that gets renamed breaks the build instead of quietly leaving rows
+    // behind that point at a task which is gone.
+    sqlx::query(
+        "DELETE FROM run_steps WHERE run_id IN (SELECT id FROM runs WHERE task_id = ?)",
+    )
+    .bind(task_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM run_artifacts WHERE run_id IN (SELECT id FROM runs WHERE task_id = ?)",
+    )
+    .bind(task_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query(
+        "DELETE FROM run_answer_copies WHERE run_id IN (SELECT id FROM runs WHERE task_id = ?)",
+    )
+    .bind(task_id)
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("DELETE FROM side_effects WHERE task_id = ?")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM playbook_versions WHERE task_id = ?")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM task_recipients WHERE task_id = ?")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM task_mail_grants WHERE task_id = ?")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM task_credentials WHERE task_id = ?")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM msg_outbox WHERE task_id = ?")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM runs WHERE task_id = ?")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM tasks WHERE id = ?")
+        .bind(task_id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(runs)
+}
+
 /// Let a task run itself again, after a run of it worked.
 ///
 /// Only ever clears a pause Errand set for itself. A pause somebody set by hand

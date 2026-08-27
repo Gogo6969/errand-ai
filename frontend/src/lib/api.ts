@@ -263,6 +263,17 @@ export const api = {
   /** Show the person a copy of an answer where the run also put it. */
   openAnswerCopy: (id: string) => call("POST", `/v1/answer-copies/${id}/open`),
   /** Answer the question a run stopped to ask. Run the task again afterwards. */
+  /**
+   * Get rid of a task. By default it is put away: it stops for good and what
+   * it did is kept, because the record of a booking is what stops a later run
+   * making the same one twice. `forget` removes that too, for a task that
+   * should never have existed.
+   */
+  removeTask: (id: string, forget = false) =>
+    call<{ archived?: string; forgotten?: string; runs_removed?: number }>(
+      "DELETE",
+      `/v1/tasks/${id}${forget ? "?forget=true" : ""}`,
+    ),
   answerQuestion: (runId: string, answer: string) =>
     call<{ answered: string; task_id: string }>("POST", `/v1/runs/${runId}/answer`, { answer }),
 

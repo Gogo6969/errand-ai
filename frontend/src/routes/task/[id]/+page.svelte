@@ -287,6 +287,33 @@
     });
   }
 
+  /// Put this task away, or forget it entirely.
+  ///
+  /// Asked as one question with two answers rather than a checkbox, because
+  /// the difference matters and is easy to skip past: putting it away keeps
+  /// the record of anything it booked or bought, and that record is what stops
+  /// a later run doing it twice.
+  async function removeThis() {
+    if (!task) return;
+    const everRan = runs.length > 0;
+    const away = confirm(
+      `Stop "${task.name}" for good?\n\n` +
+        (everRan
+          ? "What it did is kept, including the record that stops a later run repeating anything it booked or bought."
+          : "It never ran, so there is nothing to keep."),
+    );
+    if (!away) return;
+    // Only offered for a task with nothing worth keeping, so the destructive
+    // answer is never the easy one to give by accident.
+    const forget =
+      !everRan &&
+      confirm(`Remove "${task.name}" completely, rather than putting it away?`);
+    await act(async () => {
+      await api.removeTask(id, forget);
+      location.href = "/";
+    });
+  }
+
   function startEditingDirective() {
     draftDirective = task?.description ?? "";
     editingDirective = true;
@@ -544,6 +571,9 @@
         </button>
       </Hint>
     {/if}
+    <Hint id="task.remove">
+      <button disabled={busy} onclick={removeThis}>Get rid of it</button>
+    </Hint>
     {#if task.status === "paused"}
       <Hint id="task.resume">
         <button disabled={busy} onclick={() => act(() => api.resume(id))}>Resume</button>

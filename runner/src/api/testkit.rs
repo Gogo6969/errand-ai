@@ -94,6 +94,13 @@ impl Api {
         self.as_token(&admin, Method::GET, path, None, None).await.1
     }
 
+    /// The same, keeping the status code, for asking whether something is
+    /// there at all rather than what it says.
+    pub async fn get_status(&self, path: &str) -> (u16, Value) {
+        let admin = self.admin.clone();
+        self.as_token(&admin, Method::GET, path, None, None).await
+    }
+
     pub async fn post(&self, path: &str, body: Value) -> (u16, Value) {
         let admin = self.admin.clone();
         self.as_token(&admin, Method::POST, path, Some(body), None)

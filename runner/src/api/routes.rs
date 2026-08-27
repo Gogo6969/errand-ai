@@ -28,7 +28,10 @@ pub fn router(state: AppState) -> Router {
     let private = Router::new()
         .route("/v1/health/detail", get(health_detail))
         .route("/v1/tasks", get(list_tasks).post(create_task))
-        .route("/v1/tasks/{id}", get(get_task).patch(patch_task))
+        .route(
+            "/v1/tasks/{id}",
+            get(get_task).patch(patch_task).delete(remove_task),
+        )
         .route("/v1/schedule/preview", post(preview_schedule))
         .route("/v1/tasks/{id}/activate", post(activate_task))
         .route("/v1/tasks/{id}/teach", post(teach_task))
@@ -2668,6 +2671,61 @@ async fn get_run(
 }
 
 #[derive(Deserialize)]
+struct HowToRemove {
+    /// Really delete it, rather than putting it away. Off by default.
+    #[serde(default)]
+    forget: bool,
+}
+
+/// Get rid of a task.
+///
+/// Two different things, and the difference is worth a query parameter rather
+/// than a guess. Putting a task away stops it for good and keeps what it did:
+/// a task that has booked or bought something leaves rows in the side-effect
+/// record, and those rows are what stop a later run doing the same thing twice.
+/// Forgetting it removes those too, which is right for a test or a mistake and
+/// wrong for anything that ever touched the world.
+async fn remove_task(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Query(how): Query<HowToRemove>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require(&caller, Scope::Manage)?;
+    let task = errand_core::db::get_task(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found(format!("No task with id {id}.")))?;
+
+    if how.forget {
+        let runs = errand_core::db::forget_task(state.pool(), &id)
+            .await
+            .map_err(|e| ApiError::conflict("task_busy", e.to_string()))?;
+        state.emit(Event::TaskUpdated {
+            task_id: id.clone(),
+        });
+        return Ok(Json(json!({
+            "forgotten": task.name,
+            "runs_removed": runs,
+            "note": "Gone, along with everything it did. Nothing is kept.",
+        })));
+    }
+
+    let changed = errand_core::db::archive_task(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?;
+    state.emit(Event::TaskUpdated {
+        task_id: id.clone(),
+    });
+    Ok(Json(json!({
+        "archived": task.name,
+        "changed": changed,
+        "note": "Put away. It will not run again, and what it did is kept. \
+                 Add ?forget=true to remove it and its history for good.",
+    })))
+}
+
+#[derive(Deserialize)]
 struct AnswerToAQuestion {
     answer: String,
 }
@@ -4509,6 +4567,66 @@ mod tests {
     }
 
     // ------------------------------------------------------ reading a plan --
+
+    #[tokio::test]
+    async fn a_task_can_be_put_away_and_stays_away() {
+        let api = testkit::start().await;
+        let id = a_ready_manual_task(&api).await;
+
+        let (code, body) = api.delete(&format!("/v1/tasks/{id}")).await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(
+            api.get(&format!("/v1/tasks/{id}")).await["status"],
+            "archived",
+            "it should be put away, not merely hidden"
+        );
+        // Gone from the list a person looks at, still there when they ask.
+        let listed = api.get("/v1/tasks").await["items"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .any(|t| t["id"] == json!(id));
+        assert!(!listed, "an archived task is still on the list");
+        let with_archived = api.get("/v1/tasks?include_archived=true").await["items"]
+            .as_array()
+            .expect("a list")
+            .iter()
+            .any(|t| t["id"] == json!(id));
+        assert!(with_archived, "it should still be findable when asked for");
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_task_takes_its_history_with_it() {
+        // The difference that earns the extra word in the URL. Putting a task
+        // away keeps the side-effect record, which is what stops a later run
+        // booking the same thing twice. Forgetting it throws that away, which
+        // is right for a test and wrong for anything that touched the world.
+        let api = testkit::start().await;
+        // a_ready_manual_task already leaves the one successful run that
+        // stands as proof the task works, which is the history being tested.
+        let id = a_ready_manual_task(&api).await;
+        assert_eq!(
+            api.get(&format!("/v1/runs?task_id={id}")).await["items"]
+                .as_array()
+                .expect("a list")
+                .len(),
+            1
+        );
+
+        let (code, body) = api.delete(&format!("/v1/tasks/{id}?forget=true")).await;
+        assert_eq!(code, 200, "{body}");
+        assert_eq!(body["runs_removed"], 1, "{body}");
+
+        let (code, _) = api.get_status(&format!("/v1/tasks/{id}")).await;
+        assert_eq!(code, 404, "a forgotten task is still there");
+        assert!(
+            api.get(&format!("/v1/runs?task_id={id}")).await["items"]
+                .as_array()
+                .expect("a list")
+                .is_empty(),
+            "its runs outlived it"
+        );
+    }
 
     #[tokio::test]
     async fn a_plan_can_be_read_before_it_is_approved() {

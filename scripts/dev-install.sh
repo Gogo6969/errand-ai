@@ -31,6 +31,15 @@ PROFILE="${1:-release}"
 
 echo "Building ($PROFILE)"
 if [ "$PROFILE" = "release" ]; then
+  # The daemon first, and staged before anything else is built.
+  #
+  # The app crate's build script requires app/binaries/errandd-<triple> to
+  # already exist, and that file is a build artefact nobody checks in. So in a
+  # fresh clone or a new worktree, a plain workspace build fails on the app
+  # before it ever reaches the staging step further down that would have made
+  # the file. The daemon is what this script is here to install anyway, so it
+  # is built and staged first and the rest of the workspace follows.
+  ./scripts/stage-daemon.sh
   cargo build --release -q
   SRC="target/release/errandd"
 else
@@ -46,8 +55,13 @@ fi
 # Installing that is a genuinely confusing failure -- an older binary knows
 # fewer migrations, so the daemon dies with "migration 5 was previously applied
 # but is missing", which reads like a corrupt database rather than a stale copy.
-NEWEST=$(find core runner app/src-tauri -name '*.rs' -o -name '*.sql' 2>/dev/null \
-  | xargs ls -t 2>/dev/null | head -1)
+# app/src, not app/src-tauri: the tauri crate lives at app/ in this repo, and
+# with pipefail a find over a directory that is not there fails the assignment
+# and set -e ends the script on the spot, silently, having printed nothing
+# since the last echo. Two people have now watched this exit 1 with no reason
+# given, so the path is the one that exists and the failure is not swallowed.
+NEWEST=$(find core runner app/src -name '*.rs' -o -name '*.sql' \
+  | xargs ls -t | head -1)
 if [ -n "$NEWEST" ] && [ "$SRC" -ot "$NEWEST" ]; then
   echo "Refusing to install: $SRC is older than $NEWEST." >&2
   echo "  cargo reported success but did not rewrite the binary." >&2

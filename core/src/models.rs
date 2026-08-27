@@ -186,6 +186,11 @@ pub enum FailureCode {
     Network,
     BudgetExceeded,
     NeedsHumanDecision,
+    /// The run stopped to ask the person something it could not work out and
+    /// must not guess: a phone number, which of two accounts, a size. Not a
+    /// fault, and worth its own code so the screen can offer a box to answer in
+    /// rather than a page about what went wrong.
+    NeedsAnswer,
     ProviderError,
     /// The agent was offered tools it must not have. Terminal and auto-pausing:
     /// retrying an unsafe spawn is worse than not running at all.
@@ -216,6 +221,7 @@ impl FailureCode {
             | Self::CaptchaOr2faNeeded
             | Self::BudgetExceeded
             | Self::NeedsHumanDecision
+            | Self::NeedsAnswer
             | Self::ContainmentBreach
             | Self::CrashDuringSideEffect => RetryClass::Terminal,
             Self::MissedWindow

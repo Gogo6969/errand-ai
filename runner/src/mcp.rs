@@ -107,6 +107,30 @@ pub(crate) fn tool_definitions() -> Value {
             }
         },
         {
+            "name": "ask_you",
+            "description":
+                "Stop and ask the person one question, when the job needs something only they \
+                 know and guessing would be worse than waiting: whose phone number, which of two \
+                 accounts, what size. They see the question on the task and type an answer, and \
+                 the next run is given it. Ask for exactly one thing, in one sentence, the way \
+                 you would ask somebody standing next to you. Do not use this for something you \
+                 could find out yourself, and never for a password or a card number: those are \
+                 never typed into an answer box.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "question": {
+                        "type": "string",
+                        "description":
+                            "The one thing you need, in one sentence. Say why you need it if \
+                             that is not obvious."
+                    }
+                },
+                "required": ["question"],
+                "additionalProperties": false
+            }
+        },
+        {
             "name": "fail",
             "description":
                 "Stop the run because you cannot complete it. Never guess your way past a \
@@ -179,7 +203,10 @@ pub(crate) fn tool_definitions() -> Value {
                  Anything that cannot be undone, such as booking, paying, sending or deleting, \
                  is checked against a safety record first: this run's slot may commit each such \
                  action only once ever, so if you are told it is already done, do not try again \
-                 and do not look for another way round it.",
+                 and do not look for another way round it. Anything that PAYS also needs \
+                 'amount_usd': read the total off the page first and pass it, in dollars. A task \
+                 may only spend money if somebody has given it a spending limit, and it is the \
+                 most it may spend across the whole run.",
             "inputSchema": {
                 "type": "object",
                 "properties": {
@@ -187,7 +214,15 @@ pub(crate) fn tool_definitions() -> Value {
                     "ref": { "type": "string", "description": "A ref from the last snapshot, e.g. e7." },
                     "text": { "type": "string" },
                     "value": { "type": "string" },
-                    "key": { "type": "string" }
+                    "key": { "type": "string" },
+                    "amount_usd": {
+                        "type": "number",
+                        "description":
+                            "What this will cost, in dollars, exactly as the page shows the \
+                             total. Required before clicking anything that pays. If the page \
+                             does not show a total, do not click: say you could not tell what \
+                             it would cost."
+                    }
                 },
                 "required": ["kind"], "additionalProperties": false
             }
@@ -513,6 +548,7 @@ pub fn qualified_tool_names() -> Vec<String> {
         "journal",
         "finish",
         "fail",
+        "ask_you",
         "open_browser",
         "navigate",
         "snapshot",
@@ -873,6 +909,39 @@ pub(crate) async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &
             text_result("run recorded as finished")
         }
 
+        "ask_you" => {
+            let question = args
+                .get("question")
+                .and_then(|q| q.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if question.is_empty() {
+                return text_error("ask_you needs a 'question': the one thing you need to know.");
+            }
+            let question = state.redactor(run_id).scrub(&question);
+            let _ = journal(
+                state,
+                run_id,
+                "decide",
+                &format!("Stopped to ask: {question}"),
+                true,
+            )
+            .await;
+            state.set_outcome(
+                run_id,
+                Outcome::Failed {
+                    code: "needs_answer".into(),
+                    problem: question,
+                    // Nothing to add: the question is the thing to do, and the
+                    // screen puts a box under it.
+                    fix: None,
+                    answer: None,
+                },
+            );
+            text_result("asked, and the run has stopped until they answer")
+        }
+
         "fail" => {
             let get = |k: &str| {
                 args.get(k)
@@ -1035,6 +1104,27 @@ pub(crate) async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &
                 }
             }
 
+            // Money is asked about before the fence, because the two answer
+            // different questions and this is the one that can say no outright.
+            let mut spending: Option<f64> = None;
+            if action_kind == Some("purchase") {
+                let task_id = match errand_core::db::get_run(state.pool(), run_id).await {
+                    Ok(Some(r)) => r.task_id,
+                    _ => String::new(),
+                };
+                let amount = args.get("amount_usd").and_then(|a| a.as_f64());
+                match may_spend(state, run_id, &task_id, amount).await {
+                    Ok(Ok(a)) => spending = Some(a),
+                    Ok(Err(msg)) => {
+                        let _ = journal(state, run_id, "decide", &msg, false).await;
+                        return text_error(msg);
+                    }
+                    Err(e) => {
+                        return text_error(format!("Could not check the spending limit: {e}"))
+                    }
+                }
+            }
+
             let mut fence_id: Option<String> = None;
             if let Some(action_kind) = action_kind {
                 match guard_irreversible(state, run_id, action_kind).await {
@@ -1064,12 +1154,19 @@ pub(crate) async fn dispatch(state: &AppState, run_id: &str, name: &str, args: &
                         // Commit with evidence, so a later attempt is told what
                         // already happened rather than merely being refused.
                         let url = b.snapshot().await.map(|s| s.url).unwrap_or_default();
-                        let evidence = json!({
+                        let mut evidence = json!({
                             "action": action_kind,
                             "label": label,
                             "url": url,
                             "at": errand_core::now_iso(),
                         });
+                        // What it cost, on the record, because the ceiling for
+                        // the rest of this run is read back out of these rows.
+                        // A purchase whose amount is missing here would let the
+                        // next one spend the whole limit again.
+                        if let Some(a) = spending {
+                            evidence["amount_usd"] = json!(a);
+                        }
                         let _ = errand_core::db::commit_side_effect(
                             state.pool(),
                             &id,
@@ -2299,10 +2396,19 @@ async fn list_recipients(state: &AppState, run_id: &str) -> anyhow::Result<Strin
         .ok_or_else(|| anyhow::anyhow!("run not found"))?;
     let people = errand_core::db::recipients_for_task(state.pool(), &run.task_id).await?;
     if people.is_empty() {
+        // Not something ask_you can fix. Who a task may write to is a
+        // permission, and a permission is granted by a person on the settings
+        // for the task, never by typing an answer into a box. So the words here
+        // have to name the place, because they end up in the failure a person
+        // reads.
         anyhow::bail!(
             "This task has nobody it is allowed to write to, so no message can be sent from it \
-             at all. If somebody is meant to hear how this went, the person who set the task up \
-             has to add them to it first. Carry on with the rest of the job."
+             at all. Do not ask for the address: an address cannot be typed in anywhere, and \
+             asking for one is asking somebody to hand you a permission. If sending a message \
+             is the job, stop and say exactly this: the person has to be added under the gear \
+             on this task, in 'Who it tells when it is done', before it can write to anybody. \
+             If the message was only meant to report how it went, carry on with the rest of the \
+             job without it."
         );
     }
     let mut out = String::from("People this task may write to:\n");
@@ -2902,6 +3008,58 @@ pub(crate) async fn messaged_moments_ago(
 }
 
 /// Ask the fence whether this run may do something irreversible.
+/// Whether this run may commit this much real money.
+///
+/// Separate from the fence, and asked first, because the two answer different
+/// questions: the fence asks "has this already been done", and this asks "is
+/// this allowed at all". A task with no spending limit has not been given
+/// permission to spend, so the answer is no and stays no until somebody writes
+/// down a number.
+///
+/// An amount that cannot be read is a refusal, never a zero. The whole point is
+/// that the agent has to have read the total off the page before it presses the
+/// button that pays, and "I could not tell" is exactly the state in which it
+/// must not press it.
+async fn may_spend(
+    state: &AppState,
+    run_id: &str,
+    task_id: &str,
+    amount: Option<f64>,
+) -> anyhow::Result<Result<f64, String>> {
+    let limits = errand_core::db::get_task(state.pool(), task_id)
+        .await?
+        .map(|t| errand_core::limits::Limits::from_json(&t.limits))
+        .unwrap_or_default();
+    let cap = limits.max_spend_usd;
+
+    if cap <= 0.0 {
+        return Ok(Err(
+            "This task is not allowed to spend money. Nothing was bought. Do not look for \
+             another way to pay: somebody has to give the task a spending limit first, under \
+             the gear on its page. Say that plainly and stop."
+                .into(),
+        ));
+    }
+    let Some(amount) = amount.filter(|a| a.is_finite() && *a >= 0.0) else {
+        return Ok(Err(
+            "Say what this will cost before pressing anything that pays. Read the total off the \
+             page and pass it as 'amount_usd', in dollars. If the page does not show a total, \
+             do not press the button: report that you could not tell what it would cost."
+                .into(),
+        ));
+    };
+    let already = errand_core::db::spent_so_far(state.pool(), run_id).await?;
+    let total = already + amount;
+    if total > cap {
+        return Ok(Err(format!(
+            "That would spend ${total:.2} on this run, and the limit is ${cap:.2}. Nothing was \
+             bought. Do not split it into smaller payments. Report what it would have cost and \
+             stop."
+        )));
+    }
+    Ok(Ok(amount))
+}
+
 async fn guard_irreversible(
     state: &AppState,
     run_id: &str,
@@ -3869,8 +4027,15 @@ mod tests {
             "an empty list must be a refusal, not a blank list"
         );
         assert!(
-            text.contains("has to add them to it first"),
-            "it must name what the person has to do: {text}"
+            text.contains("Who it tells when it is done") && text.contains("under the gear"),
+            "it must name the exact place a person goes to fix it: {text}"
+        );
+        // And rule out the thing a model reaches for instead, which is to ask
+        // for the phone number. An address cannot be typed in anywhere, and
+        // asking for one is asking somebody to hand over a permission.
+        assert!(
+            text.contains("Do not ask for the address"),
+            "it must stop the agent asking for a number instead: {text}"
         );
     }
 
@@ -4387,6 +4552,139 @@ mod tests {
         assert!(is_error, "{text}");
         assert!(!text.contains("press Enable"), "{text}");
         assert!(!text.contains("do not try it again"), "{text}");
+    }
+
+    #[test]
+    fn the_two_lists_of_tools_say_the_same_thing() {
+        // There are two: the schemas the agent is offered, and the names the
+        // Claude command line tool is allowed to call. A tool added to one and
+        // not the other either cannot be called at all or, worse, is offered
+        // and then refused by containment in the middle of a run. This was
+        // written after adding ask_you to the first and forgetting the second.
+        let defs = tool_definitions();
+        let offered: std::collections::BTreeSet<String> = defs
+            .as_array()
+            .expect("the tool list is an array")
+            .iter()
+            .filter_map(|t| t["name"].as_str().map(|n| n.to_string()))
+            .collect();
+        let allowed: std::collections::BTreeSet<String> = qualified_tool_names()
+            .iter()
+            .filter_map(|q| q.strip_prefix("mcp__errand__").map(str::to_string))
+            .collect();
+        assert_eq!(
+            offered, allowed,
+            "the tools offered and the tools allowed have drifted apart"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_task_with_no_spending_limit_cannot_buy_anything() {
+        // The default is zero and zero means no. Every other limit is a
+        // ceiling on something a task does anyway; this one is a permission,
+        // so a task nobody has given a number to has not been given one.
+        nothing_touches_the_real_mac();
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
+        let task_id = errand.task_id.clone();
+
+        let verdict = may_spend(&errand.api.state, &errand.run.id, &task_id, Some(9.99))
+            .await
+            .expect("the limit could be read");
+        let refusal = verdict.expect_err("a task with no limit bought something");
+        assert!(
+            refusal.contains("not allowed to spend money") && refusal.contains("spending limit"),
+            "the refusal has to say what is missing and where: {refusal}"
+        );
+    }
+
+    #[tokio::test]
+    async fn buying_without_saying_what_it_costs_is_refused() {
+        // The point of the number is that it was read off the page before the
+        // button was pressed. "I could not tell" is exactly the state in which
+        // it must not press.
+        nothing_touches_the_real_mac();
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
+        let task_id = errand.task_id.clone();
+        errand
+            .api
+            .patch(
+                &format!("/v1/tasks/{task_id}"),
+                json!({ "limits": { "max_spend_usd": 50.0 } }),
+            )
+            .await;
+
+        for amount in [None, Some(f64::NAN), Some(-1.0)] {
+            let v = may_spend(&errand.api.state, &errand.run.id, &task_id, amount)
+                .await
+                .expect("readable");
+            let refusal = v.expect_err("{amount:?} was accepted as a price");
+            assert!(
+                refusal.contains("amount_usd"),
+                "it has to say how to say the price: {refusal}"
+            );
+        }
+        // And a real number, under the limit, goes through.
+        let ok = may_spend(&errand.api.state, &errand.run.id, &task_id, Some(24.90))
+            .await
+            .expect("readable");
+        assert_eq!(ok.expect("a priced purchase under the limit"), 24.90);
+    }
+
+    #[tokio::test]
+    async fn the_limit_is_for_the_whole_run_and_cannot_be_split_into_smaller_payments() {
+        nothing_touches_the_real_mac();
+        let errand = an_errand(RunMode::NORMAL, json!({})).await;
+        let task_id = errand.task_id.clone();
+        errand
+            .api
+            .patch(
+                &format!("/v1/tasks/{task_id}"),
+                json!({ "limits": { "max_spend_usd": 30.0 } }),
+            )
+            .await;
+
+        // One purchase that really happened, recorded the way the click path
+        // records one.
+        let fence = match errand_core::db::arm_side_effect(
+            &errand.api.pool,
+            &errand.run.id,
+            &task_id,
+            &errand.run.occurrence_id,
+            "purchase",
+            "",
+        )
+        .await
+        .expect("arming")
+        {
+            errand_core::db::FenceVerdict::Armed(id) => id,
+            other => panic!("{other:?}"),
+        };
+        errand_core::db::commit_side_effect(
+            &errand.api.pool,
+            &fence,
+            &json!({ "action": "purchase", "amount_usd": 25.0 }).to_string(),
+        )
+        .await
+        .expect("committing");
+
+        assert_eq!(
+            errand_core::db::spent_so_far(&errand.api.pool, &errand.run.id)
+                .await
+                .expect("the running total"),
+            25.0
+        );
+        let v = may_spend(&errand.api.state, &errand.run.id, &task_id, Some(10.0))
+            .await
+            .expect("readable");
+        let refusal = v.expect_err("a second purchase took the run over its limit");
+        assert!(
+            refusal.contains("$35.00") && refusal.contains("$30.00"),
+            "the refusal has to show both numbers: {refusal}"
+        );
+        assert!(
+            refusal.contains("smaller payments"),
+            "and rule out the obvious workaround: {refusal}"
+        );
     }
 
     #[tokio::test]

@@ -27,6 +27,19 @@ pub struct Limits {
     /// than one that fails.
     #[serde(default = "d_messages")]
     pub max_messages: i64,
+    /// Real money, in dollars, that this task may commit in one run.
+    ///
+    /// Zero by default, and zero means "may not spend anything". Every other
+    /// limit here is a ceiling on something a task does anyway; this one is a
+    /// permission. A task cannot buy so much as a paperclip until somebody has
+    /// written down a number, and the number is the most it may spend on one
+    /// run, not per item.
+    ///
+    /// Deliberately not the same thing as `max_usd`, which is what the models
+    /// cost. Those two numbers have nothing to do with each other and sharing
+    /// one would let a cheap run buy an expensive thing.
+    #[serde(default)]
+    pub max_spend_usd: f64,
 }
 
 fn d_steps() -> i64 {
@@ -62,6 +75,9 @@ impl Default for Limits {
             max_usd: d_usd(),
             max_heal_cycles: d_heal(),
             max_messages: d_messages(),
+            // Not a default anybody chose: a task that has never been given a
+            // spending limit has not been given permission to spend.
+            max_spend_usd: 0.0,
         }
     }
 }

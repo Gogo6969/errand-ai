@@ -1209,6 +1209,33 @@ pub async fn adopt_plan_written_by(
     Ok(Some(version))
 }
 
+/// What this run has already committed to spending, in dollars.
+///
+/// Read back out of the fence's own evidence rather than counted separately,
+/// because the fence is the record of what really happened: a purchase that was
+/// armed and never confirmed is not spending that can be undone by forgetting
+/// it. Anything unparseable counts as nothing, which is the wrong way round for
+/// safety, so the caller must treat an unknown amount as a refusal rather than
+/// as zero.
+pub async fn spent_so_far(pool: &Pool, run_id: &str) -> Result<f64> {
+    let rows = sqlx::query(
+        "SELECT evidence_json FROM side_effects
+         WHERE run_id = ? AND action_kind = 'purchase' AND state = 'committed'",
+    )
+    .bind(run_id)
+    .fetch_all(pool)
+    .await?;
+    let mut total = 0.0;
+    for r in rows {
+        let raw: Option<String> = r.try_get("evidence_json")?;
+        let Some(raw) = raw else { continue };
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(&raw) {
+            total += v.get("amount_usd").and_then(|a| a.as_f64()).unwrap_or(0.0);
+        }
+    }
+    Ok(total)
+}
+
 /// Has this task ever really done the job?
 ///
 /// The evidence that replaced "a person approved a plan" as the thing standing

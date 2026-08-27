@@ -17,6 +17,7 @@
   // Closed by default, which is the whole point: a task is opened to see what
   // it produced, not to be asked eight questions about how it should work.
   let showSettings = $state(false);
+  let draftAnswer = $state("");
   let editingDirective = $state(false);
   let draftDirective = $state("");
   let busy = $state(false);
@@ -28,7 +29,13 @@
   let editingSites = $state(false);
   let draftSites = $state<string[]>([]);
   let editingLimits = $state(false);
-  let draftLimits = $state({ max_steps: 60, max_minutes: 15, max_usd: 0.5, max_messages: 3 });
+  let draftLimits = $state({
+    max_steps: 60,
+    max_minutes: 15,
+    max_usd: 0.5,
+    max_messages: 3,
+    max_spend_usd: 0,
+  });
   let warnings = $state<string[]>([]);
   // A refusal the person can answer. The daemon refuses a schedule change that
   // might repeat something irreversible and says to send it again with an
@@ -265,6 +272,21 @@
     if (await save({ ...pending.patch, acknowledge_repeat: true })) editingSchedule = false;
   }
 
+  /// The last run, if it stopped to ask rather than to fail.
+  const askedRun = $derived(
+    finishedRun?.failure?.code === "needs_answer" ? finishedRun : null,
+  );
+
+  async function sendAnswer() {
+    const text = draftAnswer.trim();
+    if (!text || !askedRun) return;
+    await act(async () => {
+      await api.answerQuestion(askedRun.id, text);
+      draftAnswer = "";
+      await api.run(id);
+    });
+  }
+
   function startEditingDirective() {
     draftDirective = task?.description ?? "";
     editingDirective = true;
@@ -298,6 +320,7 @@
       max_minutes: Math.max(0, Math.round(draftLimits.max_minutes)),
       max_usd: Math.max(0, draftLimits.max_usd),
       max_messages: Math.max(0, Math.round(draftLimits.max_messages)),
+      max_spend_usd: Math.max(0, draftLimits.max_spend_usd),
     };
     if (await save({ limits })) editingLimits = false;
   }
@@ -310,6 +333,7 @@
       max_minutes: task?.limits?.max_minutes ?? 15,
       max_usd: task?.limits?.max_usd ?? 0.5,
       max_messages: task?.limits?.max_messages ?? 3,
+      max_spend_usd: task?.limits?.max_spend_usd ?? 0,
     };
     editingLimits = true;
   }
@@ -474,6 +498,29 @@
     </div>
   {/if}
 
+  <!-- It stopped to ask something.
+       A question is not a fault, and the page it used to land on was about
+       what went wrong. It gets a box instead: the question, somewhere to type,
+       and the job done again with the answer. -->
+  {#if askedRun}
+    <div class="card asked">
+      <strong>It needs to know something</strong>
+      <p style="margin:6px 0 10px; max-width:62ch">{askedRun.failure?.plain_reason}</p>
+      <textarea class="directive" rows="2" bind:value={draftAnswer} placeholder="Your answer" data-hint-exempt="your answer to the question above; nothing happens until you send it"></textarea>
+      <div class="row" style="margin-top:8px">
+        <Hint id="task.answer">
+          <button class="primary" disabled={busy || !draftAnswer.trim()} onclick={sendAnswer}>
+            Answer and try again
+          </button>
+        </Hint>
+      </div>
+      <p class="muted" style="margin:8px 0 0; max-width:62ch">
+        Never a password or a card number. Errand will not ask for one, and this box is not the
+        place for one.
+      </p>
+    </div>
+  {/if}
+
   <!-- One button that does the job.
        There used to be two here for a task that had never run, "Teach it once,
        for real" beside "Teach it as a rehearsal", and the job would then stop
@@ -623,7 +670,10 @@
         <div class="row" style="gap:8px">
           <span class="muted">
             {task.limits
-              ? `at most ${task.limits.max_steps} steps, ${task.limits.max_minutes} minutes, $${task.limits.max_usd}, ${task.limits.max_messages} messages`
+              ? `at most ${task.limits.max_steps} steps, ${task.limits.max_minutes} minutes, $${task.limits.max_usd} of AI, ${task.limits.max_messages} messages` +
+                (task.limits.max_spend_usd
+                  ? `, and may spend up to $${task.limits.max_spend_usd}`
+                  : ", and may not spend money")
               : "stops if it runs too long or spends too much"}
           </span>
           <Hint id="task.edit_limits">
@@ -638,12 +688,19 @@
         <input id="lim-steps" type="number" min="0" bind:value={draftLimits.max_steps} />
         <label for="lim-min">Most minutes one run may take</label>
         <input id="lim-min" type="number" min="0" bind:value={draftLimits.max_minutes} />
-        <label for="lim-usd">Most dollars one run may spend</label>
+        <label for="lim-usd">Most one run may cost you in AI</label>
         <input id="lim-usd" type="number" min="0" step="0.1" bind:value={draftLimits.max_usd} />
         <label for="lim-msg">Most messages one run may send</label>
         <input id="lim-msg" type="number" min="0" bind:value={draftLimits.max_messages} />
+        <label for="lim-spend">Most real money one run may spend</label>
+        <input id="lim-spend" type="number" min="0" step="1" bind:value={draftLimits.max_spend_usd} />
         <p class="muted" style="margin:6px 0 0">
-          A zero means no ceiling for that one. A run that hits a ceiling stops and says which one.
+          The last one is not like the others. It is money leaving your account, and zero means
+          this task may not buy anything at all. Nothing is bought without it reading the total off
+          the page first, and the number is for the whole run, not per item.
+        </p>
+        <p class="muted" style="margin:6px 0 0">
+          On the rest, a zero means no ceiling. A run that hits a ceiling stops and says which one.
         </p>
       </div>
       <div class="row" style="margin-top:12px; gap:6px">
@@ -918,6 +975,10 @@
 {/if}
 
 <style>
+  /* Not the red of a failure. It is a question, and the page should not look
+     like something broke. */
+  .asked { border-left: 3px solid var(--accent, var(--rule)); }
+
   .directive {
     width: 100%;
     font: inherit;

@@ -8,6 +8,24 @@ All notable changes to this project are documented here. The format follows
 
 ### Added
 
+- **A task may spend money, once somebody says how much.** Buying was always possible in the sense
+  that a browser can click a button that pays; there was simply no ceiling on it, because every
+  limit in Errand was a ceiling on something a task does anyway. This one is a permission:
+  `limits.max_spend_usd` is zero by default and zero means a task may not buy so much as a
+  paperclip. Above zero it is the most that task may spend across one whole run, not per item, and
+  a purchase is refused unless the agent has read the total off the page and passed it as
+  `amount_usd`, so "I could not tell what it would cost" is exactly the state in which it cannot
+  press the button. What was spent is written into the side-effect record, which is where the
+  running total for the rest of the run is read back from, so the limit cannot be got round by
+  splitting a payment. Note the two dollar figures on a task are unrelated: `max_usd` is what the
+  models cost and `max_spend_usd` is money leaving an account.
+- **A run can stop and ask you one thing.** `ask_you` is for the fact a job needs and only a person
+  knows: which of two accounts, what size, which date. The question appears on the task with a box
+  under it rather than a page about what went wrong, and what you type is kept on the run that
+  asked and handed to the next one. It is deliberately not a way to be given a permission: a task
+  cannot ask for somebody to message or for a spending limit, and the refusal for a missing contact
+  now names the exact place a person goes to add one instead of asking the agent to request a phone
+  number.
 - **A task sets itself up.** Creating one used to mean filling in a name, a schedule, a list of
   sites and a permission or two before anything could run, and the panels were the first thing a
   person saw. Now the description is read for what it says outright, and a model is asked about

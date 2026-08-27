@@ -213,7 +213,13 @@ pub(crate) fn system_prompt(has_playbook: bool) -> String {
          Write for the person, not for a log file. Never write the same thing twice, and never \
          restate at the end what you are about to put in finish or fail: the person reads that \
          first and the journal second.\n\
-         - End by calling finish with what you achieved, or fail if you could not.\n\n\
+         - End by calling finish with the answer, or fail if you could not do the job.\n\
+         - If the job needs one thing only the person knows, and guessing would be worse than \
+         waiting, call ask_you with that one question instead of failing. They see it on the \
+         task, type an answer, and the next run is given it. Use it for a fact: which of two \
+         accounts, what size, which date. Do not use it to ask for a permission you have not \
+         been given, such as somebody to message or a spending limit; say plainly what is \
+         missing and where they set it, and stop.\n\n\
          What you can do, beyond browsing:\n\
          - save_note writes into their Apple Notes. save_file writes a text file into their \
          Errand Files folder. show_me opens a web page, a saved file, or an app in front of \

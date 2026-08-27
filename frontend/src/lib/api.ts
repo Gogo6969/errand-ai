@@ -262,6 +262,9 @@ export const api = {
     call<Run & { steps: Step[]; answer_copies: AnswerCopy[] }>("GET", `/v1/runs/${id}`),
   /** Show the person a copy of an answer where the run also put it. */
   openAnswerCopy: (id: string) => call("POST", `/v1/answer-copies/${id}/open`),
+  /** Answer the question a run stopped to ask. Run the task again afterwards. */
+  answerQuestion: (runId: string, answer: string) =>
+    call<{ answered: string; task_id: string }>("POST", `/v1/runs/${runId}/answer`, { answer }),
 
   playbook: (id: string) =>
     call<{

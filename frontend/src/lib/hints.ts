@@ -114,6 +114,12 @@ export const hints = {
       "Straight away, because the only thing that settles whether the new wording is better is \
        another outcome. What it learned before is kept until a run replaces it.",
   },
+  "task.answer": {
+    short: "Sends your answer and does the job again.",
+    long:
+      "The answer is kept on the run that asked, so the question and what you said sit together, " +
+      "and the next run is given it. Never type a password or a card number here.",
+  },
   "task.settings": {
     short: "How this task works: when it runs, what it may open, which AI, who it tells.",
     long:

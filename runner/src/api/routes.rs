@@ -32,6 +32,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/schedule/preview", post(preview_schedule))
         .route("/v1/tasks/{id}/activate", post(activate_task))
         .route("/v1/tasks/{id}/teach", post(teach_task))
+        .route("/v1/runs/{id}/answer", post(answer_a_question))
         .route("/v1/answer-copies/{id}/open", post(open_answer_copy))
         .route("/v1/tasks/{id}/playbook", get(get_playbook))
         .route(
@@ -2664,6 +2665,63 @@ async fn get_run(
     // answer itself is above; these are the extra places it also went.
     body["answer_copies"] = serde_json::to_value(copies).unwrap_or(json!([]));
     Ok(Json(body))
+}
+
+#[derive(Deserialize)]
+struct AnswerToAQuestion {
+    answer: String,
+}
+
+/// Answer the question a run stopped to ask, and do the job again.
+///
+/// The answer becomes a note on the run that asked, which is the channel that
+/// already exists for one run telling the next one something: the next run is
+/// handed recent notes before it starts. So nothing new has to be threaded
+/// through the agent, and the answer is on the record beside the question.
+///
+/// This only records the answer. Starting the run is the caller's next call,
+/// because there is exactly one place that knows how to start one properly and
+/// a second copy of it here would be a second thing to get wrong.
+async fn answer_a_question(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(body): Json<AnswerToAQuestion>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Answering is not merely reading: it decides what the next run does.
+    require(&caller, Scope::Approve)?;
+    let answer = body.answer.trim();
+    if answer.is_empty() {
+        return Err(ApiError::bad_request("An answer cannot be empty."));
+    }
+    let run = errand_core::db::get_run(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found(format!("No run with id {id}.")))?;
+    let question = run
+        .failure
+        .as_ref()
+        .map(|f| f.plain_reason.clone())
+        .unwrap_or_default();
+    if run.failure.as_ref().map(|f| f.code.as_str()) != Some("needs_answer") {
+        return Err(ApiError::bad_request(
+            "That run did not stop to ask anything, so there is nothing to answer.",
+        ));
+    }
+
+    errand_core::db::set_run_notes(
+        state.pool(),
+        &id,
+        &format!("You asked: {question}\nThey answered: {answer}"),
+    )
+    .await
+    .map_err(ApiError::from)?;
+
+    Ok(Json(json!({
+        "answered": question,
+        "task_id": run.task_id,
+        "note": "Kept. Run the task again and it will be given your answer.",
+    })))
 }
 
 /// Show the person one of the places a run left a copy of its answer.

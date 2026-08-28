@@ -36,6 +36,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/tasks/{id}/activate", post(activate_task))
         .route("/v1/tasks/{id}/teach", post(teach_task))
         .route("/v1/runs/{id}/answer", post(answer_a_question))
+        .route("/v1/runs/{id}/note", post(leave_a_note))
         .route("/v1/answer-copies/{id}/open", post(open_answer_copy))
         .route("/v1/tasks/{id}/playbook", get(get_playbook))
         .route(
@@ -2777,6 +2778,73 @@ async fn question_it_asked(
         }))
 }
 
+#[derive(Deserialize)]
+struct LeaveANote {
+    note: String,
+}
+
+/// Tell the task something before it tries again.
+///
+/// The only way to say anything to a task used to be to rewrite its
+/// description, or to answer a question it had thought to ask. A run that
+/// simply failed left nowhere to reply, so somebody who knew exactly what had
+/// gone wrong could do nothing with it: press the button again and watch the
+/// same thing happen, or edit the standing instructions to carry a fact about
+/// one afternoon. Reported by a person looking at a run that had asked them to
+/// sign in somewhere, who had, and had no way to say so.
+///
+/// The rails were already here. Notes go to the next few runs of the same task
+/// alongside its plan, which is exactly where a fact like "I have signed in
+/// already, use the saved profile" belongs.
+///
+/// Appended rather than written over: a run that asked a question and was
+/// answered may also need telling something else, and losing the first to the
+/// second would be its own small betrayal.
+async fn leave_a_note(
+    State(state): State<AppState>,
+    Extension(caller): Extension<Caller>,
+    Path(id): Path<String>,
+    Json(body): Json<LeaveANote>,
+) -> ApiResult<Json<serde_json::Value>> {
+    // Approve rather than Read: this decides what the next run does.
+    require(&caller, Scope::Approve)?;
+    let note = body.note.trim();
+    if note.is_empty() {
+        return Err(ApiError::bad_request(
+            "There is nothing in that note, so there is nothing to tell it.",
+        ));
+    }
+    let run = errand_core::db::get_run(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+        .ok_or_else(|| ApiError::not_found(format!("No run with id {id}.")))?;
+    if !matches!(run.status.as_str(), "succeeded" | "failed") {
+        return Err(ApiError::conflict(
+            "run_not_finished",
+            "That run is still going. A note is read by the runs after this one, so wait for it \
+             to finish and then leave it.",
+        ));
+    }
+
+    let already = errand_core::db::run_notes(state.pool(), &id)
+        .await
+        .map_err(ApiError::from)?
+        .unwrap_or_default();
+    let together = match already.trim() {
+        "" => format!("They said: {note}"),
+        already => format!("{already}\nThey also said: {note}"),
+    };
+    errand_core::db::set_run_notes(state.pool(), &id, &together)
+        .await
+        .map_err(ApiError::from)?;
+
+    Ok(Json(json!({
+        "noted": note,
+        "task_id": run.task_id,
+        "note": "Kept. The next few runs of this task are given it along with their plan.",
+    })))
+}
+
 async fn answer_a_question(
     State(state): State<AppState>,
     Extension(caller): Extension<Caller>,
@@ -5161,6 +5229,88 @@ mod tests {
             .post("/v1/automation/the-garage-door/enable", json!({}))
             .await;
         assert_eq!(code, 400, "{body}");
+    }
+
+    #[tokio::test]
+    async fn a_person_can_tell_a_finished_run_something_and_the_next_one_is_given_it() {
+        // Asked for by somebody looking at a failure that ended "sign in
+        // yourself and run this again". They had. There was nowhere to say so,
+        // and pressing the button again would have repeated the same mistake.
+        let api = testkit::start().await;
+        let task = a_task(
+            &api,
+            json!({ "name": "X research", "description": "Show me the trending subjects." }),
+        )
+        .await;
+        let run = errand_core::db::try_create_run(
+            &api.pool,
+            &task,
+            "run/one",
+            "manual",
+            errand_core::models::RunMode::NORMAL,
+            None,
+        )
+        .await
+        .expect("a run");
+
+        // Still going: a note now would be read by nobody, so it is refused
+        // rather than quietly kept.
+        let (code, _) = api
+            .post(
+                &format!("/v1/runs/{}/note", run.id),
+                json!({ "note": "too early" }),
+            )
+            .await;
+        assert_eq!(code, 409);
+
+        errand_core::db::finish_run_failed_fully(
+            &api.pool,
+            &run.id,
+            "target_unavailable",
+            "The site would not let it sign in.",
+            Some("Sign in yourself and run it again."),
+            None,
+            None,
+        )
+        .await
+        .expect("the run fails");
+
+        let (code, body) = api
+            .post(
+                &format!("/v1/runs/{}/note", run.id),
+                json!({ "note": "I am signed in already, in Errand's own profile." }),
+            )
+            .await;
+        assert_eq!(code, 200, "{body}");
+
+        // A second thing to say does not lose the first.
+        let (code, _) = api
+            .post(
+                &format!("/v1/runs/{}/note", run.id),
+                json!({ "note": "The handle is @someone." }),
+            )
+            .await;
+        assert_eq!(code, 200);
+
+        // And what the next run is handed carries both.
+        let notes = errand_core::db::recent_notes(&api.pool, &task, 3)
+            .await
+            .expect("the notes the next run reads");
+        let all = notes.join("\n");
+        assert!(all.contains("signed in already"), "{all}");
+        assert!(
+            all.contains("@someone"),
+            "the second note replaced the first: {all}"
+        );
+
+        // An empty note is nothing to tell anybody.
+        let (code, _) = api
+            .post(
+                &format!("/v1/runs/{}/note", run.id),
+                json!({ "note": "   " }),
+            )
+            .await;
+        assert_eq!(code, 400);
     }
 
     #[tokio::test]

@@ -2496,6 +2496,18 @@ pub async fn recent_notes(pool: &Pool, task_id: &str, limit: i64) -> Result<Vec<
     Ok(notes)
 }
 
+/// What has already been said to this run, if anything.
+///
+/// Not on the `Run` model: a note is for the next run to read, not for a screen
+/// to show, and the only caller is the one appending to it.
+pub async fn run_notes(pool: &Pool, run_id: &str) -> Result<Option<String>> {
+    let row = sqlx::query("SELECT notes_md FROM runs WHERE id = ?")
+        .bind(run_id)
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.and_then(|r| r.try_get::<Option<String>, _>("notes_md").ok().flatten()))
+}
+
 pub async fn set_run_notes(pool: &Pool, run_id: &str, notes: &str) -> Result<()> {
     sqlx::query("UPDATE runs SET notes_md = ? WHERE id = ?")
         .bind(notes)

@@ -170,9 +170,13 @@ pub(crate) fn tool_definitions() -> Value {
         {
             "name": "open_browser",
             "description":
-                "Open the browser for this task. It uses a saved profile per site, so a site you \
-                 logged into on a previous run is usually still logged in. Call this before any \
-                 other browser tool.",
+                "Open the browser for this task. It is Chrome, in a profile of Errand's own, \
+                 kept per site: a site you logged into on a previous run is usually still logged \
+                 in. That profile is not the person's everyday browser and shares nothing with \
+                 it, so signing in to a site in Safari or in their own Chrome window does this \
+                 task no good at all: if a sign-in is needed, say that it has to happen in \
+                 Errand's own profile, or ask for the login to be saved in settings. Call this \
+                 before any other browser tool.",
             "inputSchema": { "type": "object", "properties": {}, "additionalProperties": false }
         },
         {

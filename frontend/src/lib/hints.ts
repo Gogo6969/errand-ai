@@ -114,6 +114,17 @@ export const hints = {
       "Straight away, because the only thing that settles whether the new wording is better is \
        another outcome. What it learned before is kept until a run replaces it.",
   },
+  "task.tell": {
+    short: "Say something to this task about what just happened.",
+    long:
+      "A failure often ends by asking you to do something, and you know things the run does " +
+      "not: that you did it, that you did it differently, that the advice was wrong. What you " +
+      "write here is given to the next few runs along with their plan, so the next one starts " +
+      "knowing it. It does not change the task's standing instructions.",
+  },
+  "task.send_note": {
+    short: "Keep this for the next run. Nothing runs now.",
+  },
   "task.answer": {
     short: "Sends your answer and does the job again.",
     long:

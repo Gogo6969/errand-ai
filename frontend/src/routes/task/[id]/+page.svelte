@@ -44,6 +44,7 @@
     );
   }
   let draftAnswer = $state("");
+  let draftNote = $state("");
   let editingDirective = $state(false);
   let draftDirective = $state("");
   let busy = $state(false);
@@ -313,6 +314,23 @@
     });
   }
 
+  /**
+   * Say something to the task about a run that has finished.
+   *
+   * Not the same as answering a question, and needed far more often: a run that
+   * failed leaves somebody knowing exactly what went wrong and, until now, with
+   * nowhere to put it. What goes here reaches the next few runs alongside their
+   * plan.
+   */
+  async function sendNote() {
+    const text = draftNote.trim();
+    if (!text || !finishedRun) return;
+    await act(async () => {
+      await api.leaveNote(finishedRun.id, text);
+      draftNote = "";
+    });
+  }
+
   /// Put this task away, or forget it entirely.
   ///
   /// Asked as one question with two answers rather than a checkbox, because
@@ -548,6 +566,38 @@
           <a class="golink" href={`/run/${finishedRun.id}`}>See what happened</a>
         </Hint>
       </div>
+
+      <!-- Somewhere to answer back.
+           A failure often ends by asking for something to be done, and the
+           person doing it knows things the run does not: that it was done, that
+           it was done differently, that the advice was wrong. Without this the
+           only replies available were to press the button again and watch the
+           same thing happen, or to rewrite the standing instructions to carry a
+           fact about one afternoon. What goes here reaches the next few runs
+           beside their plan. -->
+      {#if !askedRun}
+        <details class="tellbox">
+          <Hint id="task.tell">
+            <summary>Tell it something before it tries again</summary>
+          </Hint>
+          <textarea
+            class="directive"
+            rows="2"
+            bind:value={draftNote}
+            placeholder="I signed in already, in Errand's own browser profile"
+            data-hint-exempt="what you want to tell the task; nothing happens until you send it"
+          ></textarea>
+          <div class="row" style="margin-top:8px">
+            <Hint id="task.send_note">
+              <button disabled={busy || !draftNote.trim()} onclick={sendNote}>Tell it</button>
+            </Hint>
+          </div>
+          <p class="muted" style="margin:8px 0 0; max-width:62ch">
+            Never a password or a card number. Logins belong in Settings, where they go to your
+            keychain instead.
+          </p>
+        </details>
+      {/if}
     </div>
   {/if}
 
@@ -1083,6 +1133,16 @@
      and often quotes a web page, and putting that through {@html} inside the
      app's own webview buys formatting with a class of bug nobody wants. The
      playbook is shown the same way. */
+  /* Folded away by default. The answer is what this card is for, and a box
+     inviting a reply would compete with it on every run that went fine. */
+  .tellbox { margin-top: 10px; }
+  .tellbox summary {
+    cursor: pointer;
+    color: var(--ink-soft);
+    font-size: 12.5px;
+  }
+  .tellbox summary:hover { color: var(--ink); }
+
   /* This page had no styles of its own; app.css covers the rest. */
   .warnbox {
     background: var(--warn-bg); color: var(--warn);

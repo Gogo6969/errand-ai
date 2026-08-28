@@ -289,6 +289,16 @@ export const api = {
       "DELETE",
       `/v1/tasks/${id}${forget ? "?forget=true" : ""}`,
     ),
+  /**
+   * Tell a finished run something before the task runs again.
+   *
+   * Separate from answering: a run that never asked anything still leaves
+   * somebody with something to say, and the only alternative was rewriting the
+   * task's standing instructions to carry a fact about one afternoon.
+   */
+  leaveNote: (runId: string, note: string) =>
+    call<{ noted: string; task_id: string; note: string }>("POST", `/v1/runs/${runId}/note`, { note }),
+
   answerQuestion: (runId: string, answer: string) =>
     call<{ answered: string; task_id: string }>("POST", `/v1/runs/${runId}/answer`, { answer }),
 

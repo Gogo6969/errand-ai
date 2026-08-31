@@ -20,6 +20,32 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      # Before anything cargo does. `frontendDist` is ../frontend/build, which
+      # is a build artifact and is gitignored, so on a fresh checkout it does
+      # not exist and errand-app's Tauri build script fails before a single
+      # Rust check has run: "failed to run custom build command for
+      # errand-app". Every run of this job since the frontend was gitignored
+      # has died there, and none of the three gates below has been run at all.
+      - name: The frontend the Rust build script expects to find
+        run: |
+          npm --prefix frontend install
+          npm --prefix frontend run build
+          echo "frontend exit=$?"
+
+      # And the sidecar, for the same reason: `externalBin` names
+      # binaries/errandd, tauri-build checks that the file for this target
+      # triple is there, and it is a build artifact like the frontend. Built
+      # unoptimised on purpose. This job checks Rust and never bundles
+      # anything, so what has to be true is that the file exists and the
+      # workspace compiles; the release build of the same binary is the bundle
+      # job's, three jobs down.
+      - name: The daemon the Rust build script expects to find
+        run: |
+          cargo build -p errand-runner --bin errandd
+          mkdir -p app/binaries
+          cp target/debug/errandd "app/binaries/errandd-$(rustc -vV | sed -n 's/host: //p')"
+          echo "daemon exit=$?"
+
       # Positive evidence, never grep-for-absence. Every gate records its own
       # exit status so a step that silently fails to run cannot pass as clean.
       - name: Formatting

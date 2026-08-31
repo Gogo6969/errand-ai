@@ -109,7 +109,16 @@ fi
 # SPEC-M1 is absolute: no em dashes in any file, code comment, doc, or UI
 # string. Ever. It went unchecked for months and 140 of them accumulated, which
 # is exactly how a rule nobody checks stops being true.
-if hits=$(echo "$FILES" | xargs grep -nI $'\u2014' 2>/dev/null); then
+#
+# Applied migrations are the one exception, and not by preference. `sqlx::migrate!`
+# checksums every file in core/migrations and refuses to run against a database
+# where one has changed, so editing a comment in a migration that has already
+# been applied breaks every existing install. There is no marker to add either:
+# a `scrub:allow` comment is itself an edit, with the same result. The rule is
+# unenforceable there rather than relaxed, and it still holds everywhere a file
+# can actually be changed.
+NO_EM_DASH=$(echo "$FILES" | grep -v '^core/migrations/' || true)
+if hits=$(echo "$NO_EM_DASH" | xargs grep -nI $'\u2014' 2>/dev/null); then
   problem "em dash found. The rule is none, anywhere, ever:"
   echo "$hits" | head -10 | sed 's/^/        /'
 fi

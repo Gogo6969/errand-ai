@@ -1,3 +1,10 @@
+> [!IMPORTANT]
+> **Superseded, and kept for the record.** Errand was rewritten from scratch;
+> the version being worked on now lives at
+> [Gogo6969/errand](https://github.com/Gogo6969/errand). This repository is the
+> earlier program of the same name and is archived: nothing here is being
+> developed further.
+
 <div align="center">
 
 # Errand-AI

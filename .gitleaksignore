@@ -1,0 +1,21 @@
+# Findings gitleaks is right to raise and wrong about, pinned one at a time.
+#
+# A fingerprint is commit:file:rule:line, so an entry here excuses exactly one
+# line of one commit. Anything new, anywhere else, still fails the build: this
+# is not the rule being switched off.
+#
+# The scrub job checks out with fetch-depth 0, which fetches every branch, and
+# gitleaks reads all of it. A finding on any branch therefore fails the build on
+# every other branch, which is why these turn up on work that never went near
+# the file.
+
+# core/src/passwords.rs held a test that proves the secret scrubber finds
+# secrets, and everything in the list it works through is invented: "hunter22",
+# "geheim123", "sk-abc123def". The last of those looks enough like an API key
+# for the generic-api-key rule to match it, on two adjacent lines. Nothing there
+# was ever real, the file does not exist on main, and a later commit on that
+# branch replaced the fixture anyway.
+0af897b02e5d9924b229f5928204ace56d77ba4f:core/src/passwords.rs:generic-api-key:238
+0af897b02e5d9924b229f5928204ace56d77ba4f:core/src/passwords.rs:generic-api-key:239
+2edfe196d8808f60191f831791e018e256b3474e:core/src/passwords.rs:generic-api-key:238
+2edfe196d8808f60191f831791e018e256b3474e:core/src/passwords.rs:generic-api-key:239
